@@ -16,6 +16,7 @@ class CGameControllerGTrain : public CGameControllerDDNet
 	enum
 	{
 		HOVER_TICKS = 50,
+		MAX_FREEZE_DISTANCE = 20,
 	};
 
 	// centers of all non-freeze tiles between the start and the finish line

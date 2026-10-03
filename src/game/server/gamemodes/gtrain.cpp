@@ -165,6 +165,19 @@ void CGameControllerGTrain::FindTrainPositions()
 		});
 	}
 
+	// positions must have freeze straight below, before any solid tile
+	const auto HasFreezeBelow = [&](int Index) {
+		for(int i = 1; i <= MAX_FREEZE_DISTANCE && Index + i * Width < Width * Height; i++)
+		{
+			const int Below = Index + i * Width;
+			if(IsBlocked(Below))
+				return false;
+			if(HasTile(Below, TILE_FREEZE) || HasTile(Below, TILE_DFREEZE))
+				return true;
+		}
+		return false;
+	};
+
 	for(int Index = 0; Index < Width * Height; Index++)
 	{
 		// sides not reaching the finish stay discarded, even if a teleporter leads back to them
@@ -174,6 +187,8 @@ void CGameControllerGTrain::FindTrainPositions()
 		if(HasTile(Index, TILE_FREEZE) || HasTile(Index, TILE_DFREEZE) || HasTile(Index, TILE_DEATH))
 			continue;
 		if(pCollision->IsTeleport(Index) || pCollision->IsEvilTeleport(Index) || IsCheckTeleport(Index))
+			continue;
+		if(!HasFreezeBelow(Index))
 			continue;
 		m_vTrainPositions.emplace_back((Index % Width) * 32.0f + 16.0f, (Index / Width) * 32.0f + 16.0f);
 	}
