@@ -263,7 +263,7 @@ void CGameControllerGTrain::PlaceRandomly(CCharacter *pChr)
 
 	const vec2 Pos = m_vTrainPositions[secure_rand_below(m_vTrainPositions.size())];
 	CAttempt &Attempt = m_aAttempts[ClientId];
-	if(!Attempt.m_pGoal || !Attempt.m_pGoal.unique())
+	if(Attempt.m_pGoal.use_count() != 1)
 		Attempt.m_pGoal = std::make_shared<CGTrainGoal>();
 	const int Start = PathNode(Pos);
 	const int TargetDistance = g_Config.m_SvGtrainGoalDistance;
