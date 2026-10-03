@@ -333,7 +333,7 @@ public:
 	 *
 	 * @param ClientId This is the id of the client that will be updated. Not the id that will receive the message. The message gets broadcasted to all 0.7 clients.
 	 */
-	void SendRename7(int ClientId);
+	void SendRename7(int ClientId, bool IncludeLocal = false);
 	void SendSkinChange7(int ClientId);
 
 	void List(int ClientId, const char *pFilter);

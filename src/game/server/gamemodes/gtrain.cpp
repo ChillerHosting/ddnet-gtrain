@@ -24,7 +24,7 @@ CGameControllerGTrain::CGameControllerGTrain(class CGameContext *pGameServer) :
 	m_Pathfinder(m_PathGraph)
 {
 	m_pGameType = g_Config.m_SvTestingCommands ? TEST_TYPE_NAME : GAME_TYPE_NAME;
-	m_GameFlags = 0; // Scores are leader markers, including on 0.7 clients.
+	m_GameFlags = 0; // Fight wins are numeric scores, including on 0.7 clients.
 
 	std::fill(std::begin(m_aPendingPlace), std::end(m_aPendingPlace), false);
 	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
@@ -328,7 +328,7 @@ int CGameControllerGTrain::FightSize(int Group) const
 int CGameControllerGTrain::SnapPlayerScore(int SnappingClient, CPlayer *pPlayer)
 {
 	const int ClientId = pPlayer->GetCid();
-	return pPlayer->GetTeam() != TEAM_SPECTATORS && m_aFightGroup[ClientId] == ClientId && m_aFightTeam[ClientId] != 0 ? 1 : 0;
+	return pPlayer->GetTeam() != TEAM_SPECTATORS && m_aFightTeam[m_aFightGroup[ClientId]] != 0 ? m_aFightWins[ClientId] : 0;
 }
 
 void CGameControllerGTrain::UpdateFightTeams()
@@ -358,7 +358,10 @@ void CGameControllerGTrain::UpdateFightTeams()
 		CPlayer *pPlayer = GameServer()->m_apPlayers[ClientId];
 		m_aScoreboardTeams[ClientId] = pPlayer && pPlayer->GetTeam() != TEAM_SPECTATORS ? m_aFightTeam[m_aFightGroup[ClientId]] : 0;
 		if(pPlayer)
+		{
+			pPlayer->SetNameMarked(m_aScoreboardTeams[ClientId] != 0 && m_aFightGroup[ClientId] == ClientId);
 			Server()->SetClientScore(ClientId, SnapPlayerScore(ClientId, pPlayer));
+		}
 	}
 	Teams().SetScoreboardTeams(m_aScoreboardTeams);
 }
@@ -635,6 +638,7 @@ void CGameControllerGTrain::AnnounceFightScore(int Winner)
 {
 	const int Group = m_aFightGroup[Winner];
 	++m_aFightWins[Winner];
+	Server()->SetClientScore(Winner, SnapPlayerScore(Winner, GameServer()->m_apPlayers[Winner]));
 	char aMessage[MAX_CHAT_LENGTH];
 	str_format(aMessage, sizeof(aMessage), "'%s' wins! Fight score:", Server()->ClientName(Winner));
 	bool First = true;

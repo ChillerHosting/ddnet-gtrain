@@ -278,6 +278,7 @@ MACRO_CONFIG_INT(SvGtrainPathClearRadius, sv_gtrain_path_clear_radius, 64, 0, 40
 MACRO_CONFIG_INT(SvGtrainPathParticleSpacing, sv_gtrain_path_particle_spacing, 192, 1, 4096, CFGFLAG_SERVER, "Distance in world units between GTrain path particles (32 units per tile)")
 MACRO_CONFIG_INT(SvTournamentMode, sv_tournament_mode, 0, 0, 1, CFGFLAG_SERVER, "Tournament mode. When enabled, players joins the server as spectator")
 MACRO_CONFIG_INT(SvSpamprotection, sv_spamprotection, 1, 0, 1, CFGFLAG_SERVER, "Spam protection for: team change, chat, skin change, emotes and votes")
+MACRO_CONFIG_INT(SvRequireChatFlagToChat, sv_require_chat_flag_to_chat, 0, 0, 1, CFGFLAG_SERVER, "Require chat-bubble ticks for chat during the first 20 seconds after joining (commands are unaffected)")
 
 MACRO_CONFIG_INT(SvSpectatorSlots, sv_spectator_slots, 0, 0, SERVER_MAX_CLIENTS, CFGFLAG_SERVER, "Number of slots to reserve for spectators")
 MACRO_CONFIG_INT(SvInactiveKickTime, sv_inactivekick_time, 0, 0, 1000, CFGFLAG_SERVER, "How many minutes to wait before taking care of inactive players")

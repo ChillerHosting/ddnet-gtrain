@@ -77,6 +77,8 @@ public:
 
 	// states if the client is chatting, accessing a menu etc.
 	int m_PlayerFlags;
+	// Ticks spent showing the chat bubble while a character is alive.
+	int m_TicksSpentChatting;
 
 	// used for snapping to just update latency if the scoreboard is active
 	int m_aCurLatency[MAX_CLIENTS];
@@ -118,6 +120,9 @@ public:
 	// The snapped client info is the same for every snapping client, so it is cached
 	// and only rebuilt once the name, clan, country or tee infos have changed
 	void InvalidateClientInfo() { m_ClientInfoValid = false; }
+	void GetDisplayName(char *pName, int Size) const;
+	void SetNameMarked(bool Marked);
+	bool IsNameMarked() const { return m_NameMarked; }
 
 	int m_DieTick;
 	int m_PreviousDieTick;
@@ -140,6 +145,7 @@ private:
 	CTeeInfo m_TeeInfos;
 	CNetObj_ClientInfo m_ClientInfo = {};
 	bool m_ClientInfoValid = false;
+	bool m_NameMarked = false;
 
 	const uint32_t m_UniqueClientId;
 	CCharacter *m_pCharacter;

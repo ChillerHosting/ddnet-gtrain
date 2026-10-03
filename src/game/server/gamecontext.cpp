@@ -285,6 +285,18 @@ std::optional<int> CGameContext::FindClientIdByName(const char *pName) const
 
 		return ClientId;
 	}
+	// Accept the displayed leader name for client name completion, while
+	// canonical names always take precedence over decorated aliases.
+	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
+	{
+		const CPlayer *pPlayer = m_apPlayers[ClientId];
+		if(!Server()->ClientIngame(ClientId) || !pPlayer || !pPlayer->IsNameMarked())
+			continue;
+		char aName[MAX_NAME_LENGTH];
+		pPlayer->GetDisplayName(aName, sizeof(aName));
+		if(str_comp(pName, aName) == 0)
+			return ClientId;
+	}
 	return std::nullopt;
 }
 
@@ -919,7 +931,7 @@ void CGameContext::SendBroadcast(const char *pText, int ClientId, bool IsImporta
 	m_apPlayers[ClientId]->m_LastBroadcastImportance = IsImportant;
 }
 
-void CGameContext::SendRename7(int ClientId)
+void CGameContext::SendRename7(int ClientId, bool IncludeLocal)
 {
 	dbg_assert(in_range(ClientId, 0, MAX_CLIENTS - 1), "Invalid ClientId: %d", ClientId);
 	dbg_assert(m_apPlayers[ClientId] != nullptr, "Client not online: %d", ClientId);
@@ -932,8 +944,10 @@ void CGameContext::SendRename7(int ClientId)
 	Drop.m_Silent = true;
 
 	protocol7::CNetMsg_Sv_ClientInfo Info;
+	char aName[MAX_NAME_LENGTH];
+	pPlayer->GetDisplayName(aName, sizeof(aName));
 	Info.m_ClientId = ClientId;
-	Info.m_pName = Server()->ClientName(ClientId);
+	Info.m_pName = aName;
 	Info.m_Country = Server()->ClientCountry(ClientId);
 	Info.m_pClan = Server()->ClientClan(ClientId);
 	Info.m_Local = 0;
@@ -949,8 +963,9 @@ void CGameContext::SendRename7(int ClientId)
 
 	for(int i = 0; i < Server()->MaxClients(); i++)
 	{
-		if(i != ClientId)
+		if(i != ClientId || IncludeLocal || pPlayer->IsNameMarked())
 		{
+			Info.m_Local = i == ClientId;
 			Server()->SendPackMsg(&Drop, MSGFLAG_VITAL | MSGFLAG_NORECORD, i);
 			Server()->SendPackMsg(&Info, MSGFLAG_VITAL | MSGFLAG_NORECORD, i);
 		}
@@ -2327,6 +2342,22 @@ void CGameContext::OnSayNetMessage(const CNetMsg_Cl_Say *pMsg, int ClientId, con
 	// drop empty and autocreated spam messages (more than 32 characters per second)
 	if(Length == 0 || (pMsg->m_pMessage[0] != '/' && (g_Config.m_SvSpamprotection && pPlayer->m_LastChat && pPlayer->m_LastChat + Server()->TickSpeed() * ((31 + Length) / 32) > Server()->Tick())))
 		return;
+
+	if(g_Config.m_SvRequireChatFlagToChat && pMsg->m_pMessage[0] != '/')
+	{
+		// Spectators and chat binds cannot send the chat-bubble flag. Allow
+		// them after 20 seconds, while still filtering reconnecting spam bots.
+		const int SecondsConnected = (Server()->Tick() - pPlayer->m_JoinTick) / Server()->TickSpeed();
+		const int SecondsUntilAllowed = std::max(0, 20 - SecondsConnected);
+		const int ChatTicksNeeded = Length > 10 ? 20 : 2;
+		if(SecondsUntilAllowed > 0 && pPlayer->m_TicksSpentChatting < ChatTicksNeeded)
+		{
+			char aMessage[128];
+			str_format(aMessage, sizeof(aMessage), "You are not allowed to use the chat yet. Please wait %d seconds.", SecondsUntilAllowed);
+			SendChatTarget(ClientId, aMessage);
+			return;
+		}
+	}
 
 	int GameTeam = GetDDRaceTeam(pPlayer->GetCid());
 	if(Team)

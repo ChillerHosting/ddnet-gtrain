@@ -51,6 +51,8 @@ void CPlayer::Reset()
 	m_DieTick = Server()->Tick();
 	m_PreviousDieTick = m_DieTick;
 	m_JoinTick = Server()->Tick();
+	m_TicksSpentChatting = 0;
+	m_NameMarked = false;
 	m_DDNetVersionKickTick = Server()->Tick() + 3 * Server()->TickSpeed();
 	delete m_pCharacter;
 	m_pCharacter = nullptr;
@@ -172,6 +174,28 @@ void CPlayer::SetTeeInfos(const char *pSkinName, bool UseCustomColor, int ColorB
 	InvalidateClientInfo();
 }
 
+void CPlayer::GetDisplayName(char *pName, int Size) const
+{
+	if(!m_NameMarked || Size < 3)
+	{
+		str_copy(pName, Server()->ClientName(m_ClientId), Size);
+		return;
+	}
+	// Reserve room for both stars without splitting a UTF-8 code point.
+	char aName[MAX_NAME_LENGTH];
+	str_utf8_truncate(aName, std::min(Size - 2, (int)sizeof(aName)), Server()->ClientName(m_ClientId), MAX_NAME_LENGTH);
+	str_format(pName, Size, "*%s*", aName);
+}
+
+void CPlayer::SetNameMarked(bool Marked)
+{
+	if(m_NameMarked == Marked)
+		return;
+	m_NameMarked = Marked;
+	InvalidateClientInfo();
+	GameServer()->SendRename7(m_ClientId, true);
+}
+
 static int PlayerFlags_SixToSeven(int Flags)
 {
 	int Seven = 0;
@@ -198,6 +222,8 @@ void CPlayer::Tick()
 
 	if(!Server()->ClientIngame(m_ClientId))
 		return;
+	if(GetCharacter() && (m_PlayerFlags & PLAYERFLAG_CHATTING) && m_TicksSpentChatting < 20)
+		++m_TicksSpentChatting;
 
 	if(m_ChatScore > 0)
 		m_ChatScore--;
@@ -341,7 +367,9 @@ void CPlayer::Snap(int SnappingClient)
 	if(!m_ClientInfoValid)
 	{
 		m_ClientInfoValid = true;
-		StrToInts(m_ClientInfo.m_aName, std::size(m_ClientInfo.m_aName), Server()->ClientName(m_ClientId));
+		char aName[MAX_NAME_LENGTH];
+		GetDisplayName(aName, sizeof(aName));
+		StrToInts(m_ClientInfo.m_aName, std::size(m_ClientInfo.m_aName), aName);
 		StrToInts(m_ClientInfo.m_aClan, std::size(m_ClientInfo.m_aClan), Server()->ClientClan(m_ClientId));
 		m_ClientInfo.m_Country = Server()->ClientCountry(m_ClientId);
 		StrToInts(m_ClientInfo.m_aSkin, std::size(m_ClientInfo.m_aSkin), m_TeeInfos.m_aSkinName);
@@ -593,10 +621,12 @@ void CPlayer::SendConnect(int FakeId, int ClientId)
 		return;
 
 	protocol7::CNetMsg_Sv_ClientInfo NewClientInfoMsg;
+	char aName[MAX_NAME_LENGTH];
+	pPlayer->GetDisplayName(aName, sizeof(aName));
 	NewClientInfoMsg.m_ClientId = FakeId;
 	NewClientInfoMsg.m_Local = ClientId == m_ClientId;
 	NewClientInfoMsg.m_Team = pPlayer->GetTeam();
-	NewClientInfoMsg.m_pName = Server()->ClientName(ClientId);
+	NewClientInfoMsg.m_pName = aName;
 	NewClientInfoMsg.m_pClan = Server()->ClientClan(ClientId);
 	NewClientInfoMsg.m_Country = Server()->ClientCountry(ClientId);
 	NewClientInfoMsg.m_Silent = 1;

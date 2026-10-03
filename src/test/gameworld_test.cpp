@@ -13,6 +13,7 @@
 #include <engine/server/server_logger.h>
 #include <engine/shared/assertion_logger.h>
 #include <engine/shared/config.h>
+#include <engine/shared/masterserver.h>
 
 #include <generated/protocol.h>
 #include <generated/server_data.h>
@@ -49,13 +50,30 @@ std::vector<std::string> FetchAndroidServerCommandQueue()
 class CGameWorldTestServer : public CServer
 {
 public:
+	struct CClientIdentity
+	{
+		int m_ClientId;
+		bool m_Local;
+		std::string m_Name;
+	};
 	std::optional<CTuningParams> m_aLastTuning[MAX_CLIENTS];
 	std::vector<std::string> m_avChatMessages[MAX_CLIENTS];
+	std::vector<CClientIdentity> m_avClientIdentities[MAX_CLIENTS];
 
 	void AdvanceTicks(int Ticks) { m_CurrentGameTick += Ticks; }
 
 	int SendMsg(CMsgPacker *pMsg, int Flags, int ClientId) override
 	{
+		if(pMsg->m_NoTranslate && pMsg->m_MsgId == protocol7::NETMSGTYPE_SV_CLIENTINFO && ClientId >= 0 && IsSixup(ClientId))
+		{
+			CUnpacker Unpacker;
+			Unpacker.Reset(pMsg->Data(), pMsg->Size());
+			const int Id = Unpacker.GetInt();
+			const bool Local = Unpacker.GetInt() != 0;
+			Unpacker.GetInt(); // team
+			m_avClientIdentities[ClientId].push_back({Id, Local, Unpacker.GetString()});
+			EXPECT_FALSE(Unpacker.Error());
+		}
 		if(pMsg->m_MsgId == NETMSGTYPE_SV_CHAT && ClientId >= 0 && !IsSixup(ClientId))
 		{
 			CUnpacker Unpacker;
@@ -227,6 +245,16 @@ public:
 			}
 		ADD_FAILURE() << "No training flag for client " << ClientId;
 		return vec2(0, 0);
+	}
+
+	void Say(int ClientId, const char *pText, bool Team = false)
+	{
+		char aText[512];
+		str_copy(aText, pText);
+		CNetMsg_Cl_Say Msg = {};
+		Msg.m_pMessage = aText;
+		Msg.m_Team = Team;
+		GameServer()->OnSayNetMessage(&Msg, ClientId, nullptr);
 	}
 
 	int TrainingMarkers(int ClientId)
@@ -483,7 +511,7 @@ TEST_F(GameWorld, GTrainTeamAndPracticeCommandsPreserveFight)
 		EXPECT_FALSE(GameServer()->m_apPlayers[ClientId]->m_VotedForPractice);
 		EXPECT_EQ(pController->Teams().ScoreboardTeam(ClientId), FightTeam);
 	}
-	EXPECT_EQ(pController->SnapPlayerScore(Anna, GameServer()->m_apPlayers[Anna]), 1);
+	EXPECT_TRUE(GameServer()->m_apPlayers[Anna]->IsNameMarked());
 	m_pServer->Console()->ExecuteLineFlag("fight", CFGFLAG_CHAT, Bob);
 	pController->Tick();
 	EXPECT_EQ(pController->Teams().ScoreboardTeam(Bob), 0);
@@ -756,7 +784,7 @@ TEST_F(GameWorld, GTrainFreeplayFollowsFightLeaderAndMembership)
 	// freeplay individually and cannot change the remaining group's mode.
 	pController->Fight(Anna, "");
 	pController->Tick();
-	const int Leader = pController->SnapPlayerScore(Bob, GameServer()->m_apPlayers[Bob]) == 1 ? Bob : Wilson;
+	const int Leader = GameServer()->m_apPlayers[Bob]->IsNameMarked() ? Bob : Wilson;
 	const int Member = Leader == Bob ? Wilson : Bob;
 	m_pServer->Console()->ExecuteLineFlag("freeplay", CFGFLAG_CHAT, Anna);
 	EXPECT_GT(TrainingMarkers(Anna), 0);
@@ -974,9 +1002,9 @@ TEST_F(GameWorld, GTrainFightChainingDeathAndCapture)
 			EXPECT_EQ(pController->Teams().ScoreboardTeam(ClientId), pController->Teams().ScoreboardTeam(Anna));
 		}
 		EXPECT_GT(pController->Teams().ScoreboardTeam(Anna), 0);
-		EXPECT_EQ(pController->SnapPlayerScore(Anna, GameServer()->m_apPlayers[Anna]), 1);
-		EXPECT_EQ(pController->SnapPlayerScore(Bob, GameServer()->m_apPlayers[Bob]), 0);
-		EXPECT_EQ(pController->SnapPlayerScore(Wilson, GameServer()->m_apPlayers[Wilson]), 0);
+		EXPECT_TRUE(GameServer()->m_apPlayers[Anna]->IsNameMarked());
+		EXPECT_FALSE(GameServer()->m_apPlayers[Bob]->IsNameMarked());
+		EXPECT_FALSE(GameServer()->m_apPlayers[Wilson]->IsNameMarked());
 		EXPECT_EQ(pController->Teams().ScoreboardTeam(Observer), 0);
 		EXPECT_EQ(GameServer()->GetPlayerChar(Observer)->m_Pos, ObserverPosition);
 		EXPECT_EQ(TrainingGoal(Observer), ObserverGoal);
@@ -1139,7 +1167,7 @@ TEST_F(GameWorld, GTrainFightTeamsMergeLeaveAndDisconnect)
 		EXPECT_EQ(TrainingGoal(ClientId), TrainingGoal(Dee));
 		EXPECT_EQ(GameServer()->GetPlayerChar(ClientId)->m_Pos, GameServer()->GetPlayerChar(Dee)->m_Pos);
 	}
-	EXPECT_EQ(pController->SnapPlayerScore(Dee, GameServer()->m_apPlayers[Dee]), 1);
+	EXPECT_TRUE(GameServer()->m_apPlayers[Dee]->IsNameMarked());
 	EXPECT_EQ(pController->SnapPlayerScore(Anna, GameServer()->m_apPlayers[Anna]), 0);
 
 	// Leaving a nonleader preserves the leader and the other players' attempt.
@@ -1148,14 +1176,14 @@ TEST_F(GameWorld, GTrainFightTeamsMergeLeaveAndDisconnect)
 	m_pServer->Console()->ExecuteLineFlag("fight", CFGFLAG_CHAT, Bob);
 	pController->Tick();
 	EXPECT_EQ(pController->Teams().ScoreboardTeam(Bob), 0);
-	EXPECT_EQ(pController->SnapPlayerScore(Dee, GameServer()->m_apPlayers[Dee]), 1);
+	EXPECT_TRUE(GameServer()->m_apPlayers[Dee]->IsNameMarked());
 	EXPECT_EQ(GameServer()->GetPlayerChar(Dee)->m_Pos, GroupPosition);
 	EXPECT_EQ(TrainingGoal(Dee), GroupGoal);
 	GameServer()->m_apPlayers[Bob]->KillCharacter(WEAPON_SELF);
 	for(int ClientId : {Anna, Wilson, Dee, Ed})
 		ASSERT_NE(GameServer()->GetPlayerChar(ClientId), nullptr);
 
-	// The wire snapshot must show numeric leader markers on both protocols.
+	// A new group starts with zero wins on both protocols.
 	for(bool Sixup : {false, true})
 	{
 		m_pServer->m_aClients[Dee].m_Sixup = Sixup;
@@ -1183,9 +1211,7 @@ TEST_F(GameWorld, GTrainFightTeamsMergeLeaveAndDisconnect)
 			if(pSnap->GetItemType(i) == (Sixup ? (int)protocol7::NETOBJTYPE_PLAYERINFO : (int)NETOBJTYPE_PLAYERINFO))
 			{
 				const int Score = Sixup ? ((const protocol7::CNetObj_PlayerInfo *)pItem->Data())->m_Score : ((const CNetObj_PlayerInfo *)pItem->Data())->m_Score;
-				int LeaderId = Dee;
-				ASSERT_TRUE(m_pServer->Translate(LeaderId, Dee));
-				EXPECT_EQ(Score, pItem->Id() == LeaderId ? 1 : 0);
+				EXPECT_EQ(Score, 0);
 				++PlayerInfos;
 			}
 			if(pSnap->GetItemType(i) == NETOBJTYPE_GAMEINFOEX)
@@ -1217,7 +1243,7 @@ TEST_F(GameWorld, GTrainFightTeamsMergeLeaveAndDisconnect)
 		EXPECT_EQ(pController->Teams().ScoreboardTeam(ClientId), Team);
 		EXPECT_EQ(GameServer()->GetPlayerChar(ClientId)->m_Pos, GroupPosition);
 	}
-	EXPECT_EQ(pController->SnapPlayerScore(Ed, GameServer()->m_apPlayers[Ed]), 1);
+	EXPECT_TRUE(GameServer()->m_apPlayers[Ed]->IsNameMarked());
 	GameServer()->m_apPlayers[Wilson]->KillCharacter(WEAPON_SELF);
 	ASSERT_NE(GameServer()->GetPlayerChar(Anna), nullptr);
 	ASSERT_NE(GameServer()->GetPlayerChar(Ed), nullptr);
@@ -1227,6 +1253,211 @@ TEST_F(GameWorld, GTrainFightTeamsMergeLeaveAndDisconnect)
 		EXPECT_EQ(GameServer()->GetPlayerChar(ClientId), nullptr);
 	pController->Tick();
 	EXPECT_EQ(TrainingGoal(Anna), TrainingGoal(Ed));
+}
+
+TEST_F(GameWorld, ChatFlagFilterCountsLiveChatTicksAndMessageCharacters)
+{
+	PrepareTrainingCorridor();
+	g_Config.m_SvRequireChatFlagToChat = 1;
+	g_Config.m_SvSpamprotection = 0;
+	const auto vIds = SpawnTrainingPlayers({"Speaker", "Observer"});
+	const int Speaker = vIds[0], Observer = vIds[1];
+	CPlayer *pPlayer = GameServer()->m_apPlayers[Speaker];
+	pPlayer->m_PlayerFlags = 0;
+	m_pServer->m_avChatMessages[Speaker].clear();
+	m_pServer->m_avChatMessages[Observer].clear();
+	Say(Speaker, "hi");
+	EXPECT_TRUE(m_pServer->m_avChatMessages[Observer].empty());
+	ASSERT_FALSE(m_pServer->m_avChatMessages[Speaker].empty());
+	EXPECT_EQ(m_pServer->m_avChatMessages[Speaker].back(), "You are not allowed to use the chat yet. Please wait 20 seconds.");
+	pPlayer->m_PlayerFlags = PLAYERFLAG_CHATTING;
+	pPlayer->Tick();
+	EXPECT_EQ(pPlayer->m_TicksSpentChatting, 1);
+	Say(Speaker, "hi");
+	EXPECT_TRUE(m_pServer->m_avChatMessages[Observer].empty());
+	pPlayer->Tick();
+	EXPECT_EQ(pPlayer->m_TicksSpentChatting, 2);
+	Say(Speaker, "hi");
+	ASSERT_FALSE(m_pServer->m_avChatMessages[Observer].empty());
+	EXPECT_EQ(m_pServer->m_avChatMessages[Observer].back(), "hi");
+	// Thresholds use UTF-8 characters, not bytes, and include exactly ten.
+	Say(Speaker, "éééééééééé");
+	EXPECT_EQ(m_pServer->m_avChatMessages[Observer].back(), "éééééééééé");
+	m_pServer->m_avChatMessages[Observer].clear();
+	Say(Speaker, "ééééééééééé");
+	EXPECT_TRUE(m_pServer->m_avChatMessages[Observer].empty());
+	for(int i = 2; i < 20; ++i)
+		pPlayer->Tick();
+	EXPECT_EQ(pPlayer->m_TicksSpentChatting, 20);
+	pPlayer->m_PlayerFlags = 0;
+	pPlayer->Tick();
+	Say(Speaker, "hello world");
+	ASSERT_FALSE(m_pServer->m_avChatMessages[Observer].empty());
+	EXPECT_EQ(m_pServer->m_avChatMessages[Observer].back(), "hello world");
+	pPlayer->Reset();
+	EXPECT_EQ(pPlayer->m_TicksSpentChatting, 0);
+}
+
+TEST_F(GameWorld, ChatFlagFilterAllowsSpectatorsAndBindsAfterTwentySeconds)
+{
+	PrepareTrainingCorridor();
+	g_Config.m_SvRequireChatFlagToChat = 1;
+	g_Config.m_SvSpamprotection = 0;
+	const auto vIds = SpawnTrainingPlayers({"Spectator", "Observer"});
+	const int Speaker = vIds[0], Observer = vIds[1];
+	CPlayer *pPlayer = GameServer()->m_apPlayers[Speaker];
+	pPlayer->SetTeam(TEAM_SPECTATORS, false);
+	pPlayer->m_PlayerFlags = PLAYERFLAG_CHATTING;
+	for(int i = 0; i < 20; ++i)
+		pPlayer->Tick();
+	EXPECT_EQ(pPlayer->m_TicksSpentChatting, 0); // no live character
+	m_pServer->m_avChatMessages[Observer].clear();
+	m_pServer->AdvanceTicks(20 * m_pServer->TickSpeed() - 1);
+	Say(Speaker, "hi");
+	EXPECT_TRUE(m_pServer->m_avChatMessages[Observer].empty());
+	EXPECT_EQ(m_pServer->m_avChatMessages[Speaker].back(), "You are not allowed to use the chat yet. Please wait 1 seconds.");
+	m_pServer->AdvanceTicks(1);
+	Say(Speaker, "a spectator chat bind");
+	ASSERT_FALSE(m_pServer->m_avChatMessages[Observer].empty());
+	EXPECT_EQ(m_pServer->m_avChatMessages[Observer].back(), "a spectator chat bind");
+}
+
+TEST_F(GameWorld, ChatFlagFilterIsOptionalAndLeavesCommandsAvailable)
+{
+	PrepareTrainingCorridor();
+	g_Config.m_SvSpamprotection = 0;
+	const auto vIds = SpawnTrainingPlayers({"Speaker", "Observer"});
+	const int Speaker = vIds[0], Observer = vIds[1];
+	g_Config.m_SvRequireChatFlagToChat = 0;
+	m_pServer->m_avChatMessages[Observer].clear();
+	Say(Speaker, "a chat bind immediately after joining");
+	ASSERT_FALSE(m_pServer->m_avChatMessages[Observer].empty());
+	EXPECT_EQ(m_pServer->m_avChatMessages[Observer].back(), "a chat bind immediately after joining");
+	g_Config.m_SvRequireChatFlagToChat = 1;
+	Say(Speaker, "/fight Observer");
+	GameServer()->m_pController->Tick();
+	EXPECT_TRUE(GameServer()->m_apPlayers[Observer]->IsNameMarked());
+	m_pServer->m_avChatMessages[Speaker].clear();
+	Say(Speaker, "team chat", true);
+	ASSERT_FALSE(m_pServer->m_avChatMessages[Speaker].empty());
+	EXPECT_NE(m_pServer->m_avChatMessages[Speaker].back().find("You are not allowed to use the chat yet."), std::string::npos);
+	Say(Observer, "/freeplay");
+	EXPECT_EQ(TrainingMarkers(Observer), 0);
+	EXPECT_EQ(TrainingMarkers(Speaker), 0);
+}
+
+TEST_F(GameWorld, GTrainScoreboardWinsAndLeaderNamesKeepCanonicalServerNames)
+{
+	PrepareTrainingCorridor();
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob", "Viewer"});
+	const int Anna = vIds[0], Bob = vIds[1], Viewer = vIds[2];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	for(int ClientId : {Anna, Viewer})
+	{
+		m_pServer->m_aClients[ClientId].m_Sixup = true;
+		GameServer()->m_PlayerMapping.InitPlayerMap(ClientId);
+	}
+	for(int ClientId : {Anna, Viewer})
+	{
+		for(int Other : vIds)
+			GameServer()->m_PlayerMapping.ForceInsertPlayer(Other, ClientId);
+		m_pServer->m_avClientIdentities[ClientId].clear();
+	}
+	pController->Fight(Bob, "Anna");
+	pController->Tick();
+	char aName[MAX_NAME_LENGTH];
+	GameServer()->m_apPlayers[Anna]->GetDisplayName(aName, sizeof(aName));
+	EXPECT_STREQ(aName, "*Anna*");
+	EXPECT_STREQ(m_pServer->ClientName(Anna), "Anna");
+	EXPECT_EQ(GameServer()->FindClientIdByName("Anna"), Anna);
+	EXPECT_EQ(GameServer()->FindClientIdByName("*Anna*"), Anna);
+	for(int ClientId : {Anna, Viewer})
+	{
+		SCOPED_TRACE(ClientId);
+		int MappedAnna = Anna;
+		ASSERT_TRUE(m_pServer->Translate(MappedAnna, ClientId));
+		bool Found = false;
+		for(const auto &Info : m_pServer->m_avClientIdentities[ClientId])
+			if(Info.m_ClientId == MappedAnna && Info.m_Name == "*Anna*")
+			{
+				EXPECT_EQ(Info.m_Local, ClientId == Anna);
+				Found = true;
+			}
+		EXPECT_TRUE(Found); // 0.7 names update for the leader and observers
+	}
+	for(int Winner : {Bob, Bob, Anna})
+	{
+		for(int ClientId : {Anna, Bob})
+			GameServer()->GetPlayerChar(ClientId)->Unfreeze();
+		pController->Tick();
+		CCharacter *pChr = GameServer()->GetPlayerChar(Winner);
+		pChr->m_Pos = pChr->m_PrevPos = TrainingGoal(Winner);
+		pChr->SetPosition(pChr->m_Pos);
+		pController->Tick();
+	}
+	EXPECT_EQ(pController->SnapPlayerScore(Anna, GameServer()->m_apPlayers[Anna]), 1);
+	EXPECT_EQ(pController->SnapPlayerScore(Bob, GameServer()->m_apPlayers[Bob]), 2);
+	EXPECT_EQ(m_pServer->m_aClients[Anna].m_Score, 1);
+	EXPECT_EQ(m_pServer->m_aClients[Bob].m_Score, 2);
+	for(bool Sixup : {false, true})
+	{
+		m_pServer->m_aClients[Viewer].m_Sixup = Sixup;
+		CSnapshotBuffer Buffer;
+		m_pServer->m_SnapshotBuilder.Init(Sixup);
+		for(int ClientId : {Anna, Bob})
+			GameServer()->m_apPlayers[ClientId]->Snap(Viewer);
+		m_pServer->m_SnapshotBuilder.Finish(&Buffer);
+		const CSnapshot *pSnap = Buffer.AsSnapshot();
+		int Infos = 0;
+		for(int i = 0; i < pSnap->NumItems(); ++i)
+		{
+			const auto *pItem = pSnap->GetItem(i);
+			int MappedAnna = Anna;
+			ASSERT_TRUE(m_pServer->Translate(MappedAnna, Viewer));
+			const bool Leader = pItem->Id() == MappedAnna;
+			if(pSnap->GetItemType(i) == (Sixup ? (int)protocol7::NETOBJTYPE_PLAYERINFO : (int)NETOBJTYPE_PLAYERINFO))
+			{
+				const int Score = Sixup ? ((const protocol7::CNetObj_PlayerInfo *)pItem->Data())->m_Score : ((const CNetObj_PlayerInfo *)pItem->Data())->m_Score;
+				EXPECT_EQ(Score, Leader ? 1 : 2);
+				++Infos;
+			}
+			if(!Sixup && pSnap->GetItemType(i) == NETOBJTYPE_CLIENTINFO)
+			{
+				const auto *pInfo = (const CNetObj_ClientInfo *)pItem->Data();
+				EXPECT_TRUE(IntsToStr(pInfo->m_aName, std::size(pInfo->m_aName), aName, sizeof(aName)));
+				EXPECT_STREQ(aName, Leader ? "*Anna*" : "Bob");
+			}
+		}
+		EXPECT_EQ(Infos, 2);
+	}
+	// The actual server-info packet keeps the original player name.
+	m_pServer->m_aClients[Anna].m_DebugDummy = false;
+	CServer::CCache Cache;
+	m_pServer->CacheServerInfo(&Cache, SERVERINFO_EXTENDED, true);
+	bool FoundCanonical = false;
+	for(const auto &Chunk : Cache.m_vCache)
+	{
+		const std::string Data((const char *)Chunk.m_vData.data(), Chunk.m_vData.size());
+		EXPECT_EQ(Data.find("*Anna*"), std::string::npos);
+		FoundCanonical |= Data.find(std::string("Anna\0", 5)) != std::string::npos;
+	}
+	EXPECT_TRUE(FoundCanonical);
+	m_pServer->m_aClients[Anna].m_DebugDummy = true;
+
+	// Leaving transfers the leader decoration and resets only the leaver.
+	m_pServer->m_aClients[Viewer].m_Sixup = true;
+	pController->Fight(Viewer, "*Anna*");
+	pController->Tick();
+	pController->Fight(Anna, "");
+	pController->Tick();
+	EXPECT_FALSE(GameServer()->m_apPlayers[Anna]->IsNameMarked());
+	EXPECT_EQ(pController->SnapPlayerScore(Anna, GameServer()->m_apPlayers[Anna]), 0);
+	EXPECT_EQ(pController->SnapPlayerScore(Bob, GameServer()->m_apPlayers[Bob]), 2);
+	const int Leader = GameServer()->m_apPlayers[Bob]->IsNameMarked() ? Bob : Viewer;
+	GameServer()->m_apPlayers[Leader]->GetDisplayName(aName, sizeof(aName));
+	EXPECT_EQ(aName[0], '*');
+	EXPECT_EQ(aName[str_length(aName) - 1], '*');
+	EXPECT_STREQ(m_pServer->ClientName(Anna), "Anna");
 }
 
 TEST_F(GameWorld, ClosestCharacter)
