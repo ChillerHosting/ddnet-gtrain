@@ -632,7 +632,7 @@ CClientMask CGameTeams::TeamMask(int Team, int ExceptId, int Asker, int VersionF
 
 void CGameTeams::SendTeamsState(int ClientId)
 {
-	if(g_Config.m_SvTeam == SV_TEAM_FORCED_SOLO)
+	if(g_Config.m_SvTeam == SV_TEAM_FORCED_SOLO && !m_pScoreboardTeams)
 		return;
 
 	if(!m_pGameContext->m_apPlayers[ClientId])
@@ -674,8 +674,8 @@ void CGameTeams::SendTeamsState(int ClientId)
 		int TranslatedId = i;
 		if(Server()->ReverseTranslate(TranslatedId, ClientId))
 		{
-			// TeamForClient is also used for the switch state snap and Sv_KillMsgTeam, which have to agree with the teams state
-			Team = TeamForClient(m_Core.Team(TranslatedId), ClientId);
+			// Use the same legacy team numbering as other team messages.
+			Team = TeamForClient(ScoreboardTeam(TranslatedId), ClientId);
 		}
 		Msg.AddInt(Team);
 		MsgLegacy.AddInt(Team);
@@ -689,6 +689,15 @@ void CGameTeams::SendTeamsState(int ClientId)
 	}
 }
 
+void CGameTeams::SetScoreboardTeams(const int *pTeams)
+{
+	m_pScoreboardTeams = pTeams;
+	UpdateLegacyTeamMap();
+	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
+		if(GameServer()->m_apPlayers[ClientId])
+			SendTeamsState(ClientId);
+}
+
 void CGameTeams::UpdateLegacyTeamMap()
 {
 	// Clients before VERSION_DDNET_128_TEAMS only know team numbers up to LEGACY_TEAM_SUPER. Only whether
@@ -697,7 +706,7 @@ void CGameTeams::UpdateLegacyTeamMap()
 	// correct, at the cost of showing a different team number than the one the player joined.
 	bool aTeamOccupied[NUM_DDRACE_TEAMS] = {};
 	for(int i = 0; i < MAX_CLIENTS; i++)
-		aTeamOccupied[m_Core.Team(i)] = true;
+		aTeamOccupied[ScoreboardTeam(i)] = true;
 
 	// teams that the client can represent keep their own number
 	for(int Team = TEAM_FLOCK; Team < LEGACY_TEAM_SUPER; Team++)
@@ -728,7 +737,7 @@ int CGameTeams::TeamForClient(int Team, int ClientId) const
 	if(ClientSupportsServerNumTeams(ClientId))
 		return Team;
 	// If the team's slots are not reserved, dont highlight it. Causes mismatch between dummy and main when playermapping is active.
-	if(!Server()->ClientSupportsServerMaxClients(ClientId) && !GameServer()->m_PlayerMapping.ReserveTeamSlots(Team, ClientId))
+	if(!m_pScoreboardTeams && !Server()->ClientSupportsServerMaxClients(ClientId) && !GameServer()->m_PlayerMapping.ReserveTeamSlots(Team, ClientId))
 		return TEAM_FLOCK;
 	return m_aLegacyTeamMap[Team];
 }

@@ -46,6 +46,8 @@ class CGameTeams
 
 	// Team numbers as they are sent to clients before VERSION_DDNET_128_TEAMS, see UpdateLegacyTeamMap
 	int m_aLegacyTeamMap[NUM_DDRACE_TEAMS];
+	// Optional presentation teams for modes with separate physical solo teams.
+	const int *m_pScoreboardTeams = nullptr;
 	void UpdateLegacyTeamMap();
 
 	CGameContext *m_pGameContext;
@@ -111,6 +113,9 @@ public:
 	void ResetSwitchers(int Team);
 
 	void SendTeamsState(int ClientId);
+	void SetScoreboardTeams(const int *pTeams);
+	bool HasScoreboardTeams() const { return m_pScoreboardTeams != nullptr; }
+	int ScoreboardTeam(int ClientId) const { return m_pScoreboardTeams ? m_pScoreboardTeams[ClientId] : m_Core.Team(ClientId); }
 	void SetTeamLock(int Team, bool Lock);
 	void SetTeamFlock(int Team, bool Mode);
 	void ResetInvited(int Team);

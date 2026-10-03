@@ -5,6 +5,8 @@
 
 #include <engine/shared/config.h>
 
+#include <generated/server_data.h>
+
 #include <game/collision.h>
 #include <game/mapitems.h>
 #include <game/server/entities/character.h>
@@ -18,16 +20,31 @@
 #define TEST_TYPE_NAME "TestGTrain"
 
 CGameControllerGTrain::CGameControllerGTrain(class CGameContext *pGameServer) :
-	CGameControllerDDNet(pGameServer)
+	CGameControllerDDNet(pGameServer),
+	m_Pathfinder(m_PathGraph)
 {
 	m_pGameType = g_Config.m_SvTestingCommands ? TEST_TYPE_NAME : GAME_TYPE_NAME;
+	m_GameFlags = 0; // Scores are leader markers, including on 0.7 clients.
 
 	std::fill(std::begin(m_aPendingPlace), std::end(m_aPendingPlace), false);
+	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
+		m_aFightGroup[ClientId] = ClientId;
+	m_FlagSnapId = Server()->SnapNewId();
+	for(auto &SnapId : m_aDirectionSnapIds)
+		SnapId = Server()->SnapNewId();
 
 	FindTrainPositions();
+	Teams().SetScoreboardTeams(m_aScoreboardTeams);
 }
 
-CGameControllerGTrain::~CGameControllerGTrain() = default;
+CGameControllerGTrain::~CGameControllerGTrain()
+{
+	if(m_FlagSnapId)
+		Server()->SnapFreeId(*m_FlagSnapId);
+	for(auto SnapId : m_aDirectionSnapIds)
+		if(SnapId)
+			Server()->SnapFreeId(*SnapId);
+}
 
 void CGameControllerGTrain::FindTrainPositions()
 {
@@ -197,6 +214,44 @@ void CGameControllerGTrain::FindTrainPositions()
 		log_warn("gtrain", "no tiles found between start and finish line%s, training is disabled on this map", FoundStart ? "" : " (map has no start line)");
 	else
 		log_info("gtrain", "found %d tiles between start and finish line", (int)m_vTrainPositions.size());
+
+	// Spawn eligibility and path eligibility differ: routes may pass safe tiles
+	// without freeze below, but never route through freeze, death or race lines.
+	m_vTileNodes.assign(Width * Height, -1);
+	for(int Index = 0; Index < Width * Height; ++Index)
+	{
+		if(!vKept[Index] || vDiscarded[Index] || IsBlocked(Index) ||
+			HasTile(Index, TILE_FREEZE) || HasTile(Index, TILE_DFREEZE) || HasTile(Index, TILE_DEATH) ||
+			HasTile(Index, TILE_START) || HasTile(Index, TILE_FINISH) || IsCheckTeleport(Index))
+			continue;
+		// Checkpoint teleports depend on character history, so they cannot be
+		// represented as unconditional edges in a shared static graph.
+		m_vTileNodes[Index] = (int)m_PathGraph.m_vNodes.size();
+		m_PathGraph.m_vNodes.push_back({vec2((Index % Width) * 32.0f + 16.0f, (Index / Width) * 32.0f + 16.0f), false});
+	}
+	for(vec2 Pos : m_vTrainPositions)
+		m_PathGraph.m_vNodes[m_vTileNodes[pCollision->GetPureMapIndex(Pos)]].m_Goal = true;
+
+	std::vector<std::pair<int, CGTrainPathGraph::CEdge>> vEdges;
+	for(int Index = 0; Index < Width * Height; ++Index)
+	{
+		const int Node = m_vTileNodes[Index];
+		if(Node < 0)
+			continue;
+		const int Teleport = pCollision->IsTeleport(Index) ? pCollision->IsTeleport(Index) : pCollision->IsEvilTeleport(Index);
+		if(Teleport)
+		{
+			for(vec2 Out : pCollision->TeleOuts(Teleport - 1))
+			{
+				const int Destination = m_vTileNodes[pCollision->GetPureMapIndex(Out)];
+				if(Destination >= 0)
+					vEdges.push_back({Node, {Destination, 0}});
+			}
+			continue;
+		}
+		CGTrainPathGraph::AddTileEdges(Index, Width, Height, m_vTileNodes, vEdges);
+	}
+	m_PathGraph.InitEdges(vEdges);
 }
 
 void CGameControllerGTrain::PlaceRandomly(CCharacter *pChr)
@@ -207,6 +262,29 @@ void CGameControllerGTrain::PlaceRandomly(CCharacter *pChr)
 		return;
 
 	const vec2 Pos = m_vTrainPositions[secure_rand_below(m_vTrainPositions.size())];
+	CAttempt &Attempt = m_aAttempts[ClientId];
+	if(!Attempt.m_pGoal || !Attempt.m_pGoal.unique())
+		Attempt.m_pGoal = std::make_shared<CGTrainGoal>();
+	const int Start = PathNode(Pos);
+	const int TargetDistance = g_Config.m_SvGtrainGoalDistance;
+	m_Pathfinder.Build(*Attempt.m_pGoal, Start, TargetDistance, secure_rand_below(1 << 30));
+	PlaceForAttempt(pChr, Attempt.m_pGoal, Start, TargetDistance);
+}
+
+void CGameControllerGTrain::PlaceForAttempt(CCharacter *pChr, const std::shared_ptr<CGTrainGoal> &pGoal, int Start, int TargetDistance)
+{
+	const int ClientId = pChr->GetPlayer()->GetCid();
+	m_aPendingPlace[ClientId] = false;
+	CAttempt &Attempt = m_aAttempts[ClientId];
+	Attempt.m_pGoal = pGoal;
+	Attempt.m_Start = Start;
+	Attempt.m_TargetDistance = TargetDistance;
+	Attempt.m_StartTick = -1;
+	Attempt.m_vRoute = pGoal->m_vInitialRoute;
+	Attempt.m_RouteIndex = 0;
+	Attempt.m_RouteNode = Start;
+	Attempt.m_LastPathTick = -1;
+	const vec2 Pos = m_PathGraph.m_vNodes[Start].m_Pos;
 	pChr->SetDeepFrozen(false);
 	pChr->SetLiveFrozen(false);
 	pChr->Unfreeze();
@@ -221,8 +299,7 @@ void CGameControllerGTrain::PlaceRandomly(CCharacter *pChr)
 
 	// hover in place until the freeze is over
 	pChr->ForceFreeze(HOVER_TICKS);
-	pChr->m_ZeroGravity = true;
-	GameServer()->SendTuningParams(ClientId, pChr->m_TuneZone);
+	pChr->SetZeroGravity(true);
 }
 
 void CGameControllerGTrain::OnCharacterSpawn(CCharacter *pChr)
@@ -233,30 +310,514 @@ void CGameControllerGTrain::OnCharacterSpawn(CCharacter *pChr)
 	m_aPendingPlace[pChr->GetPlayer()->GetCid()] = true;
 }
 
+int CGameControllerGTrain::FightSize(int Group) const
+{
+	int Size = 0;
+	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
+		if(m_aFightGroup[ClientId] == Group && GameServer()->m_apPlayers[ClientId])
+			++Size;
+	return Size;
+}
+
+int CGameControllerGTrain::SnapPlayerScore(int SnappingClient, CPlayer *pPlayer)
+{
+	const int ClientId = pPlayer->GetCid();
+	return pPlayer->GetTeam() != TEAM_SPECTATORS && m_aFightGroup[ClientId] == ClientId && m_aFightTeam[ClientId] != 0 ? 1 : 0;
+}
+
+void CGameControllerGTrain::UpdateFightTeams()
+{
+	int aSizes[MAX_CLIENTS] = {};
+	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
+		if(GameServer()->m_apPlayers[ClientId] && GameServer()->m_apPlayers[ClientId]->GetTeam() != TEAM_SPECTATORS)
+			++aSizes[m_aFightGroup[ClientId]];
+	for(int Group = 0; Group < MAX_CLIENTS; ++Group)
+		if(aSizes[Group] < 2)
+			m_aFightTeam[Group] = 0;
+	for(int Group = 0; Group < MAX_CLIENTS; ++Group)
+	{
+		if(aSizes[Group] < 2 || m_aFightTeam[Group] != 0)
+			continue;
+		for(int Team = 1; Team < TEAM_SUPER; ++Team)
+		{
+			if(std::find(std::begin(m_aFightTeam), std::end(m_aFightTeam), Team) == std::end(m_aFightTeam))
+			{
+				m_aFightTeam[Group] = Team;
+				break;
+			}
+		}
+	}
+	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
+	{
+		CPlayer *pPlayer = GameServer()->m_apPlayers[ClientId];
+		m_aScoreboardTeams[ClientId] = pPlayer && pPlayer->GetTeam() != TEAM_SPECTATORS ? m_aFightTeam[m_aFightGroup[ClientId]] : 0;
+		if(pPlayer)
+			Server()->SetClientScore(ClientId, SnapPlayerScore(ClientId, pPlayer));
+	}
+	Teams().SetScoreboardTeams(m_aScoreboardTeams);
+}
+
+void CGameControllerGTrain::RestartFight(int Group, bool KeepGoal)
+{
+	m_aFightRestart[Group] = false;
+	if(m_vTrainPositions.empty())
+		return;
+	const CAttempt &Previous = m_aAttempts[Group];
+	const int Start = KeepGoal ? Previous.m_Start : PathNode(m_vTrainPositions[secure_rand_below(m_vTrainPositions.size())]);
+	const vec2 Pos = m_PathGraph.m_vNodes[Start].m_Pos;
+	const int TargetDistance = KeepGoal ? Previous.m_TargetDistance : g_Config.m_SvGtrainGoalDistance;
+	// All owners of this goal belong to the resetting group. Build it once,
+	// then share it while keeping timers local to each player.
+	auto pGoal = m_aAttempts[Group].m_pGoal;
+	if(!pGoal)
+		pGoal = std::make_shared<CGTrainGoal>();
+	if(!KeepGoal)
+		m_Pathfinder.Build(*pGoal, Start, TargetDistance, secure_rand_below(1 << 30));
+	m_SyncFightDeaths = true;
+	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
+	{
+		CPlayer *pPlayer = GameServer()->m_apPlayers[ClientId];
+		if(m_aFightGroup[ClientId] != Group || !pPlayer || pPlayer->GetTeam() == TEAM_SPECTATORS)
+			continue;
+		CCharacter *pChr = pPlayer->GetCharacter();
+		if(!pChr)
+		{
+			// Delete a dead character before reusing its allocation pool slot.
+			pPlayer->KillCharacter(WEAPON_GAME, false);
+			pChr = pPlayer->ForceSpawn(Pos);
+			pChr->SetSolo(true);
+		}
+		PlaceForAttempt(pChr, pGoal, Start, TargetDistance);
+	}
+	m_SyncFightDeaths = false;
+}
+
+bool CGameControllerGTrain::LeaveFight(int ClientId, bool NewAttempt)
+{
+	const int Group = m_aFightGroup[ClientId];
+	if(FightSize(Group) <= 1)
+	{
+		m_aFightWins[ClientId] = 0;
+		return false;
+	}
+	const bool Restart = m_aFightRestart[Group];
+	const int ScoreboardTeam = m_aFightTeam[Group];
+	m_aFightRestart[Group] = false;
+	m_aFightTeam[Group] = 0;
+	int RemainingGroup = Group == ClientId ? -1 : Group;
+	if(RemainingGroup < 0)
+		for(int Other = 0; Other < MAX_CLIENTS; ++Other)
+			if(Other != ClientId && m_aFightGroup[Other] == Group && GameServer()->m_apPlayers[Other])
+			{
+				RemainingGroup = Other;
+				break;
+			}
+	if(RemainingGroup >= 0)
+	{
+		for(int Other = 0; Other < MAX_CLIENTS; ++Other)
+			if(Other != ClientId && m_aFightGroup[Other] == Group)
+				m_aFightGroup[Other] = RemainingGroup;
+		m_aFightRestart[RemainingGroup] = Restart;
+		m_aFightTeam[RemainingGroup] = ScoreboardTeam;
+	}
+	m_aFightGroup[ClientId] = ClientId;
+	m_aFightRestart[ClientId] = false;
+	m_aFightWins[ClientId] = 0;
+	m_aAttempts[ClientId].m_pGoal.reset();
+	if(NewAttempt)
+		m_aPendingPlace[ClientId] = true;
+	UpdateFightTeams();
+	return true;
+}
+
+void CGameControllerGTrain::Fight(int ClientId, const char *pName)
+{
+	CPlayer *pPlayer = GameServer()->m_apPlayers[ClientId];
+	if(!pPlayer)
+		return;
+	if(!pName[0])
+	{
+		GameServer()->SendChatTarget(ClientId, LeaveFight(ClientId, true) ? "You left fight mode." : "You are not in fight mode.");
+		return;
+	}
+	const int Target = GameServer()->FindClientIdByName(pName).value_or(-1);
+	if(Target < 0 || !GameServer()->m_apPlayers[Target])
+	{
+		GameServer()->SendChatTarget(ClientId, "Player not found. Use their full name.");
+		return;
+	}
+	if(Target == ClientId)
+	{
+		GameServer()->SendChatTarget(ClientId, "You cannot fight yourself.");
+		return;
+	}
+	CPlayer *pTarget = GameServer()->m_apPlayers[Target];
+	if(pPlayer->GetTeam() == TEAM_SPECTATORS || pTarget->GetTeam() == TEAM_SPECTATORS || pPlayer->IsPaused() || pTarget->IsPaused())
+	{
+		GameServer()->SendChatTarget(ClientId, "Both players must be playing and unpaused to join a fight.");
+		return;
+	}
+	if(m_vTrainPositions.empty())
+	{
+		GameServer()->SendChatTarget(ClientId, "Training is disabled on this map.");
+		return;
+	}
+	const int SourceGroup = m_aFightGroup[ClientId];
+	const int TargetGroup = m_aFightGroup[Target];
+	if(SourceGroup == TargetGroup)
+	{
+		GameServer()->SendChatTarget(ClientId, "You are already in the same fight.");
+		return;
+	}
+	for(int Other = 0; Other < MAX_CLIENTS; ++Other)
+		if(m_aFightGroup[Other] == SourceGroup)
+			m_aFightGroup[Other] = TargetGroup;
+	m_aFightRestart[SourceGroup] = false;
+	m_aFightRestart[TargetGroup] = true;
+	UpdateFightTeams();
+	char aMessage[160];
+	str_format(aMessage, sizeof(aMessage), "'%s' joined the fight with '%s'. Everyone starts a new attempt. Use /fight to leave.",
+		Server()->ClientName(ClientId), Server()->ClientName(Target));
+	for(int Other = 0; Other < MAX_CLIENTS; ++Other)
+		if(m_aFightGroup[Other] == TargetGroup && GameServer()->m_apPlayers[Other])
+			GameServer()->SendChatTarget(Other, aMessage);
+}
+
+void CGameControllerGTrain::Retry(int ClientId)
+{
+	CPlayer *pPlayer = GameServer()->m_apPlayers[ClientId];
+	if(!pPlayer)
+		return;
+	if(pPlayer->GetTeam() == TEAM_SPECTATORS || pPlayer->IsPaused())
+	{
+		GameServer()->SendChatTarget(ClientId, "You must be playing and unpaused to retry.");
+		return;
+	}
+	const int Group = m_aFightGroup[ClientId];
+	const CAttempt &Attempt = m_aAttempts[Group];
+	if(!Attempt.m_pGoal || Attempt.m_Start < 0)
+	{
+		GameServer()->SendChatTarget(ClientId, "There is no training attempt to retry yet.");
+		return;
+	}
+	if(Group == ClientId && FightSize(Group) > 1)
+	{
+		RestartFight(Group, true);
+		return;
+	}
+	CCharacter *pChr = pPlayer->GetCharacter();
+	if(!pChr)
+	{
+		pPlayer->KillCharacter(WEAPON_GAME, false);
+		pChr = pPlayer->ForceSpawn(m_PathGraph.m_vNodes[Attempt.m_Start].m_Pos);
+		pChr->SetSolo(true);
+	}
+	PlaceForAttempt(pChr, Attempt.m_pGoal, Attempt.m_Start, Attempt.m_TargetDistance);
+}
+
+int CGameControllerGTrain::OnCharacterDeath(CCharacter *pVictim, CPlayer *pKiller, int Weapon)
+{
+	const int Result = CGameControllerDDNet::OnCharacterDeath(pVictim, pKiller, Weapon);
+	const int ClientId = pVictim->GetPlayer()->GetCid();
+	const int Group = m_aFightGroup[ClientId];
+	if(m_SyncFightDeaths || !pVictim->IsAlive() || ClientId != Group || FightSize(Group) <= 1)
+		return Result;
+	m_aFightRestart[Group] = true;
+	// Death callbacks run before the victim is marked dead. Suppress recursive
+	// propagation while killing its peers; never delete the original victim.
+	m_SyncFightDeaths = true;
+	for(int Other = 0; Other < MAX_CLIENTS; ++Other)
+		if(Other != ClientId && m_aFightGroup[Other] == Group && GameServer()->GetPlayerChar(Other))
+			GameServer()->m_apPlayers[Other]->KillCharacter(WEAPON_SELF);
+	m_SyncFightDeaths = false;
+	return Result;
+}
+
+int CGameControllerGTrain::PathNode(vec2 Pos) const
+{
+	// Do not use the collision lookup's clamping outside the map.
+	const int Width = GameServer()->Collision()->GetWidth();
+	const int Height = GameServer()->Collision()->GetHeight();
+	if(Pos.x < 0 || Pos.y < 0 || Pos.x >= Width * 32.0f || Pos.y >= Height * 32.0f)
+		return -1;
+	return m_vTileNodes[(int)(Pos.y / 32) * Width + (int)(Pos.x / 32)];
+}
+
+void CGameControllerGTrain::UpdatePath(CCharacter *pChr)
+{
+	CAttempt &Attempt = m_aAttempts[pChr->GetPlayer()->GetCid()];
+	if(!Attempt.m_pGoal || !Attempt.m_pGoal->m_Ready)
+		return;
+	const int Node = pChr->m_ZeroGravity ? Attempt.m_Start : PathNode(pChr->m_Pos);
+	if(Node == Attempt.m_RouteNode)
+		return;
+	if(Node < 0)
+	{
+		Attempt.m_RouteNode = -1;
+		return;
+	}
+	// Normal movement and small backwards steps reuse the cached route.
+	const size_t Begin = Attempt.m_RouteIndex > 8 ? Attempt.m_RouteIndex - 8 : 0;
+	const size_t End = std::min(Attempt.m_vRoute.size(), Attempt.m_RouteIndex + 9);
+	for(size_t i = Begin; i < End; ++i)
+		if(Attempt.m_vRoute[i] == Node)
+		{
+			Attempt.m_RouteIndex = i;
+			Attempt.m_RouteNode = Node;
+			return;
+		}
+	// Deviations get a fresh A* route, at most five searches per second per
+	// player. Spectator snapshots never trigger another search.
+	const int Interval = std::max(1, Server()->TickSpeed() / 5);
+	if(Attempt.m_LastPathTick >= 0 && Server()->Tick() - Attempt.m_LastPathTick < Interval)
+	{
+		Attempt.m_RouteNode = -1;
+		return;
+	}
+	Attempt.m_LastPathTick = Server()->Tick();
+	m_Pathfinder.FindPath(Node, Attempt.m_pGoal->m_Goal, Attempt.m_vRoute);
+	Attempt.m_RouteIndex = 0;
+	Attempt.m_RouteNode = Node;
+}
+
+void CGameControllerGTrain::AnnounceFightScore(int Winner)
+{
+	const int Group = m_aFightGroup[Winner];
+	++m_aFightWins[Winner];
+	char aMessage[MAX_CHAT_LENGTH];
+	str_format(aMessage, sizeof(aMessage), "'%s' wins! Fight score:", Server()->ClientName(Winner));
+	bool First = true;
+	// Leader first, then the remaining members. Split long standings into
+	// complete chat messages rather than truncating names or scores.
+	for(int i = -1; i < MAX_CLIENTS; ++i)
+	{
+		const int Other = i < 0 ? Group : i;
+		if(i == Group || m_aFightGroup[Other] != Group || !GameServer()->m_apPlayers[Other])
+			continue;
+		char aEntry[128];
+		str_format(aEntry, sizeof(aEntry), "%s '%s': %d", First ? "" : ",", Server()->ClientName(Other), m_aFightWins[Other]);
+		if(str_length(aMessage) + str_length(aEntry) >= (int)sizeof(aMessage))
+		{
+			GameServer()->SendChat(-1, TEAM_ALL, aMessage);
+			str_copy(aMessage, "Fight score:");
+			str_format(aEntry, sizeof(aEntry), " '%s': %d", Server()->ClientName(Other), m_aFightWins[Other]);
+		}
+		str_append(aMessage, aEntry);
+		First = false;
+	}
+	GameServer()->SendChat(-1, TEAM_ALL, aMessage);
+}
+
+void CGameControllerGTrain::CheckGoal(CCharacter *pChr)
+{
+	const int ClientId = pChr->GetPlayer()->GetCid();
+	CAttempt &Attempt = m_aAttempts[ClientId];
+	const CGTrainGoal &Target = *Attempt.m_pGoal;
+
+	const vec2 Goal = m_PathGraph.m_vNodes[Target.m_Goal].m_Pos;
+	// Check the movement segment too, so a fast tee cannot skip the flag.
+	// A teleport's long displacement must not collect a flag along the way.
+	vec2 Closest = pChr->m_Pos;
+	const vec2 Movement = pChr->m_Pos - pChr->m_PrevPos;
+	const float MovementSquared = dot(Movement, Movement);
+	if(MovementSquared > 0 && MovementSquared <= 256.0f * 256.0f)
+		Closest = pChr->m_PrevPos + Movement * std::clamp(dot(Goal - pChr->m_PrevPos, Movement) / MovementSquared, 0.0f, 1.0f);
+	const vec2 GoalOffset = Closest - Goal;
+	if(dot(GoalOffset, GoalOffset) < 42.0f * 42.0f)
+	{
+		const int Group = m_aFightGroup[ClientId];
+		if(FightSize(Group) > 1)
+		{
+			AnnounceFightScore(ClientId);
+			RestartFight(Group);
+		}
+		else
+		{
+			char aMessage[256];
+			const double Seconds = (Server()->Tick() - Attempt.m_StartTick) / (double)Server()->TickSpeed();
+			str_format(aMessage, sizeof(aMessage), "'%s' captured the flag in %.2f seconds.", Server()->ClientName(ClientId), Seconds);
+			GameServer()->SendChat(-1, TEAM_ALL, aMessage);
+			PlaceRandomly(pChr);
+		}
+		for(int Other = 0; Other < MAX_CLIENTS; ++Other)
+		{
+			CCharacter *pOther = GameServer()->GetPlayerChar(Other);
+			if(m_aFightGroup[Other] != Group || !pOther)
+				continue;
+			if(Server()->IsSixup(Other))
+				GameServer()->CreateSound(pOther->m_Pos, SOUND_CTF_CAPTURE, CClientMask().set(Other));
+			else
+				GameServer()->CreateSoundGlobal(SOUND_CTF_CAPTURE, Other);
+		}
+	}
+}
+
+void CGameControllerGTrain::OnPlayerDisconnect(CPlayer *pPlayer, const char *pReason)
+{
+	const int ClientId = pPlayer->GetCid();
+	LeaveFight(ClientId, false);
+	m_aPendingPlace[ClientId] = false;
+	m_aAttempts[ClientId] = CAttempt();
+	m_aFightWins[ClientId] = 0;
+	CGameControllerDDNet::OnPlayerDisconnect(pPlayer, pReason);
+}
+
+void CGameControllerGTrain::OnPlayerConnect(CPlayer *pPlayer)
+{
+	CGameControllerDDNet::OnPlayerConnect(pPlayer);
+	UpdateFightTeams();
+}
+
+void CGameControllerGTrain::Snap(int SnappingClient)
+{
+	CGameControllerDDNet::Snap(SnappingClient);
+	if(SnappingClient == SERVER_DEMO_CLIENT)
+		return;
+	CPlayer *pPlayer = GameServer()->m_apPlayers[SnappingClient];
+	if(!pPlayer)
+		return;
+	int ClientId = SnappingClient;
+	if((pPlayer->GetTeam() == TEAM_SPECTATORS || pPlayer->IsPaused()) && pPlayer->SpectatorId() != SPEC_FREEVIEW)
+		ClientId = pPlayer->SpectatorId();
+	if(ClientId < 0 || ClientId >= MAX_CLIENTS)
+		return;
+	CCharacter *pChr = GameServer()->GetPlayerChar(ClientId);
+	const CAttempt &Attempt = m_aAttempts[ClientId];
+	if(!pChr || !Attempt.m_pGoal || !Attempt.m_pGoal->m_Ready || !m_FlagSnapId)
+		return;
+	const vec2 Goal = m_PathGraph.m_vNodes[Attempt.m_pGoal->m_Goal].m_Pos;
+	CNetObj_Flag Flag = {};
+	Flag.m_X = (int)Goal.x;
+	Flag.m_Y = (int)Goal.y;
+	Flag.m_Team = TEAM_BLUE;
+	Server()->SnapNewItem(*m_FlagSnapId, Flag);
+
+	if(Attempt.m_RouteNode < 0 || Attempt.m_vRoute.empty())
+		return;
+	int NumParticles = 0;
+	const float ClearRadius = g_Config.m_SvGtrainPathClearRadius;
+	const auto Emit = [&](vec2 Pos) {
+		// Leave gameplay space clear, including where a winding path comes
+		// back near the player. Only snapshot particles inside the viewport.
+		Pos = vec2(round_to_int(Pos.x), round_to_int(Pos.y));
+		const vec2 Offset = Pos - pChr->m_Pos;
+		if(dot(Offset, Offset) < ClearRadius * ClearRadius || NetworkClipped(GameServer(), SnappingClient, Pos) || NumParticles == NUM_DIRECTION_PARTICLES)
+			return;
+		const auto SnapId = m_aDirectionSnapIds[NumParticles++];
+		if(!SnapId)
+			return;
+		CNetObj_Projectile Particle = {};
+		Particle.m_X = round_to_int(Pos.x);
+		Particle.m_Y = round_to_int(Pos.y);
+		// Hammer projectiles have no sprite but use the same bullet trail as
+		// the gun. Zero velocity keeps them still and skips client prediction.
+		Particle.m_Type = WEAPON_HAMMER;
+		Server()->SnapNewItem(*SnapId, Particle);
+	};
+	vec2 Incoming = m_PathGraph.m_vNodes[Attempt.m_vRoute[Attempt.m_RouteIndex]].m_Pos;
+	// Bounded traversal and a shared snapshot-ID pool: no per-snapshot heap
+	// allocations or map searches, even with very distant goals.
+	for(int Step = 0; Step < MAX_PATH_NODES && NumParticles < NUM_DIRECTION_PARTICLES; ++Step)
+	{
+		const size_t Index = Attempt.m_RouteIndex + Step;
+		if(Index >= Attempt.m_vRoute.size())
+			break;
+		const int Node = Attempt.m_vRoute[Index];
+		const vec2 Center = m_PathGraph.m_vNodes[Node].m_Pos;
+		const int Next = Index + 1 < Attempt.m_vRoute.size() ? Attempt.m_vRoute[Index + 1] : -1;
+		if(Next < 0)
+		{
+			if(Node == Attempt.m_pGoal->m_Goal)
+			{
+				const int Samples = std::max(1, (int)std::ceil(distance(Incoming, Center) / 8.0f));
+				for(int i = 1; i <= Samples; ++i)
+					Emit(mix(Incoming, Center, (float)i / Samples));
+			}
+			break;
+		}
+		if(m_PathGraph.IsTeleportStep(Node, Next))
+		{
+			// A teleport is a discontinuity, not a line across the map.
+			Incoming = m_PathGraph.m_vNodes[Next].m_Pos;
+			continue;
+		}
+		const vec2 Outgoing = (Center + m_PathGraph.m_vNodes[Next].m_Pos) * 0.5f;
+		// Round turns through each tile center. This curve stays within the
+		// traversable tiles and avoids a staircase of right-angle corners.
+		const int Samples = std::max(1, (int)std::ceil((distance(Incoming, Center) + distance(Center, Outgoing)) / 8.0f));
+		for(int i = 1; i <= Samples; ++i)
+		{
+			const float t = (float)i / Samples;
+			Emit(mix(mix(Incoming, Center, t), mix(Center, Outgoing, t), t));
+		}
+		Incoming = Outgoing;
+	}
+}
+
 void CGameControllerGTrain::Tick()
 {
 	CGameControllerDDNet::Tick();
 
 	// killing is how players choose a new position, never delay it
 	g_Config.m_SvKillDelay = 0;
+	if(IsGamePaused())
+	{
+		for(CAttempt &Attempt : m_aAttempts)
+			if(Attempt.m_StartTick >= 0)
+				++Attempt.m_StartTick;
+		return;
+	}
+
+	// Remove spectator links before group respawns, and coalesce all death
+	// and spawn requests into one goal selection and one placement per group.
+	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
+	{
+		CPlayer *pPlayer = GameServer()->m_apPlayers[ClientId];
+		if(!pPlayer)
+			continue;
+		if(pPlayer->GetTeam() == TEAM_SPECTATORS)
+			LeaveFight(ClientId, false);
+		else if(m_aPendingPlace[ClientId] && m_aFightGroup[ClientId] == ClientId && FightSize(ClientId) > 1)
+			m_aFightRestart[m_aFightGroup[ClientId]] = true;
+	}
+	for(int Group = 0; Group < MAX_CLIENTS; ++Group)
+		if(m_aFightRestart[Group])
+			RestartFight(Group);
 
 	for(int ClientId = 0; ClientId < MAX_CLIENTS; ClientId++)
 	{
 		CCharacter *pChr = GameServer()->GetPlayerChar(ClientId);
-		if(!pChr || pChr->IsPaused())
+		if(!pChr)
 			continue;
+		if(pChr->IsPaused())
+		{
+			if(m_aAttempts[ClientId].m_StartTick >= 0)
+				++m_aAttempts[ClientId].m_StartTick;
+			continue;
+		}
 
 		if(m_aPendingPlace[ClientId])
 		{
-			PlaceRandomly(pChr);
+			const int Group = m_aFightGroup[ClientId];
+			const CAttempt &GroupAttempt = m_aAttempts[Group];
+			// A member's own respawn rejoins the current attempt without
+			// moving peers or rebuilding their shared goal.
+			if(Group != ClientId && FightSize(Group) > 1 && GroupAttempt.m_pGoal && GroupAttempt.m_Start >= 0)
+				PlaceForAttempt(pChr, GroupAttempt.m_pGoal, GroupAttempt.m_Start, GroupAttempt.m_TargetDistance);
+			else
+				PlaceRandomly(pChr);
 			continue;
 		}
+		CAttempt &Attempt = m_aAttempts[ClientId];
 
 		// hover is over, let the player play again
 		if(pChr->m_ZeroGravity && pChr->m_FreezeTime == 0)
 		{
-			pChr->m_ZeroGravity = false;
-			GameServer()->SendTuningParams(ClientId, pChr->m_TuneZone);
+			pChr->SetZeroGravity(false);
+			Attempt.m_StartTick = Server()->Tick();
 		}
+		UpdatePath(pChr);
+		if(!pChr->m_ZeroGravity && Attempt.m_pGoal && Attempt.m_pGoal->m_Ready)
+			CheckGoal(pChr);
 	}
 }

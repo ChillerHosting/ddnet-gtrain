@@ -11,6 +11,7 @@
 
 #include <game/server/entities/character.h>
 #include <game/server/gamemodes/ddnet.h>
+#include <game/server/gamemodes/gtrain.h>
 #include <game/server/teams.h>
 #include <game/team_state.h>
 #include <game/teamscore.h>
@@ -570,6 +571,12 @@ void CGameContext::ConPractice(IConsole::IResult *pResult, void *pUserData)
 	if(!pPlayer)
 		return;
 
+	if(dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController))
+	{
+		pSelf->SendChatTarget(pResult->m_ClientId, "/practice is disabled in GTrain.");
+		return;
+	}
+
 	if(pSelf->ProcessSpamProtection(pResult->m_ClientId, false))
 		return;
 
@@ -585,7 +592,7 @@ void CGameContext::ConPractice(IConsole::IResult *pResult, void *pUserData)
 
 	if(!Teams.IsValidTeamNumber(Team) || (Team == TEAM_FLOCK && g_Config.m_SvTeam != SV_TEAM_FORCED_SOLO))
 	{
-		log_info("chatresp", "Join a team to enable practice mode, which means you can use /r, but can't earn a rank.");
+		log_info("chatresp", "Join a team to enable practice mode, which means you can use /rescue, but can't earn a rank.");
 		return;
 	}
 
@@ -1107,6 +1114,34 @@ void CGameContext::AttemptJoinTeam(int ClientId, int Team)
 	}
 }
 
+void CGameContext::ConFight(IConsole::IResult *pResult, void *pUserData)
+{
+	CGameContext *pSelf = (CGameContext *)pUserData;
+	if(!CheckClientId(pResult->m_ClientId) || !pSelf->m_apPlayers[pResult->m_ClientId])
+		return;
+	auto *pController = dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController);
+	if(!pController)
+	{
+		pSelf->SendChatTarget(pResult->m_ClientId, "Fight mode is only available in GTrain.");
+		return;
+	}
+	pController->Fight(pResult->m_ClientId, pResult->NumArguments() ? pResult->GetString(0) : "");
+}
+
+void CGameContext::ConRetry(IConsole::IResult *pResult, void *pUserData)
+{
+	CGameContext *pSelf = (CGameContext *)pUserData;
+	if(!CheckClientId(pResult->m_ClientId) || !pSelf->m_apPlayers[pResult->m_ClientId])
+		return;
+	auto *pController = dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController);
+	if(!pController)
+	{
+		pSelf->SendChatTarget(pResult->m_ClientId, "Retry is only available in GTrain.");
+		return;
+	}
+	pController->Retry(pResult->m_ClientId);
+}
+
 void CGameContext::ConInvite(IConsole::IResult *pResult, void *pUserData)
 {
 	CGameContext *pSelf = (CGameContext *)pUserData;
@@ -1243,6 +1278,11 @@ void CGameContext::ConTeam(IConsole::IResult *pResult, void *pUserData)
 	CPlayer *pPlayer = pSelf->m_apPlayers[pResult->m_ClientId];
 	if(!pPlayer)
 		return;
+	if(dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController))
+	{
+		pSelf->SendChatTarget(pResult->m_ClientId, "/team is disabled in GTrain. Use /fight to join a fight group.");
+		return;
+	}
 
 	if(pResult->NumArguments() > 0)
 	{

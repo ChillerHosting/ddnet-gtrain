@@ -509,16 +509,22 @@ void CGameContext::SnapSwitchers(int SnappingClient)
 		return;
 
 	CPlayer *pPlayer = SnappingClient != SERVER_DEMO_CLIENT ? m_apPlayers[SnappingClient] : nullptr;
+	int ViewingClient = SnappingClient;
 	int Team = pPlayer && pPlayer->GetCharacter() ? pPlayer->GetCharacter()->Team() : 0;
 
 	if(pPlayer && (pPlayer->GetTeam() == TEAM_SPECTATORS || pPlayer->IsPaused()) && pPlayer->SpectatorId() != SPEC_FREEVIEW && m_apPlayers[pPlayer->SpectatorId()] && m_apPlayers[pPlayer->SpectatorId()]->GetCharacter())
+	{
+		ViewingClient = pPlayer->SpectatorId();
 		Team = m_apPlayers[pPlayer->SpectatorId()]->GetCharacter()->Team();
+	}
 
 	if(Team == TEAM_SUPER)
 		return;
 
 	int SentTeam = Team;
-	if(g_Config.m_SvTeam == SV_TEAM_FORCED_SOLO)
+	if(pPlayer && m_pController->Teams().HasScoreboardTeams())
+		SentTeam = m_pController->Teams().TeamForClient(m_pController->Teams().ScoreboardTeam(ViewingClient), SnappingClient);
+	else if(g_Config.m_SvTeam == SV_TEAM_FORCED_SOLO)
 		SentTeam = 0;
 	else if(SnappingClient != SERVER_DEMO_CLIENT)
 		SentTeam = m_pController->Teams().TeamForClient(SentTeam, SnappingClient);
@@ -4063,6 +4069,12 @@ void CGameContext::RegisterChatCommands()
 	Console()->Register("unlock", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConUnlock, this, "Unlock a team");
 	Console()->Register("invite", "r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConInvite, this, "Invite a person to a locked team");
 	Console()->Register("join", "r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConJoin, this, "Join the team of the specified player");
+	Console()->Register("fight", "?r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConFight, this, "Join a GTrain fight with a player (no name to leave)");
+	Console()->Register("retry", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRetry, this, "Retry the current training position and goal");
+	Console()->Register("r", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRetry, this, "Retry the current training position and goal");
+	Console()->Register("invincible", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRetry, this, "Retry the current training position and goal");
+	Console()->Register("tc", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRetry, this, "Retry the current training position and goal");
+	Console()->Register("telecursor", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRetry, this, "Retry the current training position and goal");
 	Console()->Register("team0mode", "?i['0'|'1']", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTeam0Mode, this, "Toggle team between team 0 and team mode. This mode will make your team behave like team 0.");
 
 	Console()->Register("showothers", "?i['0'|'1'|'2']", CFGFLAG_CHAT | CFGFLAG_SERVER, ConShowOthers, this, "Whether to show players from other teams or not (off by default), optional i = 0 for off, i = 1 for on, i = 2 for own team only");
@@ -4073,7 +4085,6 @@ void CGameContext::RegisterChatCommands()
 	Console()->Register("saytimeall", "", CFGFLAG_CHAT | CFGFLAG_SERVER | CFGFLAG_NONTEEHISTORIC, ConSayTimeAll, this, "Publicly messages everyone your current time in this current running race");
 	Console()->Register("time", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTime, this, "Privately shows you your current time in this current running race in the broadcast message");
 	Console()->Register("timer", "?s['gametimer'|'broadcast'|'both'|'none'|'cycle']", CFGFLAG_CHAT | CFGFLAG_SERVER, ConSetTimerType, this, "Personal Setting of showing time in either broadcast or game/round timer, timer s, where s = broadcast for broadcast, gametimer for game/round timer, cycle for cycle, both for both, none for no timer and nothing to show current status");
-	Console()->Register("r", "", CFGFLAG_CHAT | CFGFLAG_SERVER | CMDFLAG_PRACTICE, ConRescue, this, "Teleport yourself out of freeze if auto rescue mode is enabled, otherwise it will set position for rescuing if grounded and teleport you out of freeze if not (use sv_rescue 1 to enable this feature)");
 	Console()->Register("rescue", "", CFGFLAG_CHAT | CFGFLAG_SERVER | CMDFLAG_PRACTICE, ConRescue, this, "Teleport yourself out of freeze if auto rescue mode is enabled, otherwise it will set position for rescuing if grounded and teleport you out of freeze if not (use sv_rescue 1 to enable this feature)");
 	Console()->Register("back", "", CFGFLAG_CHAT | CMDFLAG_PRACTICE, ConBack, this, "Teleport yourself to the last auto rescue position before you died (use sv_rescue 1 to enable this feature)");
 	Console()->Register("rescuemode", "?r['auto'|'manual']", CFGFLAG_CHAT | CFGFLAG_SERVER | CMDFLAG_PRACTICE, ConRescueMode, this, "Sets one of the two rescue modes (auto or manual). Prints current mode if no arguments provided");
@@ -4081,8 +4092,6 @@ void CGameContext::RegisterChatCommands()
 	Console()->Register("teleport", "?r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER | CMDFLAG_PRACTICE, ConTeleTo, this, "Depending on the number of supplied arguments, teleport yourself to; (0.) where you are spectating or aiming; (1.) the specified player name");
 	Console()->Register("tpxy", "s[x] s[y]", CFGFLAG_CHAT | CFGFLAG_SERVER | CMDFLAG_PRACTICE, ConTeleXY, this, "Teleport yourself to the specified coordinates. A tilde (~) can be used to denote your current position, e.g. '/tpxy ~1 ~' to teleport one tile to the right");
 	Console()->Register("lasttp", "", CFGFLAG_CHAT | CFGFLAG_SERVER | CMDFLAG_PRACTICE, ConLastTele, this, "Teleport yourself to the last location you teleported to");
-	Console()->Register("tc", "?r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER | CMDFLAG_PRACTICE, ConTeleCursor, this, "Teleport yourself to player or to where you are spectating/or looking if no player name is given");
-	Console()->Register("telecursor", "?r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER | CMDFLAG_PRACTICE, ConTeleCursor, this, "Teleport yourself to player or to where you are spectating/or looking if no player name is given");
 	Console()->Register("totele", "i[number]", CFGFLAG_CHAT | CMDFLAG_PRACTICE, ConPracticeToTeleporter, this, "Teleports you to teleporter i");
 	Console()->Register("totelecp", "i[number]", CFGFLAG_CHAT | CMDFLAG_PRACTICE, ConPracticeToCheckTeleporter, this, "Teleports you to checkpoint teleporter i");
 	Console()->Register("unsolo", "", CFGFLAG_CHAT | CMDFLAG_PRACTICE, ConPracticeUnSolo, this, "Puts you out of solo part");
@@ -4113,7 +4122,6 @@ void CGameContext::RegisterChatCommands()
 	Console()->Register("endless", "", CFGFLAG_CHAT | CMDFLAG_PRACTICE, ConPracticeEndlessHook, this, "Gives you endless hook");
 	Console()->Register("unendless", "", CFGFLAG_CHAT | CMDFLAG_PRACTICE, ConPracticeUnEndlessHook, this, "Removes endless hook from you");
 	Console()->Register("setswitch", "i[switch] ?i['0'|'1'] ?i[seconds]", CFGFLAG_CHAT | CMDFLAG_PRACTICE, ConPracticeSetSwitch, this, "Toggle or set the switch on or off for the specified time (or indefinitely by default)");
-	Console()->Register("invincible", "?i['0'|'1']", CFGFLAG_CHAT | CMDFLAG_PRACTICE, ConPracticeToggleInvincible, this, "Toggles invincible mode");
 	Console()->Register("collision", "", CFGFLAG_CHAT | CMDFLAG_PRACTICE, ConPracticeToggleCollision, this, "Toggles collision");
 	Console()->Register("hookcollision", "", CFGFLAG_CHAT | CMDFLAG_PRACTICE, ConPracticeToggleHookCollision, this, "Toggles hook collision");
 	Console()->Register("hitothers", "?s['all'|'hammer'|'shotgun'|'grenade'|'laser']", CFGFLAG_CHAT | CMDFLAG_PRACTICE, ConPracticeToggleHitOthers, this, "Toggles hit others");

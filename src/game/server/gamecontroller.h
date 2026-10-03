@@ -155,6 +155,7 @@ public:
 	 * @return the score value that will be included in the snapshot.
 	 */
 	virtual int SnapPlayerScore(int SnappingClient, CPlayer *pPlayer) { return 0; }
+	virtual bool HasTimeScore() const { return true; }
 
 	class CFinishTime
 	{

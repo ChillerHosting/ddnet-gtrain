@@ -713,7 +713,8 @@ void CPlayer::KillCharacter(int Weapon, bool SendKillMsg)
 {
 	if(m_pCharacter)
 	{
-		m_pCharacter->Die(m_ClientId, Weapon, SendKillMsg);
+		if(m_pCharacter->IsAlive())
+			m_pCharacter->Die(m_ClientId, Weapon, SendKillMsg);
 
 		delete m_pCharacter;
 		m_pCharacter = nullptr;

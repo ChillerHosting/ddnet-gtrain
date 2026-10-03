@@ -2117,6 +2117,18 @@ void CCharacter::HandleTiles(int Index)
 	}
 }
 
+void CCharacter::SetZeroGravity(bool ZeroGravity)
+{
+	m_ZeroGravity = ZeroGravity;
+	// Training placement can move us after the world's deferred tick. Update
+	// the zone immediately so both physics and the client use the new tile.
+	HandleTuneLayer();
+	// The next snapshot must use the current position and gravity state,
+	// rather than a core cached before the placement or tuning change.
+	m_ReckoningTick = 0;
+	GameServer()->SendTuningParams(m_pPlayer->GetCid(), m_TuneZone);
+}
+
 void CCharacter::HandleTuneLayer()
 {
 	m_TuneZoneOld = m_TuneZone;
