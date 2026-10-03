@@ -208,6 +208,8 @@ public:
 	bool Freeze(int Seconds);
 	bool Freeze();
 	bool Unfreeze();
+	void ForceFreeze(int Ticks);
+	bool m_ZeroGravity = false;
 	void GiveAllWeapons();
 	void ResetPickups();
 	void ResetJumps();

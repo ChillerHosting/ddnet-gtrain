@@ -4,6 +4,7 @@
 
 #include "entities/character.h"
 #include "gamemodes/ddnet.h"
+#include "gamemodes/gtrain.h"
 #include "gamemodes/mod.h"
 #include "player.h"
 #include "score.h"
@@ -1134,6 +1135,11 @@ void CGameContext::SendTuningParams(int ClientId, int Zone)
 
 	CCharacter *pCharacter = m_apPlayers[ClientId]->GetCharacter();
 	int NeededFakeTuning = pCharacter ? pCharacter->NeededFaketuning() : 0;
+
+	if(pCharacter && pCharacter->m_ZeroGravity)
+	{
+		Params.m_Gravity = 0;
+	}
 
 	if(NeededFakeTuning & FAKETUNE_SOLO)
 	{
@@ -4215,6 +4221,10 @@ void CGameContext::OnInit(const void *pPersistentData)
 
 	m_MapBugs.Dump();
 
+	const bool IsGTrain = !str_comp(Config()->m_SvGametype, "gtrain");
+	if(IsGTrain)
+		g_Config.m_SvSoloServer = 1;
+
 	if(g_Config.m_SvSoloServer)
 	{
 		g_Config.m_SvTeam = SV_TEAM_FORCED_SOLO;
@@ -4230,7 +4240,9 @@ void CGameContext::OnInit(const void *pPersistentData)
 		}
 	}
 
-	if(!str_comp(Config()->m_SvGametype, "mod"))
+	if(IsGTrain)
+		m_pController = new CGameControllerGTrain(this);
+	else if(!str_comp(Config()->m_SvGametype, "mod"))
 		m_pController = new CGameControllerMod(this);
 	else
 		m_pController = new CGameControllerDDNet(this);

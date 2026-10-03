@@ -3163,6 +3163,8 @@ if(SERVER)
     gamecontroller.h
     gamemodes/ddnet.cpp
     gamemodes/ddnet.h
+    gamemodes/gtrain.cpp
+    gamemodes/gtrain.h
     gamemodes/mod.cpp
     gamemodes/mod.h
     gameworld.cpp

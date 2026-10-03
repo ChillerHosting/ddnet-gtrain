@@ -2127,6 +2127,8 @@ void CCharacter::HandleTuneLayer()
 	int CurrentIndex = Collision()->GetMapIndex(m_Pos);
 	m_TuneZone = Collision()->IsTune(CurrentIndex);
 	m_Core.m_Tuning = TuningList()[m_TuneZone]; // throw tunings from specific zone into gamecore
+	if(m_ZeroGravity)
+		m_Core.m_Tuning.m_Gravity = 0;
 
 	if(m_TuneZone != m_TuneZoneOld) // don't send tunigs all the time
 	{
@@ -2394,6 +2396,13 @@ bool CCharacter::Unfreeze()
 		return true;
 	}
 	return false;
+}
+
+void CCharacter::ForceFreeze(int Ticks)
+{
+	m_Armor = 0;
+	m_FreezeTime = Ticks;
+	m_Core.m_FreezeStart = Server()->Tick();
 }
 
 void CCharacter::ResetJumps()
