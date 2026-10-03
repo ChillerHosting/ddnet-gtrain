@@ -92,7 +92,22 @@ jobs:
         path: artifacts
         merge-multiple: true
 
-    - name: Create GitHub release
+    - name: Create or update GitHub release
       env:
         GH_TOKEN: ${{ github.token }}
-      run: gh release create "${{ github.ref_name }}" artifacts/* --repo "${{ github.repository }}" --title "${{ github.ref_name }}" --generate-notes
+      run: |
+        TAG="${{ github.ref_name }}"
+        REPO="${{ github.repository }}"
+
+        if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+          echo "Release $TAG already exists; uploading assets"
+          gh release upload "$TAG" artifacts/* \
+            --repo "$REPO" \
+            --clobber
+        else
+          echo "Creating release $TAG"
+          gh release create "$TAG" artifacts/* \
+            --repo "$REPO" \
+            --title "$TAG" \
+            --generate-notes
+        fi
