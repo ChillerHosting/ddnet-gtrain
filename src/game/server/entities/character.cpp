@@ -1022,10 +1022,6 @@ void CCharacter::Die(int Killer, int Weapon, bool SendKillMsg)
 	StopRecording();
 	int ModeSpecial = GameServer()->m_pController->OnCharacterDeath(this, GameServer()->m_apPlayers[Killer], Weapon);
 
-	log_info("game", "kill killer='%d:%s' victim='%d:%s' weapon=%d special=%d",
-		Killer, Server()->ClientName(Killer),
-		m_pPlayer->GetCid(), Server()->ClientName(m_pPlayer->GetCid()), Weapon, ModeSpecial);
-
 	if(SendKillMsg)
 	{
 		SendDeathMessageIfNotInLockedTeam(Killer, Weapon, ModeSpecial);
