@@ -4070,6 +4070,7 @@ void CGameContext::RegisterChatCommands()
 	Console()->Register("invite", "r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConInvite, this, "Invite a person to a locked team");
 	Console()->Register("join", "r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConJoin, this, "Join the team of the specified player");
 	Console()->Register("fight", "?r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConFight, this, "Join a GTrain fight with a player (no name to leave)");
+	Console()->Register("freeplay", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConFreeplay, this, "Toggle training without flags or paths (fight leader only in a group)");
 	Console()->Register("retry", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRetry, this, "Retry the current training position and goal");
 	Console()->Register("r", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRetry, this, "Retry the current training position and goal");
 	Console()->Register("invincible", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRetry, this, "Retry the current training position and goal");

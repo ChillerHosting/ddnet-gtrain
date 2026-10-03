@@ -267,7 +267,10 @@ void CGameControllerGTrain::PlaceRandomly(CCharacter *pChr)
 		Attempt.m_pGoal = std::make_shared<CGTrainGoal>();
 	const int Start = PathNode(Pos);
 	const int TargetDistance = g_Config.m_SvGtrainGoalDistance;
-	m_Pathfinder.Build(*Attempt.m_pGoal, Start, TargetDistance, secure_rand_below(1 << 30));
+	if(m_aFreeplay[ClientId])
+		*Attempt.m_pGoal = CGTrainGoal();
+	else
+		m_Pathfinder.Build(*Attempt.m_pGoal, Start, TargetDistance, secure_rand_below(1 << 30));
 	PlaceForAttempt(pChr, Attempt.m_pGoal, Start, TargetDistance);
 }
 
@@ -280,7 +283,10 @@ void CGameControllerGTrain::PlaceForAttempt(CCharacter *pChr, const std::shared_
 	Attempt.m_Start = Start;
 	Attempt.m_TargetDistance = TargetDistance;
 	Attempt.m_StartTick = -1;
-	Attempt.m_vRoute = pGoal->m_vInitialRoute;
+	if(m_aFreeplay[m_aFightGroup[ClientId]])
+		Attempt.m_vRoute.clear();
+	else
+		Attempt.m_vRoute = pGoal->m_vInitialRoute;
 	Attempt.m_RouteIndex = 0;
 	Attempt.m_RouteNode = Start;
 	Attempt.m_LastPathTick = -1;
@@ -372,7 +378,12 @@ void CGameControllerGTrain::RestartFight(int Group, bool KeepGoal)
 	if(!pGoal)
 		pGoal = std::make_shared<CGTrainGoal>();
 	if(!KeepGoal)
-		m_Pathfinder.Build(*pGoal, Start, TargetDistance, secure_rand_below(1 << 30));
+	{
+		if(m_aFreeplay[Group])
+			*pGoal = CGTrainGoal();
+		else
+			m_Pathfinder.Build(*pGoal, Start, TargetDistance, secure_rand_below(1 << 30));
+	}
 	m_SyncFightDeaths = true;
 	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
 	{
@@ -401,6 +412,7 @@ bool CGameControllerGTrain::LeaveFight(int ClientId, bool NewAttempt)
 		return false;
 	}
 	const bool Restart = m_aFightRestart[Group];
+	const bool Freeplay = m_aFreeplay[Group];
 	const int ScoreboardTeam = m_aFightTeam[Group];
 	m_aFightRestart[Group] = false;
 	m_aFightTeam[Group] = 0;
@@ -419,10 +431,12 @@ bool CGameControllerGTrain::LeaveFight(int ClientId, bool NewAttempt)
 				m_aFightGroup[Other] = RemainingGroup;
 		m_aFightRestart[RemainingGroup] = Restart;
 		m_aFightTeam[RemainingGroup] = ScoreboardTeam;
+		m_aFreeplay[RemainingGroup] = Freeplay;
 	}
 	m_aFightGroup[ClientId] = ClientId;
 	m_aFightRestart[ClientId] = false;
 	m_aFightWins[ClientId] = 0;
+	m_aFreeplay[ClientId] = Freeplay;
 	m_aAttempts[ClientId].m_pGoal.reset();
 	if(NewAttempt)
 		m_aPendingPlace[ClientId] = true;
@@ -473,6 +487,7 @@ void CGameControllerGTrain::Fight(int ClientId, const char *pName)
 		if(m_aFightGroup[Other] == SourceGroup)
 			m_aFightGroup[Other] = TargetGroup;
 	m_aFightRestart[SourceGroup] = false;
+	m_aFreeplay[SourceGroup] = false;
 	m_aFightRestart[TargetGroup] = true;
 	UpdateFightTeams();
 	char aMessage[160];
@@ -481,6 +496,42 @@ void CGameControllerGTrain::Fight(int ClientId, const char *pName)
 	for(int Other = 0; Other < MAX_CLIENTS; ++Other)
 		if(m_aFightGroup[Other] == TargetGroup && GameServer()->m_apPlayers[Other])
 			GameServer()->SendChatTarget(Other, aMessage);
+}
+
+void CGameControllerGTrain::Freeplay(int ClientId)
+{
+	CPlayer *pPlayer = GameServer()->m_apPlayers[ClientId];
+	if(!pPlayer)
+		return;
+	const int Group = m_aFightGroup[ClientId];
+	if(ClientId != Group)
+	{
+		GameServer()->SendChatTarget(ClientId, "Only the fight leader can toggle freeplay.");
+		return;
+	}
+	if(pPlayer->GetTeam() == TEAM_SPECTATORS || pPlayer->IsPaused())
+	{
+		GameServer()->SendChatTarget(ClientId, "You must be playing and unpaused to toggle freeplay.");
+		return;
+	}
+	m_aFreeplay[Group] = !m_aFreeplay[Group];
+	for(int Other = 0; Other < MAX_CLIENTS; ++Other)
+	{
+		if(m_aFightGroup[Other] != Group || !GameServer()->m_apPlayers[Other])
+			continue;
+		if(m_aFreeplay[Group])
+			m_aAttempts[Other].m_vRoute.clear();
+		GameServer()->SendChatTarget(Other, m_aFreeplay[Group] ? "Freeplay enabled. Flags and paths are hidden; captures are disabled." : "Freeplay disabled. Starting a new training attempt.");
+	}
+	if(!m_aFreeplay[Group])
+	{
+		if(FightSize(Group) > 1)
+			RestartFight(Group);
+		else if(CCharacter *pChr = pPlayer->GetCharacter())
+			PlaceRandomly(pChr);
+		else
+			m_aPendingPlace[ClientId] = true;
+	}
 }
 
 void CGameControllerGTrain::Retry(int ClientId)
@@ -659,6 +710,7 @@ void CGameControllerGTrain::OnPlayerDisconnect(CPlayer *pPlayer, const char *pRe
 	m_aPendingPlace[ClientId] = false;
 	m_aAttempts[ClientId] = CAttempt();
 	m_aFightWins[ClientId] = 0;
+	m_aFreeplay[ClientId] = false;
 	CGameControllerDDNet::OnPlayerDisconnect(pPlayer, pReason);
 }
 
@@ -681,6 +733,8 @@ void CGameControllerGTrain::Snap(int SnappingClient)
 		ClientId = pPlayer->SpectatorId();
 	if(ClientId < 0 || ClientId >= MAX_CLIENTS)
 		return;
+	if(m_aFreeplay[m_aFightGroup[ClientId]])
+		return;
 	CCharacter *pChr = GameServer()->GetPlayerChar(ClientId);
 	const CAttempt &Attempt = m_aAttempts[ClientId];
 	if(!pChr || !Attempt.m_pGoal || !Attempt.m_pGoal->m_Ready || !m_FlagSnapId)
@@ -696,6 +750,9 @@ void CGameControllerGTrain::Snap(int SnappingClient)
 		return;
 	int NumParticles = 0;
 	const float ClearRadius = g_Config.m_SvGtrainPathClearRadius;
+	const float Spacing = g_Config.m_SvGtrainPathParticleSpacing;
+	float DistanceToNext = Spacing;
+	std::optional<vec2> LastParticle;
 	const auto Emit = [&](vec2 Pos) {
 		// Leave gameplay space clear, including where a winding path comes
 		// back near the player. Only snapshot particles inside the viewport.
@@ -713,6 +770,20 @@ void CGameControllerGTrain::Snap(int SnappingClient)
 		// the gun. Zero velocity keeps them still and skips client prediction.
 		Particle.m_Type = WEAPON_HAMMER;
 		Server()->SnapNewItem(*SnapId, Particle);
+		LastParticle = Pos;
+	};
+	// Carry the spacing across tile boundaries and turns. Sampling each tile
+	// separately would still produce at least one particle per tile.
+	const auto SampleSegment = [&](vec2 From, vec2 To) {
+		const float Length = distance(From, To);
+		if(Length == 0)
+			return;
+		while(DistanceToNext <= Length && NumParticles < NUM_DIRECTION_PARTICLES)
+		{
+			Emit(mix(From, To, DistanceToNext / Length));
+			DistanceToNext += Spacing;
+		}
+		DistanceToNext -= Length;
 	};
 	vec2 Incoming = m_PathGraph.m_vNodes[Attempt.m_vRoute[Attempt.m_RouteIndex]].m_Pos;
 	// Bounded traversal and a shared snapshot-ID pool: no per-snapshot heap
@@ -729,9 +800,10 @@ void CGameControllerGTrain::Snap(int SnappingClient)
 		{
 			if(Node == Attempt.m_pGoal->m_Goal)
 			{
-				const int Samples = std::max(1, (int)std::ceil(distance(Incoming, Center) / 8.0f));
-				for(int i = 1; i <= Samples; ++i)
-					Emit(mix(Incoming, Center, (float)i / Samples));
+				SampleSegment(Incoming, Center);
+				// Keep an endpoint even for a route shorter than the spacing.
+				if(!LastParticle || *LastParticle != Center)
+					Emit(Center);
 			}
 			break;
 		}
@@ -739,16 +811,29 @@ void CGameControllerGTrain::Snap(int SnappingClient)
 		{
 			// A teleport is a discontinuity, not a line across the map.
 			Incoming = m_PathGraph.m_vNodes[Next].m_Pos;
+			DistanceToNext = Spacing;
 			continue;
 		}
 		const vec2 Outgoing = (Center + m_PathGraph.m_vNodes[Next].m_Pos) * 0.5f;
 		// Round turns through each tile center. This curve stays within the
 		// traversable tiles and avoids a staircase of right-angle corners.
-		const int Samples = std::max(1, (int)std::ceil((distance(Incoming, Center) + distance(Center, Outgoing)) / 8.0f));
-		for(int i = 1; i <= Samples; ++i)
+		const vec2 In = Center - Incoming, Out = Outgoing - Center;
+		if(In.x * Out.y == In.y * Out.x)
 		{
-			const float t = (float)i / Samples;
-			Emit(mix(mix(Incoming, Center, t), mix(Center, Outgoing, t), t));
+			SampleSegment(Incoming, Outgoing);
+		}
+		else
+		{
+			// Four short segments approximate the rounded turn safely inside
+			// its tile; only points at the configured spacing are emitted.
+			vec2 Previous = Incoming;
+			for(int i = 1; i <= 4; ++i)
+			{
+				const float t = i * 0.25f;
+				const vec2 Pos = mix(mix(Incoming, Center, t), mix(Center, Outgoing, t), t);
+				SampleSegment(Previous, Pos);
+				Previous = Pos;
+			}
 		}
 		Incoming = Outgoing;
 	}
@@ -816,6 +901,8 @@ void CGameControllerGTrain::Tick()
 			pChr->SetZeroGravity(false);
 			Attempt.m_StartTick = Server()->Tick();
 		}
+		if(m_aFreeplay[m_aFightGroup[ClientId]])
+			continue;
 		UpdatePath(pChr);
 		if(!pChr->m_ZeroGravity && Attempt.m_pGoal && Attempt.m_pGoal->m_Ready)
 			CheckGoal(pChr);

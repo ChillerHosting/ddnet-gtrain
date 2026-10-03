@@ -48,6 +48,7 @@ class CGameControllerGTrain : public CGameControllerDDNet
 	int m_aScoreboardTeams[MAX_CLIENTS] = {};
 	bool m_aFightRestart[MAX_CLIENTS] = {};
 	int m_aFightWins[MAX_CLIENTS] = {};
+	bool m_aFreeplay[MAX_CLIENTS] = {};
 	bool m_SyncFightDeaths = false;
 	std::optional<int> m_FlagSnapId;
 	std::array<std::optional<int>, NUM_DIRECTION_PARTICLES> m_aDirectionSnapIds;
@@ -77,6 +78,7 @@ public:
 	CFinishTime SnapPlayerTime(int SnappingClient, CPlayer *pPlayer) override { return CFinishTime::Unset(); }
 	void Snap(int SnappingClient) override;
 	void Fight(int ClientId, const char *pName);
+	void Freeplay(int ClientId);
 	void Retry(int ClientId);
 
 	void Tick() override;

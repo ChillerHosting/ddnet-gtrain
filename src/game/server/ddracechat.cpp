@@ -1128,6 +1128,20 @@ void CGameContext::ConFight(IConsole::IResult *pResult, void *pUserData)
 	pController->Fight(pResult->m_ClientId, pResult->NumArguments() ? pResult->GetString(0) : "");
 }
 
+void CGameContext::ConFreeplay(IConsole::IResult *pResult, void *pUserData)
+{
+	CGameContext *pSelf = (CGameContext *)pUserData;
+	if(!CheckClientId(pResult->m_ClientId) || !pSelf->m_apPlayers[pResult->m_ClientId])
+		return;
+	auto *pController = dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController);
+	if(!pController)
+	{
+		pSelf->SendChatTarget(pResult->m_ClientId, "Freeplay is only available in GTrain.");
+		return;
+	}
+	pController->Freeplay(pResult->m_ClientId);
+}
+
 void CGameContext::ConRetry(IConsole::IResult *pResult, void *pUserData)
 {
 	CGameContext *pSelf = (CGameContext *)pUserData;

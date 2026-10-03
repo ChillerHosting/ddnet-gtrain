@@ -229,6 +229,20 @@ public:
 		return vec2(0, 0);
 	}
 
+	int TrainingMarkers(int ClientId)
+	{
+		CSnapshotBuffer Buffer;
+		m_pServer->m_SnapshotBuilder.Init(m_pServer->IsSixup(ClientId));
+		GameServer()->m_pController->Snap(ClientId);
+		m_pServer->m_SnapshotBuilder.Finish(&Buffer);
+		int Markers = 0;
+		const CSnapshot *pSnap = Buffer.AsSnapshot();
+		for(int i = 0; i < pSnap->NumItems(); ++i)
+			if(pSnap->GetItemType(i) == NETOBJTYPE_FLAG || pSnap->GetItemType(i) == NETOBJTYPE_PROJECTILE)
+				++Markers;
+		return Markers;
+	}
+
 	std::vector<int> SpawnTrainingPlayers(std::initializer_list<const char *> Names)
 	{
 		g_Config.m_DbgDummies = Names.size();
@@ -276,6 +290,7 @@ TEST_F(GameWorld, DebugDummiesConnectAndDrop)
 TEST_F(GameWorld, GTrainPersonalGoalTrailAndCollection)
 {
 	PrepareTrainingCorridor();
+	g_Config.m_SvGtrainPathParticleSpacing = 8;
 	g_Config.m_DbgDummies = 2;
 	m_pServer->UpdateDebugDummies(false);
 	const int FirstId = m_pServer->MaxClients() - 1;
@@ -478,6 +493,7 @@ TEST_F(GameWorld, GTrainTeamAndPracticeCommandsPreserveFight)
 TEST_F(GameWorld, GTrainParticlePathRoundsWallsAndLeavesPlayerClear)
 {
 	PrepareTrainingCorridor();
+	g_Config.m_SvGtrainPathParticleSpacing = 8;
 	CCollision *pCollision = GameServer()->Collision();
 	ASSERT_GE(pCollision->GetWidth(), 17);
 	ASSERT_GE(pCollision->GetHeight(), 9);
@@ -546,6 +562,7 @@ TEST_F(GameWorld, GTrainParticlePathRoundsWallsAndLeavesPlayerClear)
 TEST_F(GameWorld, GTrainParticlePathUsesDiagonalsInOpenSpace)
 {
 	PrepareTrainingCorridor();
+	g_Config.m_SvGtrainPathParticleSpacing = 8;
 	CCollision *pCollision = GameServer()->Collision();
 	ASSERT_GE(pCollision->GetHeight(), 8);
 	for(int y = 0; y < pCollision->GetHeight(); ++y)
@@ -565,7 +582,10 @@ TEST_F(GameWorld, GTrainParticlePathUsesDiagonalsInOpenSpace)
 	CCharacter *pChr = GameServer()->GetPlayerChar(ClientId);
 	const vec2 Goal = TrainingGoal(ClientId);
 	const vec2 InitialOffset = Goal - pChr->m_Pos;
-	EXPECT_FLOAT_EQ(std::max(std::abs(InitialOffset.x), std::abs(InitialOffset.y)), 3 * 32.0f);
+	// Interior spawns fall back to two steps: all corners are closer than
+	// the configured three-step distance on this small map.
+	const float Farthest = std::max(std::max(pChr->m_Pos.x - 80, 176 - pChr->m_Pos.x), std::max(pChr->m_Pos.y - 80, 176 - pChr->m_Pos.y));
+	EXPECT_FLOAT_EQ(std::max(std::abs(InitialOffset.x), std::abs(InitialOffset.y)), Farthest);
 	pChr->Unfreeze();
 	GameServer()->m_pController->Tick();
 	const vec2 Position(Goal.x < 128 ? 176 : 80, Goal.y < 128 ? 176 : 80);
@@ -596,6 +616,165 @@ TEST_F(GameWorld, GTrainParticlePathUsesDiagonalsInOpenSpace)
 	EXPECT_EQ(Previous, Goal);
 	const vec2 Offset = Goal - Position;
 	EXPECT_LT(PathLength, std::abs(Offset.x) + std::abs(Offset.y) - 10.0f);
+}
+
+TEST_F(GameWorld, GTrainParticleSpacingAccumulatesAcrossTiles)
+{
+	PrepareTrainingCorridor();
+	g_Config.m_SvGtrainGoalDistance = 12;
+	g_Config.m_SvGtrainPathParticleSpacing = 96;
+	const int ClientId = SpawnTrainingPlayers({"Runner"})[0];
+	const vec2 Start = GameServer()->GetPlayerChar(ClientId)->m_Pos;
+	const vec2 Goal = TrainingGoal(ClientId);
+	ASSERT_FLOAT_EQ(distance(Start, Goal), 12 * 32.0f);
+	GameServer()->m_apPlayers[ClientId]->m_ShowAll = true;
+	const auto Particles = [&] {
+		CSnapshotBuffer Buffer;
+		m_pServer->m_SnapshotBuilder.Init();
+		GameServer()->m_pController->Snap(ClientId);
+		m_pServer->m_SnapshotBuilder.Finish(&Buffer);
+		const CSnapshot *pSnap = Buffer.AsSnapshot();
+		std::vector<vec2> vPositions;
+		for(int i = 0; i < pSnap->NumItems(); ++i)
+		{
+			if(pSnap->GetItemType(i) != NETOBJTYPE_PROJECTILE)
+				continue;
+			const auto *pParticle = (const CNetObj_Projectile *)pSnap->GetItem(i)->Data();
+			const vec2 Pos(pParticle->m_X, pParticle->m_Y);
+			EXPECT_GE(distance(Start, Pos), 64.0f);
+			vPositions.push_back(Pos);
+		}
+		return vPositions;
+	};
+	const auto vSparse = Particles();
+	ASSERT_EQ(vSparse.size(), 4);
+	for(size_t i = 0; i < vSparse.size(); ++i)
+		EXPECT_FLOAT_EQ(distance(Start, vSparse[i]), (i + 1) * 96.0f);
+	EXPECT_EQ(vSparse.back(), Goal);
+
+	// Spacing changes immediately and does not select a new goal.
+	g_Config.m_SvGtrainPathParticleSpacing = 32;
+	const auto vDense = Particles();
+	ASSERT_EQ(vDense.size(), 11);
+	for(size_t i = 1; i < vDense.size(); ++i)
+		EXPECT_FLOAT_EQ(distance(vDense[i - 1], vDense[i]), 32.0f);
+	EXPECT_EQ(TrainingGoal(ClientId), Goal);
+
+	// Non-divisible spacing adds just the endpoint after the regular samples.
+	g_Config.m_SvGtrainPathParticleSpacing = 160;
+	const auto vUneven = Particles();
+	ASSERT_EQ(vUneven.size(), 3);
+	EXPECT_FLOAT_EQ(distance(Start, vUneven[0]), 160.0f);
+	EXPECT_FLOAT_EQ(distance(Start, vUneven[1]), 320.0f);
+	EXPECT_EQ(vUneven.back(), Goal);
+	g_Config.m_SvGtrainPathParticleSpacing = 4096;
+	EXPECT_EQ(Particles(), (std::vector<vec2>{Goal}));
+}
+
+TEST_F(GameWorld, GTrainFreeplayHidesGoalsAndDisablesCaptures)
+{
+	PrepareTrainingCorridor();
+	const auto vIds = SpawnTrainingPlayers({"Runner", "Observer"});
+	const int Runner = vIds[0], Observer = vIds[1];
+	CCharacter *pChr = GameServer()->GetPlayerChar(Runner);
+	const vec2 Start = pChr->m_Pos;
+	const vec2 Goal = TrainingGoal(Runner);
+	const vec2 ObserverGoal = TrainingGoal(Observer);
+	m_pServer->Console()->ExecuteLineFlag("freeplay", CFGFLAG_CHAT, Runner);
+	EXPECT_EQ(pChr->m_Pos, Start);
+	EXPECT_EQ(TrainingMarkers(Runner), 0);
+	EXPECT_EQ(TrainingGoal(Observer), ObserverGoal);
+	pChr->Unfreeze();
+	GameServer()->m_pController->Tick();
+	m_pServer->AdvanceTicks(2 * m_pServer->TickSpeed());
+	pChr->m_Pos = pChr->m_PrevPos = Goal;
+	pChr->SetPosition(Goal);
+	CMemoryLogger CaptureLogger;
+	{
+		CLogScope Scope(&CaptureLogger);
+		GameServer()->m_pController->Tick();
+	}
+	EXPECT_EQ(pChr->m_Pos, Goal);
+	EXPECT_FALSE(pChr->m_ZeroGravity);
+	EXPECT_EQ(CaptureLogger.ConcatenatedLines().find("captured the flag"), std::string::npos);
+	EXPECT_EQ(TrainingMarkers(Runner), 0);
+
+	// Retrying and dying keep freeplay active, with no new goal to capture.
+	m_pServer->Console()->ExecuteLineFlag("retry", CFGFLAG_CHAT, Runner);
+	EXPECT_EQ(pChr->m_Pos, Start);
+	EXPECT_EQ(TrainingMarkers(Runner), 0);
+	GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_SELF);
+	GameServer()->m_apPlayers[Runner]->ForceSpawn(vec2(80, 80));
+	GameServer()->m_pController->Tick();
+	EXPECT_EQ(TrainingMarkers(Runner), 0);
+	m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, Runner);
+	EXPECT_EQ(TrainingMarkers(Runner), 0);
+
+	m_pServer->Console()->ExecuteLineFlag("freeplay", CFGFLAG_CHAT, Runner);
+	pChr = GameServer()->GetPlayerChar(Runner);
+	EXPECT_GT(TrainingMarkers(Runner), 0);
+	EXPECT_TRUE(pChr->m_ZeroGravity);
+	EXPECT_EQ(pChr->m_FreezeTime, 50);
+	EXPECT_FLOAT_EQ(distance(pChr->m_Pos, TrainingGoal(Runner)), 3 * 32.0f);
+	EXPECT_EQ(TrainingGoal(Observer), ObserverGoal);
+}
+
+TEST_F(GameWorld, GTrainFreeplayFollowsFightLeaderAndMembership)
+{
+	PrepareTrainingCorridor();
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob", "Wilson", "Observer"});
+	const int Anna = vIds[0], Bob = vIds[1], Wilson = vIds[2], Observer = vIds[3];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	pController->Fight(Bob, "Anna");
+	pController->Tick();
+	m_pServer->m_avChatMessages[Bob].clear();
+	m_pServer->Console()->ExecuteLineFlag("freeplay", CFGFLAG_CHAT, Bob);
+	ASSERT_FALSE(m_pServer->m_avChatMessages[Bob].empty());
+	EXPECT_EQ(m_pServer->m_avChatMessages[Bob].back(), "Only the fight leader can toggle freeplay.");
+	EXPECT_GT(TrainingMarkers(Anna), 0);
+	EXPECT_GT(TrainingMarkers(Bob), 0);
+	m_pServer->Console()->ExecuteLineFlag("freeplay", CFGFLAG_CHAT, Anna);
+	EXPECT_EQ(TrainingMarkers(Anna), 0);
+	EXPECT_EQ(TrainingMarkers(Bob), 0);
+	EXPECT_GT(TrainingMarkers(Observer), 0);
+
+	// Chained joins adopt the target group's mode; group resets keep it.
+	pController->Fight(Wilson, "Bob");
+	pController->Tick();
+	GameServer()->m_apPlayers[Anna]->KillCharacter(WEAPON_SELF);
+	pController->Tick();
+	for(int ClientId : {Anna, Bob, Wilson})
+	{
+		ASSERT_NE(GameServer()->GetPlayerChar(ClientId), nullptr);
+		EXPECT_EQ(TrainingMarkers(ClientId), 0);
+		EXPECT_EQ(GameServer()->GetPlayerChar(ClientId)->m_Pos, GameServer()->GetPlayerChar(Anna)->m_Pos);
+	}
+	m_pServer->Console()->ExecuteLineFlag("freeplay", CFGFLAG_CHAT, Bob);
+	EXPECT_EQ(TrainingMarkers(Anna), 0);
+
+	// Promotion carries freeplay to the new leader; the leaver stays in
+	// freeplay individually and cannot change the remaining group's mode.
+	pController->Fight(Anna, "");
+	pController->Tick();
+	const int Leader = pController->SnapPlayerScore(Bob, GameServer()->m_apPlayers[Bob]) == 1 ? Bob : Wilson;
+	const int Member = Leader == Bob ? Wilson : Bob;
+	m_pServer->Console()->ExecuteLineFlag("freeplay", CFGFLAG_CHAT, Anna);
+	EXPECT_GT(TrainingMarkers(Anna), 0);
+	EXPECT_EQ(TrainingMarkers(Leader), 0);
+	EXPECT_EQ(TrainingMarkers(Member), 0);
+	m_pServer->Console()->ExecuteLineFlag("freeplay", CFGFLAG_CHAT, Leader);
+	EXPECT_GT(TrainingMarkers(Leader), 0);
+	EXPECT_EQ(TrainingGoal(Leader), TrainingGoal(Member));
+	m_pServer->Console()->ExecuteLineFlag("freeplay", CFGFLAG_CHAT, Member);
+	EXPECT_GT(TrainingMarkers(Member), 0);
+
+	// Disconnecting the leader also preserves the mode for the survivor.
+	m_pServer->Console()->ExecuteLineFlag("freeplay", CFGFLAG_CHAT, Leader);
+	CServer::DelClientCallback(Leader, "test", m_pServer);
+	EXPECT_EQ(TrainingMarkers(Member), 0);
+	m_pServer->Console()->ExecuteLineFlag("freeplay", CFGFLAG_CHAT, Member);
+	EXPECT_GT(TrainingMarkers(Member), 0);
+	EXPECT_GT(TrainingMarkers(Observer), 0);
 }
 
 TEST_F(GameWorld, GTrainRetryPreservesGoalAndRestartsTimer)

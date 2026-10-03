@@ -275,6 +275,7 @@ MACRO_CONFIG_STR(SvMotd, sv_motd, 900, "", CFGFLAG_SERVER, "Message of the day t
 MACRO_CONFIG_STR(SvGametype, sv_gametype, 32, "gtrain", CFGFLAG_SERVER, "Game type (gtrain, ddnet, mod)")
 MACRO_CONFIG_INT(SvGtrainGoalDistance, sv_gtrain_goal_distance, 100, 1, 100000, CFGFLAG_SERVER, "GTrain goal distance in shortest-path tiles (next attempt)")
 MACRO_CONFIG_INT(SvGtrainPathClearRadius, sv_gtrain_path_clear_radius, 64, 0, 4096, CFGFLAG_SERVER, "GTrain particle-free radius in world units around the player")
+MACRO_CONFIG_INT(SvGtrainPathParticleSpacing, sv_gtrain_path_particle_spacing, 192, 1, 4096, CFGFLAG_SERVER, "Distance in world units between GTrain path particles (32 units per tile)")
 MACRO_CONFIG_INT(SvTournamentMode, sv_tournament_mode, 0, 0, 1, CFGFLAG_SERVER, "Tournament mode. When enabled, players joins the server as spectator")
 MACRO_CONFIG_INT(SvSpamprotection, sv_spamprotection, 1, 0, 1, CFGFLAG_SERVER, "Spam protection for: team change, chat, skin change, emotes and votes")
 
