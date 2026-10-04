@@ -56,7 +56,7 @@ class CGameControllerGTrain : public CGameControllerDDNet
 	void FindTrainPositions();
 	void PlaceRandomly(class CCharacter *pChr);
 	void PlaceForAttempt(class CCharacter *pChr, const std::shared_ptr<CGTrainGoal> &pGoal, int Start, int TargetDistance);
-	void RestartFight(int Group, bool KeepGoal = false);
+	void RestartFight(int Group);
 	bool LeaveFight(int ClientId, bool NewAttempt);
 	int FightSize(int Group) const;
 	void UpdateFightTeams();

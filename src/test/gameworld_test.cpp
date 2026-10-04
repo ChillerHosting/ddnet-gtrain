@@ -856,7 +856,7 @@ TEST_F(GameWorld, GTrainRetryPreservesGoalAndRestartsTimer)
 	EXPECT_NE(CaptureLogger.ConcatenatedLines().find("'Runner' captured the flag in 1.00 seconds."), std::string::npos);
 }
 
-TEST_F(GameWorld, GTrainRetryRespectsFightLeader)
+TEST_F(GameWorld, GTrainRetryOnlyResetsRequestingFightMember)
 {
 	PrepareTrainingCorridor();
 	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob", "Observer"});
@@ -883,19 +883,52 @@ TEST_F(GameWorld, GTrainRetryRespectsFightLeader)
 	EXPECT_EQ(GameServer()->GetPlayerChar(Bob)->m_FreezeTime, 50);
 	EXPECT_EQ(TrainingGoal(Bob), Goal);
 
-	// The leader retries everyone at the current start and goal.
+	CCharacter *pMember = GameServer()->GetPlayerChar(Bob);
+	pMember->Unfreeze();
+	pController->Tick();
+	const vec2 MemberPosition = Start + normalize(Goal - Start) * 32.0f;
+	pMember->m_Pos = pMember->m_PrevPos = MemberPosition;
+	pMember->SetPosition(MemberPosition);
+	pMember->SetVelocity(vec2(3, 4));
+	m_pServer->AdvanceTicks(m_pServer->TickSpeed());
+	g_Config.m_SvGtrainGoalDistance = 7; // leader retries keep the shared goal
+
+	// The leader retries only themselves, including through the /r alias.
 	m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, Anna);
-	for(int ClientId : {Anna, Bob})
-	{
-		EXPECT_EQ(GameServer()->GetPlayerChar(ClientId)->m_Pos, Start);
-		EXPECT_TRUE(GameServer()->GetPlayerChar(ClientId)->m_ZeroGravity);
-		EXPECT_EQ(TrainingGoal(ClientId), Goal);
-	}
+	pController->Tick();
+	EXPECT_EQ(pLeader->m_Pos, Start);
+	EXPECT_TRUE(pLeader->m_ZeroGravity);
+	EXPECT_EQ(pLeader->m_FreezeTime, 50);
+	EXPECT_EQ(TrainingGoal(Anna), Goal);
+	EXPECT_EQ(GameServer()->GetPlayerChar(Bob), pMember);
+	EXPECT_EQ(pMember->m_Pos, MemberPosition);
+	EXPECT_EQ(pMember->Core()->m_Vel, vec2(3, 4));
+	EXPECT_FALSE(pMember->m_ZeroGravity);
+	EXPECT_EQ(pMember->m_FreezeTime, 0);
+	EXPECT_EQ(TrainingGoal(Bob), Goal);
+
+	// Retrying the leader does not respawn a dead member.
+	GameServer()->m_apPlayers[Bob]->KillCharacter(WEAPON_SELF);
+	m_pServer->Console()->ExecuteLineFlag("retry", CFGFLAG_CHAT, Anna);
+	pController->Tick();
+	EXPECT_EQ(GameServer()->GetPlayerChar(Bob), nullptr);
+	EXPECT_EQ(TrainingGoal(Anna), Goal);
+	pMember = GameServer()->m_apPlayers[Bob]->ForceSpawn(vec2(80, 80));
+	pController->Tick();
+	EXPECT_EQ(pMember->m_Pos, Start);
+	EXPECT_EQ(TrainingGoal(Bob), Goal);
 
 	// Retry overrides the pending next-position reset after a leader's death.
 	GameServer()->m_apPlayers[Anna]->KillCharacter(WEAPON_SELF);
 	EXPECT_EQ(GameServer()->GetPlayerChar(Bob), nullptr);
 	m_pServer->Console()->ExecuteLineFlag("retry", CFGFLAG_CHAT, Anna);
+	pController->Tick();
+	ASSERT_NE(GameServer()->GetPlayerChar(Anna), nullptr);
+	EXPECT_EQ(GameServer()->GetPlayerChar(Anna)->m_Pos, Start);
+	EXPECT_EQ(GameServer()->GetPlayerChar(Anna)->m_FreezeTime, 50);
+	EXPECT_EQ(TrainingGoal(Anna), Goal);
+	EXPECT_EQ(GameServer()->GetPlayerChar(Bob), nullptr);
+	GameServer()->m_apPlayers[Bob]->ForceSpawn(vec2(80, 80));
 	pController->Tick();
 	for(int ClientId : {Anna, Bob})
 	{

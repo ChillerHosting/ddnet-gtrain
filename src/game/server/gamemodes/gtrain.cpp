@@ -366,27 +366,23 @@ void CGameControllerGTrain::UpdateFightTeams()
 	Teams().SetScoreboardTeams(m_aScoreboardTeams);
 }
 
-void CGameControllerGTrain::RestartFight(int Group, bool KeepGoal)
+void CGameControllerGTrain::RestartFight(int Group)
 {
 	m_aFightRestart[Group] = false;
 	if(m_vTrainPositions.empty())
 		return;
-	const CAttempt &Previous = m_aAttempts[Group];
-	const int Start = KeepGoal ? Previous.m_Start : PathNode(m_vTrainPositions[secure_rand_below(m_vTrainPositions.size())]);
+	const int Start = PathNode(m_vTrainPositions[secure_rand_below(m_vTrainPositions.size())]);
 	const vec2 Pos = m_PathGraph.m_vNodes[Start].m_Pos;
-	const int TargetDistance = KeepGoal ? Previous.m_TargetDistance : g_Config.m_SvGtrainGoalDistance;
+	const int TargetDistance = g_Config.m_SvGtrainGoalDistance;
 	// All owners of this goal belong to the resetting group. Build it once,
 	// then share it while keeping timers local to each player.
 	auto pGoal = m_aAttempts[Group].m_pGoal;
 	if(!pGoal)
 		pGoal = std::make_shared<CGTrainGoal>();
-	if(!KeepGoal)
-	{
-		if(m_aFreeplay[Group])
-			*pGoal = CGTrainGoal();
-		else
-			m_Pathfinder.Build(*pGoal, Start, TargetDistance, secure_rand_below(1 << 30));
-	}
+	if(m_aFreeplay[Group])
+		*pGoal = CGTrainGoal();
+	else
+		m_Pathfinder.Build(*pGoal, Start, TargetDistance, secure_rand_below(1 << 30));
 	m_SyncFightDeaths = true;
 	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
 	{
@@ -554,11 +550,10 @@ void CGameControllerGTrain::Retry(int ClientId)
 		GameServer()->SendChatTarget(ClientId, "There is no training attempt to retry yet.");
 		return;
 	}
-	if(Group == ClientId && FightSize(Group) > 1)
-	{
-		RestartFight(Group, true);
-		return;
-	}
+	// A leader retry also cancels a pending new attempt after their death.
+	// Peers keep their own state and respawn normally at the current goal.
+	if(Group == ClientId)
+		m_aFightRestart[Group] = false;
 	CCharacter *pChr = pPlayer->GetCharacter();
 	if(!pChr)
 	{
