@@ -165,8 +165,9 @@ public:
 	CGameControllerGTrain(class CGameContext *pGameServer);
 	~CGameControllerGTrain() override;
 	static bool AddSwitchLayer(class IStorage *pStorage, const char *pPath, char *pNewPath, int NewPathSize);
-	// 0 for Easy with one star up to 14 for Extreme with three and 15 for
-	// Deranged, which has no stars. Every step makes captures worth more.
+	// 0 for Easy with one star up to 14 for Extreme with three and 16 for
+	// Deranged, which has no stars and counts as Extreme with five. Every
+	// step makes captures worth more.
 	// Other categories and ratings have no ELO.
 	static std::optional<int> EloStep(const char *pServer, int Stars);
 	void LoadMapDifficulty();

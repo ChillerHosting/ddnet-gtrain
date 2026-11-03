@@ -2477,9 +2477,10 @@ TEST_F(GameWorld, GTrainCapturesEarnEloByDifficultySpeedAndGoalDistance)
 	EXPECT_EQ(CGameControllerGTrain::EloStep("hard", 2), 7);
 	EXPECT_EQ(CGameControllerGTrain::EloStep("Insane", 3), 11);
 	EXPECT_EQ(CGameControllerGTrain::EloStep("Extreme", 3), 14);
-	// Deranged maps have no stars, a rating doesn't change them.
-	EXPECT_EQ(CGameControllerGTrain::EloStep("Deranged", 0), 15);
-	EXPECT_EQ(CGameControllerGTrain::EloStep("deranged", 2), 15);
+	// Deranged maps have no stars, a rating doesn't change them. They count
+	// as Extreme with five stars.
+	EXPECT_EQ(CGameControllerGTrain::EloStep("Deranged", 0), 16);
+	EXPECT_EQ(CGameControllerGTrain::EloStep("deranged", 2), 16);
 	const std::pair<const char *, int> aWithoutElo[] = {{"Mod", 2}, {"Solo", 1}, {"Others", 3}, {"Novice", 1}, {"", 1}, {"Hard", 0}, {"Hard", 4}};
 	for(const auto &[pServer, Stars] : aWithoutElo)
 		EXPECT_FALSE(CGameControllerGTrain::EloStep(pServer, Stars)) << pServer << " " << Stars;
@@ -2602,9 +2603,9 @@ TEST_F(GameWorld, GTrainCapturesEarnEloByDifficultySpeedAndGoalDistance)
 	EXPECT_NE(Messages.find("'Bob' captured the flag (0 fails, +0 ELO (frozen)). Fight score (first to 10): 'Anna': 0, 'Bob': 2"), std::string::npos);
 	EXPECT_EQ(pController->Stats(Bob).m_Points, aPoints[Bob]);
 
-	// Deranged maps have no stars and are worth ten times Extreme ★★★.
+	// Deranged maps have no stars and are worth what Extreme ★★★★★ would be.
 	pController->SetMapDifficulty("Deranged", 0);
-	EXPECT_EQ(Help(), "Captures here are worth 2919.3 times as much as on Easy ★☆☆ maps (Deranged), longer and faster ones more.");
+	EXPECT_EQ(Help(), "Captures here are worth 656.8 times as much as on Easy ★☆☆ maps (Deranged), longer and faster ones more.");
 	Tiles = GoalTiles(Runner);
 	EXPECT_NE(Capture(Runner).find("(0 fails, " + Gain(Runner, GTrainElo::DERANGED_STEP, Tiles, 0) + ")."), std::string::npos);
 	EXPECT_EQ(pController->Stats(Runner).m_Points, aPoints[Runner]);

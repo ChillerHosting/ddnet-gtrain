@@ -9,13 +9,14 @@ TEST(GTrainElo, PointsPerTileGrowByHalfPerStep)
 	EXPECT_DOUBLE_EQ(PointsPerTile(0), 100);
 	EXPECT_DOUBLE_EQ(PointsPerTile(1), 150);
 	EXPECT_DOUBLE_EQ(PointsPerTile(3), 337.5);
-	for(int Step = 1; Step <= EXTREME_STEP; ++Step)
+	for(int Step = 1; Step <= DERANGED_STEP; ++Step)
 		EXPECT_DOUBLE_EQ(PointsPerTile(Step) / PointsPerTile(Step - 1), 1.5);
 	// Extreme with three stars is worth about 292 times Easy with one.
 	EXPECT_NEAR(PointsPerTile(EXTREME_STEP) / PointsPerTile(0), 291.93, 0.01);
-	// Deranged, the step above, is worth ten times as much.
-	EXPECT_EQ(DERANGED_STEP, EXTREME_STEP + 1);
-	EXPECT_DOUBLE_EQ(PointsPerTile(DERANGED_STEP), 10 * PointsPerTile(EXTREME_STEP));
+	// Deranged counts as Extreme with five stars, 2.25 times three stars.
+	EXPECT_EQ(DERANGED_STEP, EXTREME_STEP + 2);
+	EXPECT_DOUBLE_EQ(PointsPerTile(DERANGED_STEP), 2.25 * PointsPerTile(EXTREME_STEP));
+	EXPECT_NEAR(PointsPerTile(DERANGED_STEP) / PointsPerTile(0), 656.84, 0.01);
 }
 
 TEST(GTrainElo, SpeedFactorFollowsTheTypicalSpeedOfTheDifficulty)
@@ -27,9 +28,9 @@ TEST(GTrainElo, SpeedFactorFollowsTheTypicalSpeedOfTheDifficulty)
 	EXPECT_DOUBLE_EQ(SpeedFactor(EXTREME_STEP, 100, 100 / Extreme), 1);
 	EXPECT_DOUBLE_EQ(SpeedFactor(EXTREME_STEP, 150, 100 / Extreme), 1.5);
 	EXPECT_DOUBLE_EQ(SpeedFactor(EXTREME_STEP, 75, 100 / Extreme), std::max(0.75, MIN_SPEED_FACTOR));
-	// Deranged continues the line one step past Extreme with three stars.
-	const double Deranged = Extreme - (Easy - Extreme) / EXTREME_STEP;
-	EXPECT_NEAR(Deranged, 5.57, 0.01);
+	// Deranged continues the line two steps past Extreme with three stars.
+	const double Deranged = Extreme - 2 * (Easy - Extreme) / EXTREME_STEP;
+	EXPECT_NEAR(Deranged, 5.14, 0.01);
 	EXPECT_DOUBLE_EQ(SpeedFactor(DERANGED_STEP, 100, 100 / Deranged), 1);
 	EXPECT_DOUBLE_EQ(SpeedFactor(DERANGED_STEP, 150, 100 / Deranged), 1.5);
 	// Fast captures earn up to a maximum, slow ones a minimum. Instant
@@ -46,7 +47,7 @@ TEST(GTrainElo, CapturePoints)
 	EXPECT_EQ(CapturePoints(7, 100, 100 / ((EASY_TILES_PER_SECOND + EXTREME_TILES_PER_SECOND) / 2)), 170859); // 100 * 1.5^7 * 100, rounded
 	EXPECT_EQ(CapturePoints(EXTREME_STEP, 100, 100 / (4 * EXTREME_TILES_PER_SECOND)), std::llround(100 * PointsPerTile(EXTREME_STEP) * 4));
 	EXPECT_EQ(CapturePoints(EXTREME_STEP, 100, 1000), std::llround(100 * PointsPerTile(EXTREME_STEP) * MIN_SPEED_FACTOR));
-	EXPECT_EQ(CapturePoints(DERANGED_STEP, 100, 1000), std::llround(100 * 10 * PointsPerTile(EXTREME_STEP) * MIN_SPEED_FACTOR));
+	EXPECT_EQ(CapturePoints(DERANGED_STEP, 100, 1000), std::llround(100 * 2.25 * PointsPerTile(EXTREME_STEP) * MIN_SPEED_FACTOR));
 }
 
 TEST(GTrainElo, LongerGoalsEarnMoreThanTheirLength)

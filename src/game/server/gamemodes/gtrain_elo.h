@@ -15,15 +15,14 @@ namespace GTrainElo
 {
 	inline constexpr int MAX_ELO = 9999;
 	inline constexpr int EXTREME_STEP = 14; // Extreme with three stars
-	// Deranged maps have no stars and sit one step above Extreme with three,
-	// worth DERANGED_MULTIPLIER times as much.
-	inline constexpr int DERANGED_STEP = EXTREME_STEP + 1;
+	// Deranged maps have no stars and count as Extreme with five would, two
+	// steps above Extreme with three.
+	inline constexpr int DERANGED_STEP = EXTREME_STEP + 2;
 	inline constexpr double POINTS_PER_TILE = 100; // Easy with one star
 	inline constexpr double STEP_MULTIPLIER = 1.5;
-	inline constexpr double DERANGED_MULTIPLIER = 10;
 	// Typical capture speeds in path tiles per second, a bit below those of
 	// the first captures on the KoG maps. Harder maps are slower, which must
-	// not cost points. Deranged continues the line one step past Extreme.
+	// not cost points. Deranged continues the line past Extreme.
 	inline constexpr double EASY_TILES_PER_SECOND = 12;
 	inline constexpr double EXTREME_TILES_PER_SECOND = 6;
 	inline constexpr double MIN_SPEED_FACTOR = 0.5;
@@ -36,8 +35,6 @@ namespace GTrainElo
 
 	constexpr double PointsPerTile(int Step)
 	{
-		if(Step == DERANGED_STEP)
-			return DERANGED_MULTIPLIER * PointsPerTile(EXTREME_STEP);
 		double Points = POINTS_PER_TILE;
 		for(int i = 0; i < Step; ++i)
 			Points *= STEP_MULTIPLIER;

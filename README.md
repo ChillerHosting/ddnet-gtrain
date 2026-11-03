@@ -53,10 +53,10 @@ Every capture earns points, and your ELO shows them on a scale from 0 to 9999. B
   | Insane | 3844 | 5767 | 8650 |
   | Extreme | 12975 | 19462 | 29193 |
 
-  Deranged maps have no stars and sit one step above Extreme, at 10 times Extreme ★★★: 291929.
+  Deranged maps have no stars and count as Extreme ★★★★★ would, two steps above Extreme ★★★: 65684.
 
 - Longer goals are worth more than their length, since every tile is another chance to fail: points grow with the distance to the power of 1.5, so twice the distance earns about 2.8 times as many. Per tile, 50 tile goals earn 0.71 times the table's points, 200 tiles 1.41 times and 500 tiles 2.24 times.
-- That is multiplied by your speed compared to a typical one, from 12 path tiles per second on Easy down to 6 on Extreme ★★★ and 5.6 on Deranged (a bit below the speeds of the first captures on the KoG maps). Faster captures earn up to 4 times as much, slow ones still earn at least half. Only the time of the successful attempt counts.
+- That is multiplied by your speed compared to a typical one, from 12 path tiles per second on Easy down to 6 on Extreme ★★★ and 5.1 on Deranged (a bit below the speeds of the first captures on the KoG maps). Faster captures earn up to 4 times as much, slow ones still earn at least half. Only the time of the successful attempt counts.
 - The distance is the goal's actual distance, which is shorter than the `/distance` setting when the finish line is closer.
 - ELO is logarithmic: it grows by about 760 every time your points double, so new players climb fast and harder maps keep raising it. A single capture barely counts on its own. Rough guide, at a typical speed:
 
