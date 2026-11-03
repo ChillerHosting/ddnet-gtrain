@@ -9,10 +9,13 @@ TEST(GTrainElo, PointsPerTileGrowByHalfPerStep)
 	EXPECT_DOUBLE_EQ(PointsPerTile(0), 100);
 	EXPECT_DOUBLE_EQ(PointsPerTile(1), 150);
 	EXPECT_DOUBLE_EQ(PointsPerTile(3), 337.5);
-	for(int Step = 1; Step <= MAX_STEP; ++Step)
+	for(int Step = 1; Step <= EXTREME_STEP; ++Step)
 		EXPECT_DOUBLE_EQ(PointsPerTile(Step) / PointsPerTile(Step - 1), 1.5);
 	// Extreme with three stars is worth about 292 times Easy with one.
-	EXPECT_NEAR(PointsPerTile(MAX_STEP) / PointsPerTile(0), 291.93, 0.01);
+	EXPECT_NEAR(PointsPerTile(EXTREME_STEP) / PointsPerTile(0), 291.93, 0.01);
+	// Deranged, the step above, is worth ten times as much.
+	EXPECT_EQ(DERANGED_STEP, EXTREME_STEP + 1);
+	EXPECT_DOUBLE_EQ(PointsPerTile(DERANGED_STEP), 10 * PointsPerTile(EXTREME_STEP));
 }
 
 TEST(GTrainElo, SpeedFactorFollowsTheTypicalSpeedOfTheDifficulty)
@@ -20,15 +23,20 @@ TEST(GTrainElo, SpeedFactorFollowsTheTypicalSpeedOfTheDifficulty)
 	// Typical speeds go linearly from Easy to Extreme.
 	const double Easy = EASY_TILES_PER_SECOND, Extreme = EXTREME_TILES_PER_SECOND;
 	EXPECT_DOUBLE_EQ(SpeedFactor(0, 100, 100 / Easy), 1);
-	EXPECT_DOUBLE_EQ(SpeedFactor(MAX_STEP / 2, 100, 100 / ((Easy + Extreme) / 2)), 1);
-	EXPECT_DOUBLE_EQ(SpeedFactor(MAX_STEP, 100, 100 / Extreme), 1);
-	EXPECT_DOUBLE_EQ(SpeedFactor(MAX_STEP, 150, 100 / Extreme), 1.5);
-	EXPECT_DOUBLE_EQ(SpeedFactor(MAX_STEP, 75, 100 / Extreme), std::max(0.75, MIN_SPEED_FACTOR));
+	EXPECT_DOUBLE_EQ(SpeedFactor(EXTREME_STEP / 2, 100, 100 / ((Easy + Extreme) / 2)), 1);
+	EXPECT_DOUBLE_EQ(SpeedFactor(EXTREME_STEP, 100, 100 / Extreme), 1);
+	EXPECT_DOUBLE_EQ(SpeedFactor(EXTREME_STEP, 150, 100 / Extreme), 1.5);
+	EXPECT_DOUBLE_EQ(SpeedFactor(EXTREME_STEP, 75, 100 / Extreme), std::max(0.75, MIN_SPEED_FACTOR));
+	// Deranged continues the line one step past Extreme with three stars.
+	const double Deranged = Extreme - (Easy - Extreme) / EXTREME_STEP;
+	EXPECT_NEAR(Deranged, 5.57, 0.01);
+	EXPECT_DOUBLE_EQ(SpeedFactor(DERANGED_STEP, 100, 100 / Deranged), 1);
+	EXPECT_DOUBLE_EQ(SpeedFactor(DERANGED_STEP, 150, 100 / Deranged), 1.5);
 	// Fast captures earn up to a maximum, slow ones a minimum. Instant
 	// captures count as taking one tick, which always reaches the maximum.
-	EXPECT_DOUBLE_EQ(SpeedFactor(MAX_STEP, 350, 100 / Extreme), 3.5);
-	EXPECT_DOUBLE_EQ(SpeedFactor(MAX_STEP, 1000, 100 / Extreme), MAX_SPEED_FACTOR);
-	EXPECT_DOUBLE_EQ(SpeedFactor(MAX_STEP, 1, 100), MIN_SPEED_FACTOR);
+	EXPECT_DOUBLE_EQ(SpeedFactor(EXTREME_STEP, 350, 100 / Extreme), 3.5);
+	EXPECT_DOUBLE_EQ(SpeedFactor(EXTREME_STEP, 1000, 100 / Extreme), MAX_SPEED_FACTOR);
+	EXPECT_DOUBLE_EQ(SpeedFactor(EXTREME_STEP, 1, 100), MIN_SPEED_FACTOR);
 	EXPECT_DOUBLE_EQ(SpeedFactor(0, 1, 0), MAX_SPEED_FACTOR);
 }
 
@@ -36,8 +44,9 @@ TEST(GTrainElo, CapturePoints)
 {
 	EXPECT_EQ(CapturePoints(0, 100, 100 / EASY_TILES_PER_SECOND), 10000);
 	EXPECT_EQ(CapturePoints(7, 100, 100 / ((EASY_TILES_PER_SECOND + EXTREME_TILES_PER_SECOND) / 2)), 170859); // 100 * 1.5^7 * 100, rounded
-	EXPECT_EQ(CapturePoints(MAX_STEP, 100, 100 / (4 * EXTREME_TILES_PER_SECOND)), std::llround(100 * PointsPerTile(MAX_STEP) * 4));
-	EXPECT_EQ(CapturePoints(MAX_STEP, 100, 1000), std::llround(100 * PointsPerTile(MAX_STEP) * MIN_SPEED_FACTOR));
+	EXPECT_EQ(CapturePoints(EXTREME_STEP, 100, 100 / (4 * EXTREME_TILES_PER_SECOND)), std::llround(100 * PointsPerTile(EXTREME_STEP) * 4));
+	EXPECT_EQ(CapturePoints(EXTREME_STEP, 100, 1000), std::llround(100 * PointsPerTile(EXTREME_STEP) * MIN_SPEED_FACTOR));
+	EXPECT_EQ(CapturePoints(DERANGED_STEP, 100, 1000), std::llround(100 * 10 * PointsPerTile(EXTREME_STEP) * MIN_SPEED_FACTOR));
 }
 
 TEST(GTrainElo, LongerGoalsEarnMoreThanTheirLength)
@@ -59,7 +68,7 @@ TEST(GTrainElo, LogarithmicScaleUpToTheMaximum)
 {
 	EXPECT_EQ(FromPoints(0), 0);
 	// Single captures of hard maps barely count for new players.
-	EXPECT_LT(FromPoints(CapturePoints(MAX_STEP, 100, 100 / EXTREME_TILES_PER_SECOND)), 150);
+	EXPECT_LT(FromPoints(CapturePoints(EXTREME_STEP, 100, 100 / EXTREME_TILES_PER_SECOND)), 150);
 	// Every doubling adds the same ELO once past the linear start.
 	const double Doubling = FromPoints(200'000'000'000) - FromPoints(100'000'000'000);
 	EXPECT_NEAR(FromPoints(400'000'000'000) - FromPoints(200'000'000'000), Doubling, 1);

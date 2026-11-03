@@ -14,12 +14,16 @@
 namespace GTrainElo
 {
 	inline constexpr int MAX_ELO = 9999;
-	inline constexpr int MAX_STEP = 14; // Extreme with three stars
+	inline constexpr int EXTREME_STEP = 14; // Extreme with three stars
+	// Deranged maps have no stars and sit one step above Extreme with three,
+	// worth DERANGED_MULTIPLIER times as much.
+	inline constexpr int DERANGED_STEP = EXTREME_STEP + 1;
 	inline constexpr double POINTS_PER_TILE = 100; // Easy with one star
 	inline constexpr double STEP_MULTIPLIER = 1.5;
+	inline constexpr double DERANGED_MULTIPLIER = 10;
 	// Typical capture speeds in path tiles per second, a bit below those of
 	// the first captures on the KoG maps. Harder maps are slower, which must
-	// not cost points.
+	// not cost points. Deranged continues the line one step past Extreme.
 	inline constexpr double EASY_TILES_PER_SECOND = 12;
 	inline constexpr double EXTREME_TILES_PER_SECOND = 6;
 	inline constexpr double MIN_SPEED_FACTOR = 0.5;
@@ -32,6 +36,8 @@ namespace GTrainElo
 
 	constexpr double PointsPerTile(int Step)
 	{
+		if(Step == DERANGED_STEP)
+			return DERANGED_MULTIPLIER * PointsPerTile(EXTREME_STEP);
 		double Points = POINTS_PER_TILE;
 		for(int i = 0; i < Step; ++i)
 			Points *= STEP_MULTIPLIER;
@@ -42,12 +48,12 @@ namespace GTrainElo
 	// goals at 8000 tiles per hour, all twice as fast as typical. Good players
 	// managed about half that pace at a typical speed, so this is completely
 	// inhuman.
-	inline constexpr double MAX_POINTS = 1000.0 * 8000 * PointsPerTile(MAX_STEP) * 2;
+	inline constexpr double MAX_POINTS = 1000.0 * 8000 * PointsPerTile(EXTREME_STEP) * 2;
 
 	// The capture's speed relative to the typical one of its difficulty.
 	inline double SpeedFactor(int Step, int Distance, double Seconds)
 	{
-		const double Typical = EASY_TILES_PER_SECOND + (EXTREME_TILES_PER_SECOND - EASY_TILES_PER_SECOND) * Step / MAX_STEP;
+		const double Typical = EASY_TILES_PER_SECOND + (EXTREME_TILES_PER_SECOND - EASY_TILES_PER_SECOND) * Step / EXTREME_STEP;
 		return std::clamp(Distance / std::max(Seconds, MIN_SECONDS) / Typical, MIN_SPEED_FACTOR, MAX_SPEED_FACTOR);
 	}
 

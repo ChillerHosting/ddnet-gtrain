@@ -139,9 +139,13 @@ void CGameControllerGTrain::HideUnrelatedChatCommands()
 
 static const char *const s_apEloDifficulties[] = {"Easy", "Main", "Hard", "Insane", "Extreme"};
 static const char *const s_apEloStars[] = {"★☆☆", "★★☆", "★★★"};
+// Above Extreme, without stars.
+static const char *const s_pDeranged = "Deranged";
 
 std::optional<int> CGameControllerGTrain::EloStep(const char *pServer, int Stars)
 {
+	if(str_comp_nocase(pServer, s_pDeranged) == 0)
+		return GTrainElo::DERANGED_STEP;
 	if(Stars < 1 || Stars > (int)std::size(s_apEloStars))
 		return std::nullopt;
 	for(int Difficulty = 0; Difficulty < (int)std::size(s_apEloDifficulties); ++Difficulty)
@@ -1259,8 +1263,14 @@ void CGameControllerGTrain::Help()
 	log_info("chatresp", "/rank or /profile [player]: stats and playtime, /top5captures, /top5attempts, /top5respawns, /top5playtime: their ladders");
 	log_info("chatresp", "/map <name>: vote a map, /mapinfo: map details, /cmdlist: every chat command");
 	if(m_EloStep)
-		log_info("chatresp", "Captures here are worth %.1f times as much as on Easy ★☆☆ maps (%s %s), longer and faster ones more.", GTrainElo::PointsPerTile(*m_EloStep) / GTrainElo::PointsPerTile(0),
-			s_apEloDifficulties[*m_EloStep / std::size(s_apEloStars)], s_apEloStars[*m_EloStep % std::size(s_apEloStars)]);
+	{
+		char aDifficulty[32];
+		if(*m_EloStep == GTrainElo::DERANGED_STEP)
+			str_copy(aDifficulty, s_pDeranged);
+		else
+			str_format(aDifficulty, sizeof(aDifficulty), "%s %s", s_apEloDifficulties[*m_EloStep / std::size(s_apEloStars)], s_apEloStars[*m_EloStep % std::size(s_apEloStars)]);
+		log_info("chatresp", "Captures here are worth %.1f times as much as on Easy ★☆☆ maps (%s), longer and faster ones more.", GTrainElo::PointsPerTile(*m_EloStep) / GTrainElo::PointsPerTile(0), aDifficulty);
+	}
 	else
 		log_info("chatresp", "Captures on this map earn no ELO.");
 }
