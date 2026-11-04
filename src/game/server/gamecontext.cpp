@@ -4303,7 +4303,12 @@ void CGameContext::OnInit(const void *pPersistentData)
 
 	const bool IsGTrain = !str_comp(Config()->m_SvGametype, "gtrain");
 	if(IsGTrain)
+	{
 		g_Config.m_SvSoloServer = 1;
+		// Hooks pull equally strong, whoever ticks first. Solo tees move the
+		// same either way, so stored runs still replay.
+		g_Config.m_SvNoWeakHook = 1;
+	}
 	// The GTrain controller replaces /team with its own, this brings DDNet's
 	// back after it.
 	Console()->Register("team", "?i[id]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTeam, this, "Lets you join team i (shows your team if left blank)");

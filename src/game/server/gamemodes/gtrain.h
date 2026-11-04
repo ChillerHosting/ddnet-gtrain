@@ -41,6 +41,8 @@ class CGameControllerGTrain : public CGameControllerDDNet
 		MIN_ATTEMPT_SECONDS = 2,
 		STATS_SAVE_SECONDS = 60,
 		TEAM_REQUEST_SECONDS = 60,
+		TEAM_SPOT_RANGE = 8, // tiles from the team's start
+		TEAM_SPOT_SPACING = 2, // tiles between teammates
 	};
 
 	// centers of all non-freeze tiles between the start and the finish line,
@@ -145,6 +147,7 @@ class CGameControllerGTrain : public CGameControllerDDNet
 	void HoldHoverDoor(class CCharacter *pChr, int Hover);
 	void RestartFight(int Group, std::optional<int> ChosenStart = std::nullopt);
 	void PlaceGroup(int Group, const std::shared_ptr<CGTrainGoal> &pGoal, int Start, int TargetDistance, bool Retry);
+	std::vector<int> TeamStarts(const CGTrainGoal &Goal, int Start, int Count);
 	bool LeaveFight(int ClientId, bool NewAttempt);
 	int FightSize(int Group) const;
 	bool InTeam(int ClientId) const { return m_aTeamGroup[m_aFightGroup[ClientId]]; }

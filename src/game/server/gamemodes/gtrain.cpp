@@ -694,8 +694,11 @@ void CGameControllerGTrain::PlaceForAttempt(CPlayer *pPlayer, const std::shared_
 	Attempt.m_StartTick = -1;
 	if(Settings.m_Freeplay)
 		Attempt.m_vRoute.clear();
-	else
+	else if(pGoal->m_vInitialRoute.empty() || pGoal->m_vInitialRoute.front() == Start)
 		Attempt.m_vRoute = pGoal->m_vInitialRoute;
+	// Teammates start beside the goal's start.
+	else if(!m_Pathfinder.FindPath(*pGoal, Start, Attempt.m_vRoute))
+		Attempt.m_vRoute.clear();
 	Attempt.m_RouteIndex = 0;
 	Attempt.m_RouteNode = Start;
 	pChr->SetDeepFrozen(false);
@@ -919,14 +922,21 @@ void CGameControllerGTrain::RestartFight(int Group, std::optional<int> ChosenSta
 
 void CGameControllerGTrain::PlaceGroup(int Group, const std::shared_ptr<CGTrainGoal> &pGoal, int Start, int TargetDistance, bool Retry)
 {
-	m_SyncFightDeaths = true;
-	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
+	// The leader first, who gets the start itself.
+	std::vector<int> vMembers;
+	for(int i = -1; i < MAX_CLIENTS; ++i)
 	{
+		const int ClientId = i < 0 ? Group : i;
 		CPlayer *pPlayer = GameServer()->m_apPlayers[ClientId];
-		if(m_aFightGroup[ClientId] != Group || !pPlayer || pPlayer->GetTeam() == TEAM_SPECTATORS)
+		if(i == Group || m_aFightGroup[ClientId] != Group || !pPlayer || pPlayer->GetTeam() == TEAM_SPECTATORS)
 			continue;
-		PlaceForAttempt(pPlayer, pGoal, Start, TargetDistance, Retry);
+		vMembers.push_back(ClientId);
 	}
+	// Fights race from the same spot, solo. Teammates would collide there.
+	const std::vector<int> vStarts = m_aTeamGroup[Group] ? TeamStarts(*pGoal, Start, vMembers.size()) : std::vector<int>(vMembers.size(), Start);
+	m_SyncFightDeaths = true;
+	for(size_t i = 0; i < vMembers.size(); ++i)
+		PlaceForAttempt(GameServer()->m_apPlayers[vMembers[i]], pGoal, vStarts[i], TargetDistance, Retry);
 	m_SyncFightDeaths = false;
 	if(!m_aTeamGroup[Group])
 		return;
@@ -939,6 +949,42 @@ void CGameControllerGTrain::PlaceGroup(int Group, const std::shared_ptr<CGTrainG
 		if(pChr && m_aFightGroup[ClientId] == Group && m_aAttempts[ClientId].m_StartTick < 0)
 			HoldHoverDoor(pChr, Hover);
 	}
+}
+
+std::vector<int> CGameControllerGTrain::TeamStarts(const CGTrainGoal &Goal, int Start, int Count)
+{
+	// Each teammate gets a spot of their own near the team's start, apart
+	// enough not to push each other while hovering. Spots no closer to the
+	// flag than the start come first, then the closest by path, the same
+	// ones every time, so retries keep everyone's spot. Where the map runs
+	// out of spots, the rest share the start.
+	std::vector<int> vStarts = {Start};
+	const vec2 StartPos = m_PathGraph.m_vNodes[Start].m_Pos;
+	std::vector<int> vNearby;
+	m_Pathfinder.FindReachable({Start}, TEAM_SPOT_RANGE, vNearby);
+	const int StartDistance = Goal.m_Ready ? Goal.FieldDistance(Start) : -1;
+	const bool HasGoal = StartDistance >= 0;
+	for(const bool Ahead : {false, true})
+	{
+		for(const int Node : vNearby)
+		{
+			if((int)vStarts.size() >= Count)
+				break;
+			const vec2 Pos = m_PathGraph.m_vNodes[Node].m_Pos;
+			// Spots like the random ones, not behind a teleporter.
+			if(!m_PathGraph.m_vNodes[Node].m_Goal || distance(Pos, StartPos) > TEAM_SPOT_RANGE * 32.0f)
+				continue;
+			const int Distance = Goal.FieldDistance(Node);
+			if(HasGoal && (Distance >= 0 && Distance < StartDistance) != Ahead)
+				continue;
+			if(std::all_of(vStarts.begin(), vStarts.end(), [&](int Other) { return distance(Pos, m_PathGraph.m_vNodes[Other].m_Pos) >= TEAM_SPOT_SPACING * 32.0f; }))
+				vStarts.push_back(Node);
+		}
+		if(!HasGoal)
+			break;
+	}
+	vStarts.resize(std::max(Count, 1), Start);
+	return vStarts;
 }
 
 bool CGameControllerGTrain::LeaveFight(int ClientId, bool NewAttempt)

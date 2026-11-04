@@ -105,7 +105,7 @@ Freeplay has no attempts, and rcon cheats stop everything but the playtime from 
 Teams play together instead of solo: teammates collide, hook and hit each other, and share the map's switches, like a DDRace team.
 
 - `/team <player>` asks a player to team up, `/accept` or `/a` joins within a minute. Members can ask more players, who join the same team. The one who asked first leads it, shown as `*name*`, and chooses the [settings](#commands) everyone plays with.
-- The team trains at one spot with one flag. When any member reaches the flag, it counts for the whole team and everyone starts at a new spot together: `'name' captured the flag for their team in 3.20 seconds (0 fails, +0 ELO (team))`.
+- The team trains with one flag. Everyone hovers at a spot of their own near the leader's, at least two tiles apart and no closer to the flag where the map allows, and returns there with `/r`. When any member reaches the flag, it counts for the whole team and everyone starts at a new spot together: `'name' captured the flag for their team in 3.20 seconds (0 fails, +0 ELO (team))`.
 - Any member's death, kill or `/r` acts for the whole team: a new spot after deaths, the same one after `/r`.
 - Teams earn no [ELO](#elo) for now. Captures, attempts and playtime still count in the [stats](#stats).
 - `/team` alone leaves it, and the others start over at a new spot. A team with one player left ends, so does a member's leaving for the spectators.
@@ -123,7 +123,7 @@ Build the server as described in the [DDNet building guide](docs/BUILDING.md) an
 ./DDNet-Server "sv_map <map>"
 ```
 
-`sv_gametype` defaults to `gtrain`. The mod forces `sv_solo_server 1` and `sv_kill_delay 0`, but keeps the map's `player_collision` and `player_hooking` tunings for its teams: solo players never touch, and DDNet clients predict that from their solo flag. Chat commands for races, DDRace teams and practice, like `/practice`, `/save` or `/lock`, are removed from the chat and its command completion; rcon keeps them. `/team` is GTrain's own.
+`sv_gametype` defaults to `gtrain`. The mod forces `sv_solo_server 1`, `sv_no_weak_hook 1` and `sv_kill_delay 0`, but keeps the map's `player_collision` and `player_hooking` tunings for its teams: solo players never touch, and DDNet clients predict that from their solo flag. Chat commands for races, DDRace teams and practice, like `/practice`, `/save` or `/lock`, are removed from the chat and its command completion; rcon keeps them. `/team` is GTrain's own.
 
 ### Map downloads
 

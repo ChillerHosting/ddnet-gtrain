@@ -243,6 +243,7 @@ public:
 		// The corridor is short, skipping its start has its own test.
 		g_Config.m_SvGtrainStartExclusion = 0;
 		g_Config.m_SvSoloServer = 1;
+		g_Config.m_SvNoWeakHook = 1;
 		g_Config.m_SvTeam = SV_TEAM_FORCED_SOLO;
 		GameServer()->GlobalTuning()->Set("player_collision", 0);
 		GameServer()->GlobalTuning()->Set("player_hooking", 0);
@@ -1434,6 +1435,7 @@ TEST_F(GameWorld, GTrainTeamsPlayTogetherWithoutElo)
 		GameServer()->TuningList()[Zone].Set("player_hooking", 1);
 	}
 	g_Config.m_SvSpamprotection = 0;
+	g_Config.m_SvGtrainGoalDistance = 6;
 	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob", "Carl"});
 	const int Anna = vIds[0], Bob = vIds[1], Carl = vIds[2];
 	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
@@ -1447,15 +1449,20 @@ TEST_F(GameWorld, GTrainTeamsPlayTogetherWithoutElo)
 		return LastMessage(ClientId);
 	};
 	const auto Chr = [&](int ClientId) { return GameServer()->GetPlayerChar(ClientId); };
-	// Members share a spot, a flag and a DDRace team, collide and hook each
-	// other, and show as a team. Everyone else stays solo.
+	// Members share a flag and a DDRace team, collide and hook each other,
+	// and show as a team. They hover at spots of their own, two tiles apart
+	// and close to the leader's. Everyone else stays solo.
 	const auto CheckTogether = [&](std::initializer_list<int> Members) {
 		const int Leader = *Members.begin();
 		ASSERT_NE(Chr(Leader), nullptr);
 		for(int ClientId : Members)
 		{
 			ASSERT_NE(Chr(ClientId), nullptr);
-			EXPECT_EQ(Chr(ClientId)->m_Pos, Chr(Leader)->m_Pos);
+			EXPECT_EQ(Chr(ClientId)->m_FreezeTime, 50);
+			EXPECT_LE(distance(Chr(ClientId)->m_Pos, Chr(Leader)->m_Pos), 8 * 32.0f);
+			for(int Other : Members)
+				if(Other != ClientId)
+					EXPECT_GE(distance(Chr(ClientId)->m_Pos, Chr(Other)->m_Pos), 2 * 32.0f);
 			EXPECT_EQ(TrainingGoal(ClientId), TrainingGoal(Leader));
 			EXPECT_EQ(Chr(ClientId)->Team(), Leader);
 			EXPECT_FALSE(Teams.m_Core.GetSolo(ClientId));
@@ -1524,19 +1531,20 @@ TEST_F(GameWorld, GTrainTeamsPlayTogetherWithoutElo)
 	EXPECT_EQ(pController->Stats(Bob).m_Captures, Before.m_Captures + 1);
 	CheckTogether({Anna, Bob});
 
-	// Any member's /r retries the whole team.
-	const vec2 Spot = Chr(Anna)->m_Pos;
+	// Any member's /r retries the whole team, everyone at their spot.
+	const vec2 AnnaSpot = Chr(Anna)->m_Pos, BobSpot = Chr(Bob)->m_Pos;
 	Chr(Anna)->Unfreeze();
 	Chr(Bob)->Unfreeze();
 	pController->Tick();
 	for(int ClientId : {Anna, Bob})
 	{
-		Chr(ClientId)->SetPosition(Spot + vec2(64, 0));
-		Chr(ClientId)->m_Pos = Chr(ClientId)->m_PrevPos = Spot + vec2(64, 0);
+		Chr(ClientId)->SetPosition(AnnaSpot + vec2(32, 0));
+		Chr(ClientId)->m_Pos = Chr(ClientId)->m_PrevPos = AnnaSpot + vec2(32, 0);
 	}
 	Say(Bob, "/r");
 	CheckTogether({Anna, Bob});
-	EXPECT_EQ(Chr(Anna)->m_Pos, Spot);
+	EXPECT_EQ(Chr(Anna)->m_Pos, AnnaSpot);
+	EXPECT_EQ(Chr(Bob)->m_Pos, BobSpot);
 
 	// Any member's death starts the team over.
 	GameServer()->m_apPlayers[Bob]->KillCharacter(WEAPON_SELF);
