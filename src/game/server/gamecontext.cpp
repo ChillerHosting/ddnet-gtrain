@@ -4138,8 +4138,8 @@ void CGameContext::RegisterChatCommands()
 	Console()->Register("retry", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRetry, this, "Retry the current training position and goal");
 	Console()->Register("r", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRetry, this, "Retry the current training position and goal");
 	Console()->Register("invincible", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRetry, this, "Retry the current training position and goal");
-	Console()->Register("tc", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTeleCursor, this, "Retry the current training position and goal, in freeplay start where you aim (fight leader only in a group)");
-	Console()->Register("telecursor", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTeleCursor, this, "Retry the current training position and goal, in freeplay start where you aim (fight leader only in a group)");
+	Console()->Register("tc", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTeleCursor, this, "Retry the current training position and goal, in freeplay start where you aim or at the middle of the /spec view (fight leader only in a group)");
+	Console()->Register("telecursor", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTeleCursor, this, "Retry the current training position and goal, in freeplay start where you aim or at the middle of the /spec view (fight leader only in a group)");
 	Console()->Register("distance", "?i[tiles]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConGoalDistance, this, "Show or set the GTrain goal distance, 50-1000 tiles or 0 for the server default (fight leader only in a group)");
 	Console()->Register("nodj", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConNoDoubleJump, this, "Toggle starting GTrain attempts without double jump (fight leader only in a group)");
 	Console()->Register("forwards", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConForwards, this, "Toggle GTrain goals only leading towards the finish line (fight leader only in a group)");

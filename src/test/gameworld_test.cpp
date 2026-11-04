@@ -1370,9 +1370,54 @@ TEST_F(GameWorld, GTrainFreeplayTeleCursorChoosesTheStart)
 	pController->Tick();
 	EXPECT_EQ(Pos(Bob), Tile(6, 2));
 
-	// Paused players cannot choose one.
-	GameServer()->m_apPlayers[Anna]->Pause(CPlayer::PAUSE_SPEC, true);
-	EXPECT_EQ(AimAndSay(Anna, Tile(3, 2), "/tc"), "You must be playing and unpaused to choose a start position.");
+	// In /spec or /pause, it is the middle of the view instead, which can be
+	// anywhere on the map, and the leader plays again.
+	CPlayer *pAnna = GameServer()->m_apPlayers[Anna];
+	const auto SpecAndSay = [&](int PauseType, vec2 View) {
+		pAnna->Pause(PauseType, true);
+		if(PauseType == CPlayer::PAUSE_SPEC)
+			GameServer()->GetPlayerChar(Anna)->Pause(true);
+		pAnna->m_ViewPos = View;
+		return AimAndSay(Anna, Tile(3, 2), "/tc");
+	};
+	const vec2 Far = Tile(Width - 3, 2);
+	EXPECT_EQ(SpecAndSay(CPlayer::PAUSE_SPEC, Far), "");
+	EXPECT_EQ(pAnna->IsPaused(), 0);
+	EXPECT_FALSE(GameServer()->GetPlayerChar(Anna)->IsPaused());
+	EXPECT_EQ(Pos(Anna), Far);
+	EXPECT_EQ(Pos(Bob), Far);
+	EXPECT_EQ(SpecAndSay(CPlayer::PAUSE_PAUSED, Tile(5, 2)), "");
+	EXPECT_EQ(pAnna->IsPaused(), 0);
+	EXPECT_EQ(Pos(Anna), Tile(5, 2));
+	EXPECT_EQ(Pos(Bob), Tile(5, 2));
+	// Views off the path keep the pause.
+	EXPECT_EQ(SpecAndSay(CPlayer::PAUSE_SPEC, Tile(3, 1)), "Move the middle of your view to a free tile between the start and the finish line to start there.");
+	EXPECT_EQ(pAnna->IsPaused(), -CPlayer::PAUSE_SPEC);
+	EXPECT_EQ(Pos(Anna), Tile(5, 2));
+	pAnna->Pause(CPlayer::PAUSE_NONE, true);
+
+	// Spectators have no tee to start.
+	GameServer()->m_apPlayers[Bob]->SetTeam(TEAM_SPECTATORS, false);
+	pController->Tick();
+	EXPECT_EQ(AimAndSay(Anna, Tile(3, 2), "/tc"), "");
+	m_pServer->m_avChatMessages[Bob].clear();
+	Say(Bob, "/tc");
+	ASSERT_FALSE(m_pServer->m_avChatMessages[Bob].empty());
+	EXPECT_EQ(m_pServer->m_avChatMessages[Bob].back(), "You must be playing to choose a start position.");
+
+	// Outside freeplay, /tc in /spec can't retry.
+	Say(Anna, "/freeplay");
+	const vec2 Spot = Pos(Anna);
+	EXPECT_EQ(SpecAndSay(CPlayer::PAUSE_SPEC, Tile(6, 2)), "You must be playing and unpaused to retry. In /freeplay, /tc in /spec starts at the middle of your view.");
+	EXPECT_EQ(Pos(Anna), Spot);
+	pAnna->Pause(CPlayer::PAUSE_NONE, true);
+
+	// Admin force pauses can't be left with it.
+	Say(Anna, "/freeplay");
+	pAnna->ForcePause(10);
+	pAnna->m_ViewPos = Tile(6, 2);
+	EXPECT_EQ(AimAndSay(Anna, Tile(3, 2), "/tc"), "You are force-paused and can't choose a start position.");
+	EXPECT_GT(pAnna->IsPaused(), 0);
 }
 
 TEST_F(GameWorld, GTrainRetryPreservesGoalAndRestartsTimer)

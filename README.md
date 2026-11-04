@@ -24,7 +24,7 @@ A server-side [DDNet](https://github.com/ddnet/ddnet) mod for training Gores map
 | `/forwards` | Toggle goals that only lead towards the finish line, see [below](#forwards) |
 | `/scorelimit <0-1000>` | Points needed to win a fight (default 10, `0` for no limit) |
 | `/shotgun`, `/grenade`, `/laser` (or `/rifle`), `/ninja` | Toggle keeping that weapon in every attempt; ninja never runs out. Captures with kept weapons earn no [ELO](#elo) |
-| `/freeplay` | Toggle training without flags, paths and captures. `/tc` or `/telecursor` starts you on the tile you aim at, and `/r` returns there; in a fight, the leader chooses the start of everyone |
+| `/freeplay` | Toggle training without flags, paths and captures. `/tc` or `/telecursor` starts you on the tile you aim at, and `/r` returns there; in `/spec` or `/pause`, it starts you at the middle of your view and unpauses you, so the start can be anywhere on the map. In a fight, the leader chooses the start of everyone |
 | `/trail` | Toggle showing the particle trail to the flag; it is your own choice, also in fights and while spectating |
 | `/settings [player]` | Show your settings or another player's; in a fight, the leader's settings that apply to it |
 | `/points`, `/elo [player]` | Show your ELO and rank, or another player's |

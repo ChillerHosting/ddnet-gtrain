@@ -1067,16 +1067,25 @@ void CGameControllerGTrain::TeleCursor(int ClientId)
 	const int Group = m_aFightGroup[ClientId];
 	if(!m_aSettings[Group].m_Freeplay)
 	{
-		Retry(ClientId);
+		if(pPlayer->GetTeam() != TEAM_SPECTATORS && pPlayer->IsPaused())
+			GameServer()->SendChatTarget(ClientId, "You must be playing and unpaused to retry. In /freeplay, /tc in /spec starts at the middle of your view.");
+		else
+			Retry(ClientId);
 		return;
 	}
 	// The start is the fight's, retries and member respawns return to it.
 	if(!CheckFightLeader(ClientId, "choose the start position"))
 		return;
 	CCharacter *pChr = pPlayer->GetCharacter();
-	if(pPlayer->GetTeam() == TEAM_SPECTATORS || pPlayer->IsPaused() || !pChr)
+	if(pPlayer->GetTeam() == TEAM_SPECTATORS || !pChr)
 	{
-		GameServer()->SendChatTarget(ClientId, "You must be playing and unpaused to choose a start position.");
+		GameServer()->SendChatTarget(ClientId, "You must be playing to choose a start position.");
+		return;
+	}
+	// Force pauses by admins are positive, the player's own negative.
+	if(pPlayer->IsPaused() > 0)
+	{
+		GameServer()->SendChatTarget(ClientId, "You are force-paused and can't choose a start position.");
 		return;
 	}
 	if(m_vTrainPositions.empty())
@@ -1084,10 +1093,17 @@ void CGameControllerGTrain::TeleCursor(int ClientId)
 		GameServer()->SendChatTarget(ClientId, "Training is disabled on this map.");
 		return;
 	}
+	// In /spec or /pause, it is the middle of the view, which the free view
+	// moves anywhere on the map, or the spectated player's position.
+	const bool Spectating = pPlayer->IsPaused();
+	vec2 Pos = pPlayer->m_ViewPos;
+	if(!Spectating)
+	{
+		const vec2 Target(pChr->Core()->m_Input.m_TargetX, pChr->Core()->m_Input.m_TargetY);
+		Pos = pPlayer->m_CameraInfo.ConvertTargetToWorld(pChr->GetPos(), Target);
+	}
 	// Any tile paths can go through, except teleporters moving the tee away
 	// right away. Unlike random spots, it needs no freeze below.
-	const vec2 Target(pChr->Core()->m_Input.m_TargetX, pChr->Core()->m_Input.m_TargetY);
-	const vec2 Pos = pPlayer->m_CameraInfo.ConvertTargetToWorld(pChr->GetPos(), Target);
 	CCollision *pCollision = GameServer()->Collision();
 	const int Width = pCollision->GetWidth();
 	int Start = -1;
@@ -1099,9 +1115,12 @@ void CGameControllerGTrain::TeleCursor(int ClientId)
 	}
 	if(Start < 0)
 	{
-		GameServer()->SendChatTarget(ClientId, "Aim at a free tile between the start and the finish line to start there.");
+		GameServer()->SendChatTarget(ClientId, Spectating ? "Move the middle of your view to a free tile between the start and the finish line to start there." : "Aim at a free tile between the start and the finish line to start there.");
 		return;
 	}
+	// Starting there ends the pause, before the placement respawns the tee.
+	if(Spectating)
+		pPlayer->Pause(CPlayer::PAUSE_NONE, true);
 	RestartFight(Group, Start);
 }
 
@@ -1271,7 +1290,7 @@ void CGameControllerGTrain::Help()
 	log_info("chatresp", "Kill: new position and flag");
 	log_info("chatresp", "/r or /retry: retry the current position and flag");
 	log_info("chatresp", "/tp, /teleport, /lasttp, /back, /rescue, /invincible: retry like /r, for practice binds");
-	log_info("chatresp", "/tc or /telecursor: retry like /r, in freeplay start where you aim");
+	log_info("chatresp", "/tc or /telecursor: retry like /r, in freeplay start where you aim, or in /spec at the middle of your view");
 	log_info("chatresp", "/fight <player>: join a player's fight, /fight alone leaves it");
 	log_info("chatresp", "/distance <%d-%d>: goal distance in tiles, 0 for the server default", MinGoalDistance(), (int)MAX_GOAL_DISTANCE);
 	log_info("chatresp", "/nodj: toggle starting attempts without double jump");
