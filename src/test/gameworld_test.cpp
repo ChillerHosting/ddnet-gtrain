@@ -374,6 +374,7 @@ public:
 		int m_Distance;
 		float m_Elo;
 		float m_SpeedFactor;
+		int64_t m_Points;
 		CGTrainRun m_Run;
 	};
 
@@ -384,7 +385,7 @@ public:
 		std::unique_ptr<IDbConnection> pConnection = CreateSqliteConnection(pDatabase, false);
 		char aError[256];
 		EXPECT_TRUE(pConnection->Connect(aError, sizeof(aError))) << aError;
-		EXPECT_TRUE(pConnection->PrepareStatement("SELECT Map, MapSha256, Name, Ticks, Distance, Elo, SpeedFactor, Run FROM record_gtrain_runs ORDER BY rowid", aError, sizeof(aError))) << aError;
+		EXPECT_TRUE(pConnection->PrepareStatement("SELECT Map, MapSha256, Name, Ticks, Distance, Elo, SpeedFactor, Run, Points FROM record_gtrain_runs ORDER BY rowid", aError, sizeof(aError))) << aError;
 		bool End = false;
 		while(pConnection->Step(&End, aError, sizeof(aError)) && !End)
 		{
@@ -403,6 +404,7 @@ public:
 			std::vector<unsigned char> vData(1 << 20);
 			vData.resize(pConnection->GetBlob(8, vData.data(), vData.size()));
 			EXPECT_TRUE(Stored.m_Run.Decode(vData.data(), vData.size()));
+			Stored.m_Points = pConnection->GetInt64(9);
 		}
 		EXPECT_TRUE(End) << aError;
 		pConnection->Disconnect();
@@ -2604,10 +2606,26 @@ TEST_F(GameWorld, GTrainCapturesEarnEloByDifficultySpeedAndGoalDistance)
 	EXPECT_EQ(pController->Stats(Bob).m_Points, aPoints[Bob]);
 
 	// Deranged maps have no stars and are worth what Extreme ★★★★★ would be.
+	// Speed doesn't count there, and goals have at least 100 tiles.
 	pController->SetMapDifficulty("Deranged", 0);
-	EXPECT_EQ(Help(), "Captures here are worth 656.8 times as much as on Easy ★☆☆ maps (Deranged), longer and faster ones more.");
+	EXPECT_EQ(Help(), "Captures here are worth 656.8 times as much as on Easy ★☆☆ maps (Deranged), longer ones more. Speed doesn't count, goals have at least 100 tiles.");
+	const auto Reply = [&](const char *pMessage) {
+		m_pServer->m_avChatMessages[Runner].clear();
+		Say(Runner, pMessage);
+		return m_pServer->m_avChatMessages[Runner].back();
+	};
+	EXPECT_EQ(Reply("/distance 60"), "The goal distance must be between 100 and 1000 tiles on Deranged maps, 0 for the server default.");
+	EXPECT_EQ(Reply("/distance"), "Goal distance: 100 tiles (server default). Use /distance 100-1000 to change it, 0 for the server default.");
+	// The goal from before the difficulty was known is shorter.
+	EXPECT_NE(Capture(Runner).find("(0 fails, +0 ELO (goal under 100 tiles))."), std::string::npos);
+	EXPECT_EQ(pController->Stats(Runner).m_Points, aPoints[Runner]);
+	// New goals aim for 100 tiles, which the short corridor cuts. An instant
+	// capture counts as typical speed.
 	Tiles = GoalTiles(Runner);
-	EXPECT_NE(Capture(Runner).find("(0 fails, " + Gain(Runner, GTrainElo::DERANGED_STEP, Tiles, 0) + ")."), std::string::npos);
+	ASSERT_LT(Tiles, 100);
+	Messages = Capture(Runner);
+	EXPECT_NE(Messages.find("(0 fails, " + Gain(Runner, GTrainElo::DERANGED_STEP, Tiles, 0) + ")."), std::string::npos);
+	EXPECT_NE(Messages.find(", 1.0x speed)."), std::string::npos);
 	EXPECT_EQ(pController->Stats(Runner).m_Points, aPoints[Runner]);
 
 	pController->SetMapDifficulty("Mod", 3);
@@ -3541,6 +3559,7 @@ TEST_F(GameWorld, GTrainCapturesReplayExactly)
 		// What the capture earned, at the speed of its stored ticks.
 		EXPECT_GT(Stored.m_Elo, 0.0f);
 		EXPECT_FLOAT_EQ(Stored.m_SpeedFactor, GTrainElo::SpeedFactor(*CGameControllerGTrain::EloStep("Main", 1), Stored.m_Distance, Stored.m_Ticks / (double)SERVER_TICK_SPEED));
+		EXPECT_EQ(Stored.m_Points, GTrainElo::CapturePoints(*CGameControllerGTrain::EloStep("Main", 1), Stored.m_Distance, Stored.m_Ticks / (double)SERVER_TICK_SPEED));
 	}
 	ASSERT_EQ(vStored[0].m_Run.m_Start.m_vShots.size(), 1u);
 	EXPECT_FALSE(vStored[0].m_Run.m_Start.m_vShots[0].m_Laser);

@@ -136,9 +136,23 @@ struct CSqlGTrainRunData : ISqlData
 	char m_aGameUuid[UUID_MAXSTRSIZE];
 	char m_aRevision[64];
 	int m_Distance;
+	int64_t m_Points;
 	float m_Elo;
 	float m_SpeedFactor;
 	CGTrainRun m_Run;
+};
+
+// Shadow-bans the stored runs of a map or a player, or both, or lifts the ban.
+struct CSqlGTrainBanRunsData : ISqlData
+{
+	CSqlGTrainBanRunsData() :
+		ISqlData(nullptr)
+	{
+	}
+
+	char m_aMap[MAX_MAP_LENGTH]; // empty for every map
+	char m_aName[MAX_NAME_LENGTH]; // empty for every player
+	bool m_Ban;
 };
 
 struct CSqlPlayerRequest : ISqlData
@@ -392,6 +406,7 @@ struct CScoreWorker
 	static bool SaveTeamScore(IDbConnection *pSqlServer, const ISqlData *pGameData, Write w, char *pError, int ErrorSize);
 	static bool AddGTrainStats(IDbConnection *pSqlServer, const ISqlData *pGameData, Write w, char *pError, int ErrorSize);
 	static bool SaveGTrainRun(IDbConnection *pSqlServer, const ISqlData *pGameData, Write w, char *pError, int ErrorSize);
+	static bool BanGTrainRuns(IDbConnection *pSqlServer, const ISqlData *pGameData, Write w, char *pError, int ErrorSize);
 };
 
 #endif // GAME_SERVER_SCOREWORKER_H

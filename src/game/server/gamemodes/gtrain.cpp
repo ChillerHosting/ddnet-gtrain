@@ -241,7 +241,7 @@ void CGameControllerGTrain::SaveRun(CCharacter *pChr, const CEloGain &Gain)
 		return;
 	Attempt.m_Run->m_EndPos = pChr->Core()->m_Pos;
 	Attempt.m_Run->m_EndVel = pChr->Core()->m_Vel;
-	GameServer()->Score()->SaveGTrainRun(Server()->ClientName(ClientId), Attempt.m_pGoal->m_Distance, Gain.m_Elo, Gain.m_SpeedFactor, std::move(*Attempt.m_Run));
+	GameServer()->Score()->SaveGTrainRun(Server()->ClientName(ClientId), Attempt.m_pGoal->m_Distance, Gain.m_Points, Gain.m_Elo, Gain.m_SpeedFactor, std::move(*Attempt.m_Run));
 	Attempt.m_Run.reset();
 }
 
@@ -258,12 +258,29 @@ std::optional<CGameControllerGTrain::CEloGain> CGameControllerGTrain::AwardElo(i
 		return CEloGain{0.0, 0.0, "frozen"};
 	if(Attempt.m_WithWeapons)
 		return CEloGain{0.0, 0.0, "kept weapons"};
+	// Goals made before the map's difficulty was known can be shorter.
+	if(IsDeranged() && Attempt.m_TargetDistance < DERANGED_MIN_GOAL_DISTANCE)
+		return CEloGain{0.0, 0.0, "goal under 100 tiles"};
 	const double Seconds = (Server()->Tick() - Attempt.m_StartTick) / (double)Server()->TickSpeed();
 	CGTrainStats Gain;
 	Gain.m_Points = GTrainElo::CapturePoints(*m_EloStep, Distance, Seconds);
 	const double EloBefore = GTrainElo::FromPoints(m_aStats[ClientId].m_Points);
 	AddStats(ClientId, Gain);
-	return CEloGain{GTrainElo::FromPoints(m_aStats[ClientId].m_Points) - EloBefore, GTrainElo::SpeedFactor(*m_EloStep, Distance, Seconds)};
+	return CEloGain{GTrainElo::FromPoints(m_aStats[ClientId].m_Points) - EloBefore, GTrainElo::SpeedFactor(*m_EloStep, Distance, Seconds), nullptr, Gain.m_Points};
+}
+
+void CGameControllerGTrain::BanRuns(const char *pMap, const char *pName, bool Ban)
+{
+	if(!GameServer()->Score())
+		return;
+	GameServer()->Score()->BanGTrainRuns(pMap, pName, Ban);
+	// Reloading after the ban, the database runs jobs in order, shows the
+	// changed ELO here. Players on other servers see it once they rejoin.
+	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
+	{
+		if(m_aaStatsNames[ClientId][0] && (!pName[0] || str_comp(m_aaStatsNames[ClientId], pName) == 0))
+			LoadStats(ClientId);
+	}
 }
 
 void CGameControllerGTrain::FormatCaptureResult(char *pBuf, int BufSize, int Fails, const std::optional<CEloGain> &Gain)
@@ -759,9 +776,15 @@ int CGameControllerGTrain::FightSize(int Group) const
 	return Size;
 }
 
+int CGameControllerGTrain::MinGoalDistance() const
+{
+	return IsDeranged() ? DERANGED_MIN_GOAL_DISTANCE : MIN_GOAL_DISTANCE;
+}
+
 int CGameControllerGTrain::GoalDistance(int Group) const
 {
-	return m_aSettings[Group].m_GoalDistance ? m_aSettings[Group].m_GoalDistance : g_Config.m_SvGtrainGoalDistance;
+	const int Distance = m_aSettings[Group].m_GoalDistance ? m_aSettings[Group].m_GoalDistance : g_Config.m_SvGtrainGoalDistance;
+	return IsDeranged() ? std::max(Distance, (int)DERANGED_MIN_GOAL_DISTANCE) : Distance;
 }
 
 int CGameControllerGTrain::HoverTicks(int Group) const
@@ -1091,16 +1114,16 @@ void CGameControllerGTrain::Distance(int ClientId, std::optional<int> Tiles)
 	if(!Tiles)
 	{
 		str_format(aMessage, sizeof(aMessage), "Goal distance: %d tiles%s. Use /distance %d-%d to change it, 0 for the server default.",
-			GoalDistance(Group), m_aSettings[Group].m_GoalDistance ? "" : " (server default)", (int)MIN_GOAL_DISTANCE, (int)MAX_GOAL_DISTANCE);
+			GoalDistance(Group), m_aSettings[Group].m_GoalDistance ? "" : " (server default)", MinGoalDistance(), (int)MAX_GOAL_DISTANCE);
 		GameServer()->SendChatTarget(ClientId, aMessage);
 		return;
 	}
 	if(!CheckFightLeader(ClientId, "change the goal distance"))
 		return;
 	// Short goals mostly train the easy parts right after a start.
-	if(*Tiles != 0 && (*Tiles < MIN_GOAL_DISTANCE || *Tiles > MAX_GOAL_DISTANCE))
+	if(*Tiles != 0 && (*Tiles < MinGoalDistance() || *Tiles > MAX_GOAL_DISTANCE))
 	{
-		str_format(aMessage, sizeof(aMessage), "The goal distance must be between %d and %d tiles, 0 for the server default.", (int)MIN_GOAL_DISTANCE, (int)MAX_GOAL_DISTANCE);
+		str_format(aMessage, sizeof(aMessage), "The goal distance must be between %d and %d tiles%s, 0 for the server default.", MinGoalDistance(), (int)MAX_GOAL_DISTANCE, IsDeranged() ? " on Deranged maps" : "");
 		GameServer()->SendChatTarget(ClientId, aMessage);
 		return;
 	}
@@ -1250,7 +1273,7 @@ void CGameControllerGTrain::Help()
 	log_info("chatresp", "/tp, /teleport, /lasttp, /back, /rescue, /invincible: retry like /r, for practice binds");
 	log_info("chatresp", "/tc or /telecursor: retry like /r, in freeplay start where you aim");
 	log_info("chatresp", "/fight <player>: join a player's fight, /fight alone leaves it");
-	log_info("chatresp", "/distance <%d-%d>: goal distance in tiles, 0 for the server default", (int)MIN_GOAL_DISTANCE, (int)MAX_GOAL_DISTANCE);
+	log_info("chatresp", "/distance <%d-%d>: goal distance in tiles, 0 for the server default", MinGoalDistance(), (int)MAX_GOAL_DISTANCE);
 	log_info("chatresp", "/nodj: toggle starting attempts without double jump");
 	log_info("chatresp", "/forwards: toggle goals only leading towards the finish line");
 	log_info("chatresp", "/scorelimit <0-%d>: points to win a fight, 0 for no limit", (int)MAX_SCORE_LIMIT);
@@ -1269,7 +1292,10 @@ void CGameControllerGTrain::Help()
 			str_copy(aDifficulty, s_pDeranged);
 		else
 			str_format(aDifficulty, sizeof(aDifficulty), "%s %s", s_apEloDifficulties[*m_EloStep / std::size(s_apEloStars)], s_apEloStars[*m_EloStep % std::size(s_apEloStars)]);
-		log_info("chatresp", "Captures here are worth %.1f times as much as on Easy ★☆☆ maps (%s), longer and faster ones more.", GTrainElo::PointsPerTile(*m_EloStep) / GTrainElo::PointsPerTile(0), aDifficulty);
+		if(IsDeranged())
+			log_info("chatresp", "Captures here are worth %.1f times as much as on Easy ★☆☆ maps (%s), longer ones more. Speed doesn't count, goals have at least %d tiles.", GTrainElo::PointsPerTile(*m_EloStep) / GTrainElo::PointsPerTile(0), aDifficulty, (int)DERANGED_MIN_GOAL_DISTANCE);
+		else
+			log_info("chatresp", "Captures here are worth %.1f times as much as on Easy ★☆☆ maps (%s), longer and faster ones more.", GTrainElo::PointsPerTile(*m_EloStep) / GTrainElo::PointsPerTile(0), aDifficulty);
 	}
 	else
 		log_info("chatresp", "Captures on this map earn no ELO.");

@@ -48,8 +48,11 @@ namespace GTrainElo
 	inline constexpr double MAX_POINTS = 1000.0 * 8000 * PointsPerTile(EXTREME_STEP) * 2;
 
 	// The capture's speed relative to the typical one of its difficulty.
+	// Deranged maps have no speed bonus, every capture counts as typical.
 	inline double SpeedFactor(int Step, int Distance, double Seconds)
 	{
+		if(Step == DERANGED_STEP)
+			return 1;
 		const double Typical = EASY_TILES_PER_SECOND + (EXTREME_TILES_PER_SECOND - EASY_TILES_PER_SECOND) * Step / EXTREME_STEP;
 		return std::clamp(Distance / std::max(Seconds, MIN_SECONDS) / Typical, MIN_SPEED_FACTOR, MAX_SPEED_FACTOR);
 	}

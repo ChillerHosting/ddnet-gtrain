@@ -157,6 +157,9 @@ class CGameContext : public IGameServer
 	static void ConChangeMap(IConsole::IResult *pResult, void *pUserData);
 	static void ConRandomMap(IConsole::IResult *pResult, void *pUserData);
 	static void ConRandomUnfinishedMap(IConsole::IResult *pResult, void *pUserData);
+	static void ConBanRuns(IConsole::IResult *pResult, void *pUserData);
+	static void ConUnbanRuns(IConsole::IResult *pResult, void *pUserData);
+	void BanGTrainRuns(IConsole::IResult *pResult, bool Ban) const;
 	static void ConRestart(IConsole::IResult *pResult, void *pUserData);
 	static void ConServerAlert(IConsole::IResult *pResult, void *pUserData);
 	static void ConModAlert(IConsole::IResult *pResult, void *pUserData);

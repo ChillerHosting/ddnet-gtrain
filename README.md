@@ -19,7 +19,7 @@ A server-side [DDNet](https://github.com/ddnet/ddnet) mod for training Gores map
 | Kill | New random spot and flag |
 | `/r`, `/retry` | Retry the current spot and flag; practice binds like `/tc`, `/telecursor`, `/invincible`, `/rescue`, `/back`, `/tp`, `/teleport` and `/lasttp` do the same, except `/tc` and `/telecursor` in freeplay |
 | `/fight <player>` | Join a player's fight; `/fight` alone leaves it |
-| `/distance <50-1000>` | Your goal distance in tiles; `0` uses the server default |
+| `/distance <50-1000>` | Your goal distance in tiles, at least 100 on Deranged maps; `0` uses the server default |
 | `/nodj` | Toggle starting attempts without double jump; touching the ground gives it back |
 | `/forwards` | Toggle goals that only lead towards the finish line, see [below](#forwards) |
 | `/scorelimit <0-1000>` | Points needed to win a fight (default 10, `0` for no limit) |
@@ -41,7 +41,7 @@ Goals normally lead in any direction from your spot, also back towards the start
 
 ## ELO
 
-Every capture earns points, and your ELO shows them on a scale from 0 to 9999. Both only ever grow, and players only see the ELO, the points stay internal. They are stored per player name in the server's database, like DDNet points.
+Every capture earns points, and your ELO shows them on a scale from 0 to 9999. Both only grow, unless an admin [bans runs](#banning-runs), and players only see the ELO, the points stay internal. They are stored per player name in the server's database, like DDNet points.
 
 - A capture earns points for every tile of the goal's path distance: 100 on Easy maps with one star, and 1.5 times as many for each star or difficulty step above that. These are the points per tile of a 100 tile goal:
 
@@ -53,10 +53,10 @@ Every capture earns points, and your ELO shows them on a scale from 0 to 9999. B
   | Insane | 3844 | 5767 | 8650 |
   | Extreme | 12975 | 19462 | 29193 |
 
-  Deranged maps have no stars and count as Extreme ★★★★★ would, two steps above Extreme ★★★: 65684.
+  Deranged maps have no stars and count as Extreme ★★★★★ would, two steps above Extreme ★★★: 65684. Their goals aim for at least 100 tiles, also when the server default is shorter, and speed doesn't count there, see below.
 
 - Longer goals are worth more than their length, since every tile is another chance to fail: points grow with the distance to the power of 1.5, so twice the distance earns about 2.8 times as many. Per tile, 50 tile goals earn 0.71 times the table's points, 200 tiles 1.41 times and 500 tiles 2.24 times.
-- That is multiplied by your speed compared to a typical one, from 12 path tiles per second on Easy down to 6 on Extreme ★★★ and 5.1 on Deranged (a bit below the speeds of the first captures on the KoG maps). Faster captures earn up to 4 times as much, slow ones still earn at least half. Only the time of the successful attempt counts.
+- That is multiplied by your speed compared to a typical one, from 12 path tiles per second on Easy down to 6 on Extreme ★★★ (a bit below the speeds of the first captures on the KoG maps). Faster captures earn up to 4 times as much, slow ones still earn at least half. Only the time of the successful attempt counts. Deranged maps have no speed multiplier, every capture there counts as `1.0x speed`.
 - The distance is the goal's actual distance, which is shorter than the `/distance` setting when the finish line is closer.
 - ELO is logarithmic: it grows by about 760 every time your points double, so new players climb fast and harder maps keep raising it. A single capture barely counts on its own. Rough guide, at a typical speed:
 
@@ -128,6 +128,17 @@ The tool changes maps in place and skips maps that have a switch layer already. 
 | `sv_gtrain_hover_door` | 1 | Hold hovering tees with a laser door; 0 uses zero gravity, which high ping clients mispredict at the release |
 | `sv_gtrain_path_clear_radius` | 64 | Particle-free radius around the player in world units (32 per tile); 0 shows the whole path |
 | `sv_gtrain_path_particle_spacing` | 192 | Distance between path particles in world units |
-| `sv_gtrain_record_runs` | 0 | Store captures that earn ELO in the database, with the start state and inputs that replay them and the ELO and speed multiplier they earned |
+| `sv_gtrain_record_runs` | 0 | Store captures that earn ELO in the database, with the start state and inputs that replay them and the points, ELO and speed multiplier they earned |
 | `sv_gtrain_start_exclusion` | 50 | Path distance in tiles from the start line in which no spots or flags are placed; maps entirely within it keep all their spots. Applies on map change |
 | `sv_require_chat_flag_to_chat` | 0 | Set to 1 so new players must show the chat bubble before chatting during their first 20 seconds; commands are unaffected (from [ddnet-insta](https://github.com/ddnet-insta/ddnet-insta/commit/9b7c415b19510dc04157dfaa05596c077ca02ec6)) |
+
+### Banning runs
+
+Runs stored with `sv_gtrain_record_runs` can be shadow-banned, for example of a map that turned out too easy for its rating or of a cheating player. Banned runs stay in the `record_gtrain_runs` table with `Banned` set, so they can still be replayed, but the points and captures they earned are taken off the players' stats. Nobody is told.
+
+| Rcon command | Description |
+| --- | --- |
+| `ban_runs <map> [player]` | Ban the runs on the map, `*` for every map, only those of the player if given |
+| `unban_runs <map> [player]` | Lift the ban, giving the points and captures back |
+
+The console logs how many runs, points and players it changed. Players on the server see their new ELO right away, those on other servers once they rejoin. Runs stored before runs had their points (before November 2026) only lose their capture, their points stay. Remove a map from the votes before banning its runs, and ban players while they are offline, so no new run is stored while the ban is written.

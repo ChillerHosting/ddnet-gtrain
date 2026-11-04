@@ -28,11 +28,10 @@ TEST(GTrainElo, SpeedFactorFollowsTheTypicalSpeedOfTheDifficulty)
 	EXPECT_DOUBLE_EQ(SpeedFactor(EXTREME_STEP, 100, 100 / Extreme), 1);
 	EXPECT_DOUBLE_EQ(SpeedFactor(EXTREME_STEP, 150, 100 / Extreme), 1.5);
 	EXPECT_DOUBLE_EQ(SpeedFactor(EXTREME_STEP, 75, 100 / Extreme), std::max(0.75, MIN_SPEED_FACTOR));
-	// Deranged continues the line two steps past Extreme with three stars.
-	const double Deranged = Extreme - 2 * (Easy - Extreme) / EXTREME_STEP;
-	EXPECT_NEAR(Deranged, 5.14, 0.01);
-	EXPECT_DOUBLE_EQ(SpeedFactor(DERANGED_STEP, 100, 100 / Deranged), 1);
-	EXPECT_DOUBLE_EQ(SpeedFactor(DERANGED_STEP, 150, 100 / Deranged), 1.5);
+	// Deranged maps have no speed bonus.
+	EXPECT_DOUBLE_EQ(SpeedFactor(DERANGED_STEP, 100, 100 / Extreme), 1);
+	EXPECT_DOUBLE_EQ(SpeedFactor(DERANGED_STEP, 400, 1), 1);
+	EXPECT_DOUBLE_EQ(SpeedFactor(DERANGED_STEP, 100, 1000), 1);
 	// Fast captures earn up to a maximum, slow ones a minimum. Instant
 	// captures count as taking one tick, which always reaches the maximum.
 	EXPECT_DOUBLE_EQ(SpeedFactor(EXTREME_STEP, 350, 100 / Extreme), 3.5);
@@ -47,7 +46,8 @@ TEST(GTrainElo, CapturePoints)
 	EXPECT_EQ(CapturePoints(7, 100, 100 / ((EASY_TILES_PER_SECOND + EXTREME_TILES_PER_SECOND) / 2)), 170859); // 100 * 1.5^7 * 100, rounded
 	EXPECT_EQ(CapturePoints(EXTREME_STEP, 100, 100 / (4 * EXTREME_TILES_PER_SECOND)), std::llround(100 * PointsPerTile(EXTREME_STEP) * 4));
 	EXPECT_EQ(CapturePoints(EXTREME_STEP, 100, 1000), std::llround(100 * PointsPerTile(EXTREME_STEP) * MIN_SPEED_FACTOR));
-	EXPECT_EQ(CapturePoints(DERANGED_STEP, 100, 1000), std::llround(100 * 2.25 * PointsPerTile(EXTREME_STEP) * MIN_SPEED_FACTOR));
+	EXPECT_EQ(CapturePoints(DERANGED_STEP, 100, 1000), std::llround(100 * 2.25 * PointsPerTile(EXTREME_STEP)));
+	EXPECT_EQ(CapturePoints(DERANGED_STEP, 100, 1), CapturePoints(DERANGED_STEP, 100, 1000));
 }
 
 TEST(GTrainElo, LongerGoalsEarnMoreThanTheirLength)

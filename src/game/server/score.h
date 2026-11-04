@@ -67,9 +67,13 @@ public:
 	void LoadMapDifficulty(const std::shared_ptr<CScoreMapDifficultyResult> &pResult);
 	void LoadGTrainStats(const char *pName, const std::shared_ptr<CScoreGTrainStatsResult> &pResult);
 	void AddGTrainStats(const char *pName, const CGTrainStats &Stats);
-	// Distance is the path distance of the run's goal, Elo and SpeedFactor
-	// what the capture earned.
-	void SaveGTrainRun(const char *pName, int Distance, float Elo, float SpeedFactor, CGTrainRun &&Run);
+	// Distance is the path distance of the run's goal, Points, Elo and
+	// SpeedFactor what the capture earned.
+	void SaveGTrainRun(const char *pName, int Distance, int64_t Points, float Elo, float SpeedFactor, CGTrainRun &&Run);
+	// Shadow-bans the stored runs on a map, of a player or both (empty for
+	// all), or lifts the ban, and takes their points and captures off the
+	// stats or gives them back.
+	void BanGTrainRuns(const char *pMap, const char *pName, bool Ban);
 	void ShowGTrainTop(int ClientId, EGTrainStat Stat, int Offset = 1);
 	void ShowElo(int ClientId, const char *pName);
 	void ShowGTrainProfile(int ClientId, const char *pName);

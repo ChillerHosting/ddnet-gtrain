@@ -137,7 +137,10 @@ void IDbConnection::FormatCreateGTrainRuns(char *aBuf, unsigned int BufferSize, 
 	// map's hash and the server's git revision tell the map and physics it
 	// was made with. A run starts at a tick of its game, the server's map
 	// load, and lasts Ticks. Elo is what the capture added to the player's
-	// ELO, SpeedFactor the multiplier its speed gave the points.
+	// ELO, SpeedFactor the multiplier its speed gave the points and Points
+	// the points it added, NULL on runs stored before they were. Banned runs
+	// are shadow-banned (ban_runs): they stay stored, but what they earned is
+	// taken off the player's stats.
 	str_format(aBuf, BufferSize,
 		"CREATE TABLE IF NOT EXISTS %s_gtrain_runs ("
 		"  Map VARCHAR(128) COLLATE %s NOT NULL, "
@@ -152,6 +155,8 @@ void IDbConnection::FormatCreateGTrainRuns(char *aBuf, unsigned int BufferSize, 
 		"  Elo FLOAT NOT NULL, "
 		"  SpeedFactor FLOAT NOT NULL, "
 		"  Run %s NOT NULL, "
+		"  Points BIGINT DEFAULT NULL, "
+		"  Banned BOOL NOT NULL DEFAULT FALSE, "
 		"  PRIMARY KEY (Map, GameId, StartTick, Name)"
 		")",
 		GetPrefix(), BinaryCollate(), MAX_NAME_LENGTH_SQL, BinaryCollate(), pBlobType);

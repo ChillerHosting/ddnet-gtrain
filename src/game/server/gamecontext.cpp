@@ -3348,6 +3348,28 @@ void CGameContext::ConRandomMap(IConsole::IResult *pResult, void *pUserData)
 	pSelf->m_pScore->RandomMap(ClientId, MinStars, MaxStars);
 }
 
+void CGameContext::BanGTrainRuns(IConsole::IResult *pResult, bool Ban) const
+{
+	auto *pController = dynamic_cast<CGameControllerGTrain *>(m_pController);
+	if(!pController)
+	{
+		log_info("gtrain", "runs are only stored in GTrain");
+		return;
+	}
+	const char *pMap = pResult->GetString(0);
+	pController->BanRuns(str_comp(pMap, "*") == 0 ? "" : pMap, pResult->NumArguments() > 1 ? pResult->GetString(1) : "", Ban);
+}
+
+void CGameContext::ConBanRuns(IConsole::IResult *pResult, void *pUserData)
+{
+	((CGameContext *)pUserData)->BanGTrainRuns(pResult, true);
+}
+
+void CGameContext::ConUnbanRuns(IConsole::IResult *pResult, void *pUserData)
+{
+	((CGameContext *)pUserData)->BanGTrainRuns(pResult, false);
+}
+
 void CGameContext::ConRandomUnfinishedMap(IConsole::IResult *pResult, void *pUserData)
 {
 	CGameContext *pSelf = (CGameContext *)pUserData;
@@ -3947,6 +3969,8 @@ void CGameContext::OnConsoleInit()
 	Console()->Register("change_map", "r[map]", CFGFLAG_SERVER | CFGFLAG_STORE, ConChangeMap, this, "Change map");
 	Console()->Register("random_map", "?i[stars] ?i[max stars]", CFGFLAG_SERVER | CFGFLAG_STORE, ConRandomMap, this, "Random map");
 	Console()->Register("random_unfinished_map", "?i[stars] ?i[max stars]", CFGFLAG_SERVER | CFGFLAG_STORE, ConRandomUnfinishedMap, this, "Random unfinished map");
+	Console()->Register("ban_runs", "s[map] ?r[player name]", CFGFLAG_SERVER, ConBanRuns, this, "Shadow-ban the stored GTrain runs on map s (* for every map), only those of player r if given: they stay stored, their points and captures are taken off the stats");
+	Console()->Register("unban_runs", "s[map] ?r[player name]", CFGFLAG_SERVER, ConUnbanRuns, this, "Lift ban_runs for the runs on map s (* for every map), only those of player r if given, giving their points and captures back");
 	Console()->Register("restart", "?i[seconds]", CFGFLAG_SERVER | CFGFLAG_STORE, ConRestart, this, "Restart in x seconds (0 = abort)");
 	Console()->Register("server_alert", "r[message]", CFGFLAG_SERVER, ConServerAlert, this, "Send a server alert message to all players");
 	Console()->Register("mod_alert", "v[id] r[message]", CFGFLAG_SERVER, ConModAlert, this, "Send a moderator alert message to player");

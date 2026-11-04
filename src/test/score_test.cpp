@@ -889,6 +889,7 @@ struct GTrainRuns : public Score // NOLINT(readability-identifier-naming)
 		str_copy(m_Data.m_aGameUuid, "a1b2c3d4-0000-4000-8000-000000000001");
 		str_copy(m_Data.m_aRevision, "144f35598d6b4ba9");
 		m_Data.m_Distance = 120;
+		m_Data.m_Points = 3'000'000'000;
 		m_Data.m_Elo = 12.25f;
 		m_Data.m_SpeedFactor = 1.5f;
 		m_Data.m_Run.m_Start.m_Tick = 5000;
@@ -910,7 +911,7 @@ TEST_P(GTrainRuns, StoredWithMapAndPlayer)
 	// A second capture in the same second with the same length is a run too.
 	m_Data.m_Run.m_Start.m_Tick += SERVER_TICK_SPEED / 2;
 	Save();
-	ASSERT_TRUE(m_pConn->PrepareStatement("SELECT Map, MapSha256, Name, GameId, Revision, StartTick, Ticks, Distance, Elo, SpeedFactor, Run FROM record_gtrain_runs ORDER BY StartTick", m_aError, sizeof(m_aError))) << m_aError;
+	ASSERT_TRUE(m_pConn->PrepareStatement("SELECT Map, MapSha256, Name, GameId, Revision, StartTick, Ticks, Distance, Elo, SpeedFactor, Run, Points, Banned FROM record_gtrain_runs ORDER BY StartTick", m_aError, sizeof(m_aError))) << m_aError;
 	bool End;
 	ASSERT_TRUE(m_pConn->Step(&End, m_aError, sizeof(m_aError))) << m_aError;
 	ASSERT_FALSE(End);
@@ -937,11 +938,134 @@ TEST_P(GTrainRuns, StoredWithMapAndPlayer)
 	EXPECT_EQ(Run.m_Start.m_Tick, 5000);
 	EXPECT_EQ(Run.m_vInputs.size(), 3u);
 	EXPECT_EQ(Run.m_vInputs[1].m_Direction, 1);
+	EXPECT_EQ(m_pConn->GetInt64(12), 3'000'000'000);
+	EXPECT_EQ(m_pConn->GetInt(13), 0);
 	ASSERT_TRUE(m_pConn->Step(&End, m_aError, sizeof(m_aError))) << m_aError;
 	ASSERT_FALSE(End);
 	EXPECT_EQ(m_pConn->GetInt(6), 5000 + SERVER_TICK_SPEED / 2);
 	ASSERT_TRUE(m_pConn->Step(&End, m_aError, sizeof(m_aError))) << m_aError;
 	EXPECT_TRUE(End);
+}
+
+struct GTrainBans : public GTrainRuns // NOLINT(readability-identifier-naming)
+{
+	void AddRun(const char *pMap, const char *pName, int64_t Points)
+	{
+		str_copy(m_Data.m_aMap, pMap);
+		str_copy(m_Data.m_aName, pName);
+		m_Data.m_Points = Points;
+		m_Data.m_Run.m_Start.m_Tick += SERVER_TICK_SPEED;
+		Save();
+	}
+
+	void AddStats(const char *pName, int64_t Points, int Captures)
+	{
+		CSqlGTrainStatsData Data;
+		str_copy(Data.m_aName, pName);
+		Data.m_Stats.m_Points = Points;
+		Data.m_Stats.m_Captures = Captures;
+		Data.m_Stats.m_Attempts = Captures;
+		ASSERT_TRUE(CScoreWorker::AddGTrainStats(m_pConn, &Data, Write::NORMAL, m_aError, sizeof(m_aError))) << m_aError;
+	}
+
+	void Ban(const char *pMap, const char *pName, bool Ban = true, Write w = Write::NORMAL)
+	{
+		CSqlGTrainBanRunsData Data;
+		str_copy(Data.m_aMap, pMap);
+		str_copy(Data.m_aName, pName);
+		Data.m_Ban = Ban;
+		ASSERT_TRUE(CScoreWorker::BanGTrainRuns(m_pConn, &Data, w, m_aError, sizeof(m_aError))) << m_aError;
+	}
+
+	CGTrainStats Stats(const char *pName)
+	{
+		auto pResult = std::make_shared<CScoreGTrainStatsResult>();
+		CSqlGTrainStatsData Request(pResult);
+		str_copy(Request.m_aName, pName);
+		EXPECT_TRUE(CScoreWorker::LoadGTrainStats(m_pConn, &Request, m_aError, sizeof(m_aError))) << m_aError;
+		return pResult->m_Stats;
+	}
+
+	int NumBanned(const char *pMap)
+	{
+		char aBuf[128];
+		str_format(aBuf, sizeof(aBuf), "SELECT COUNT(*) FROM record_gtrain_runs WHERE Banned AND Map = '%s'", pMap);
+		EXPECT_TRUE(m_pConn->PrepareStatement(aBuf, m_aError, sizeof(m_aError))) << m_aError;
+		bool End;
+		EXPECT_TRUE(m_pConn->Step(&End, m_aError, sizeof(m_aError))) << m_aError;
+		return End ? -1 : m_pConn->GetInt(1);
+	}
+
+	GTrainBans()
+	{
+		AddStats("nameless tee", 10000, 5);
+		AddStats("brainless tee", 5000, 3);
+		AddRun("Kobra 3", "nameless tee", 1000);
+		AddRun("Kobra 3", "nameless tee", 2000);
+		AddRun("Kobra 4", "nameless tee", 400);
+		AddRun("Kobra 3", "brainless tee", 300);
+	}
+};
+
+TEST_P(GTrainBans, TakeWhatTheRunsEarnedOffTheStats)
+{
+	Ban("Kobra 3", "");
+	EXPECT_EQ(Stats("nameless tee").m_Points, 7000);
+	EXPECT_EQ(Stats("nameless tee").m_Captures, 3);
+	EXPECT_EQ(Stats("nameless tee").m_Attempts, 5);
+	EXPECT_EQ(Stats("brainless tee").m_Points, 4700);
+	EXPECT_EQ(Stats("brainless tee").m_Captures, 2);
+	EXPECT_EQ(NumBanned("Kobra 3"), 3);
+	EXPECT_EQ(NumBanned("Kobra 4"), 0);
+
+	// Banned runs count only once.
+	Ban("Kobra 3", "");
+	EXPECT_EQ(Stats("nameless tee").m_Points, 7000);
+	EXPECT_EQ(Stats("brainless tee").m_Points, 4700);
+}
+
+TEST_P(GTrainBans, OfOnePlayerOrEveryMap)
+{
+	Ban("", "nameless tee");
+	EXPECT_EQ(Stats("nameless tee").m_Points, 6600);
+	EXPECT_EQ(Stats("nameless tee").m_Captures, 2);
+	EXPECT_EQ(Stats("brainless tee").m_Points, 5000);
+	EXPECT_EQ(NumBanned("Kobra 3"), 2);
+	EXPECT_EQ(NumBanned("Kobra 4"), 1);
+}
+
+TEST_P(GTrainBans, LiftedGiveThePointsBack)
+{
+	Ban("Kobra 3", "");
+	Ban("Kobra 3", "brainless tee", false);
+	EXPECT_EQ(Stats("brainless tee").m_Points, 5000);
+	EXPECT_EQ(Stats("brainless tee").m_Captures, 3);
+	EXPECT_EQ(Stats("nameless tee").m_Points, 7000);
+	EXPECT_EQ(NumBanned("Kobra 3"), 2);
+	// Unbanned runs are given back only once.
+	Ban("Kobra 3", "brainless tee", false);
+	EXPECT_EQ(Stats("brainless tee").m_Points, 5000);
+}
+
+TEST_P(GTrainBans, RunsWithoutPointsKeepTheirs)
+{
+	ASSERT_TRUE(m_pConn->PrepareStatement("UPDATE record_gtrain_runs SET Points = NULL WHERE Points = 2000", m_aError, sizeof(m_aError))) << m_aError;
+	int NumUpdated;
+	ASSERT_TRUE(m_pConn->ExecuteUpdate(&NumUpdated, m_aError, sizeof(m_aError))) << m_aError;
+	ASSERT_EQ(NumUpdated, 1);
+	Ban("Kobra 3", "nameless tee");
+	EXPECT_EQ(Stats("nameless tee").m_Points, 9000);
+	EXPECT_EQ(Stats("nameless tee").m_Captures, 3);
+	EXPECT_EQ(NumBanned("Kobra 3"), 2);
+}
+
+TEST_P(GTrainBans, OnlyInTheMainDatabase)
+{
+	Ban("Kobra 3", "", true, Write::BACKUP_FIRST);
+	Ban("Kobra 3", "", true, Write::NORMAL_SUCCEEDED);
+	Ban("Kobra 3", "", true, Write::NORMAL_FAILED);
+	EXPECT_EQ(Stats("nameless tee").m_Points, 10000);
+	EXPECT_EQ(NumBanned("Kobra 3"), 0);
 }
 
 TEST_P(GTrainRuns, OnlyTheMainDatabaseKeepsThem)
@@ -1069,4 +1193,5 @@ INSTANTIATE(MapVote);
 INSTANTIATE(Points);
 INSTANTIATE(Elo);
 INSTANTIATE(GTrainRuns);
+INSTANTIATE(GTrainBans);
 INSTANTIATE(RandomMap);

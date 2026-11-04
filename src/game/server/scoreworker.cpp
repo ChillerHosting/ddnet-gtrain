@@ -1834,8 +1834,8 @@ bool CScoreWorker::SaveGTrainRun(IDbConnection *pSqlServer, const ISqlData *pGam
 	std::vector<unsigned char> vRun = pData->m_Run.Encode();
 	char aBuf[512];
 	str_format(aBuf, sizeof(aBuf),
-		"%s INTO %s_gtrain_runs(Map, MapSha256, Name, Timestamp, GameId, Revision, StartTick, Ticks, Distance, Elo, SpeedFactor, Run) "
-		"VALUES (?, ?, ?, %s, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"%s INTO %s_gtrain_runs(Map, MapSha256, Name, Timestamp, GameId, Revision, StartTick, Ticks, Distance, Elo, SpeedFactor, Run, Points) "
+		"VALUES (?, ?, ?, %s, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		pSqlServer->InsertIgnore(), pSqlServer->GetPrefix(), pSqlServer->InsertTimestampAsUtc());
 	if(!pSqlServer->PrepareStatement(aBuf, pError, ErrorSize))
 	{
@@ -1853,8 +1853,110 @@ bool CScoreWorker::SaveGTrainRun(IDbConnection *pSqlServer, const ISqlData *pGam
 	pSqlServer->BindFloat(10, pData->m_Elo);
 	pSqlServer->BindFloat(11, pData->m_SpeedFactor);
 	pSqlServer->BindBlob(12, vRun.data(), vRun.size());
+	pSqlServer->BindInt64(13, pData->m_Points);
 	int NumInserted;
 	return pSqlServer->ExecuteUpdate(&NumInserted, pError, ErrorSize);
+}
+
+bool CScoreWorker::BanGTrainRuns(IDbConnection *pSqlServer, const ISqlData *pGameData, Write w, char *pError, int ErrorSize)
+{
+	const auto *pData = dynamic_cast<const CSqlGTrainBanRunsData *>(pGameData);
+
+	// Runs and stats are only in the main database.
+	if(w != Write::NORMAL)
+	{
+		return true;
+	}
+
+	// The runs to change, the same in every statement. There are no
+	// transactions, so a run of the player stored by another server between
+	// the statements would be marked without its points changing. Banning
+	// maps after removing them, or players while they are offline, avoids
+	// that.
+	char aFilter[256];
+	str_format(aFilter, sizeof(aFilter), "r.Banned = %s%s%s",
+		pData->m_Ban ? pSqlServer->False() : pSqlServer->True(),
+		pData->m_aMap[0] ? " AND r.Map = ?" : "",
+		pData->m_aName[0] ? " AND r.Name = ?" : "");
+	// Binds the filter's values from Index on, returns the next index.
+	auto BindFilter = [&](int Index) {
+		if(pData->m_aMap[0])
+			pSqlServer->BindString(Index++, pData->m_aMap);
+		if(pData->m_aName[0])
+			pSqlServer->BindString(Index++, pData->m_aName);
+		return Index;
+	};
+	const char *pPrefix = pSqlServer->GetPrefix();
+	const char *pWhat = pData->m_aMap[0] ? pData->m_aMap : "every map";
+	const char *pWho = pData->m_aName[0] ? pData->m_aName : "every player";
+
+	char aBuf[1024];
+	str_format(aBuf, sizeof(aBuf),
+		"SELECT COUNT(*), COUNT(DISTINCT r.Name), COALESCE(SUM(r.Points), 0), "
+		"  COALESCE(SUM(CASE WHEN r.Points IS NULL THEN 1 ELSE 0 END), 0) "
+		"FROM %s_gtrain_runs r WHERE %s",
+		pPrefix, aFilter);
+	if(!pSqlServer->PrepareStatement(aBuf, pError, ErrorSize))
+	{
+		return false;
+	}
+	BindFilter(1);
+	bool End;
+	if(!pSqlServer->Step(&End, pError, ErrorSize))
+	{
+		return false;
+	}
+	const int NumRuns = End ? 0 : pSqlServer->GetInt(1);
+	const int NumPlayers = End ? 0 : pSqlServer->GetInt(2);
+	const int64_t Points = End ? 0 : pSqlServer->GetInt64(3);
+	const int NumWithoutPoints = End ? 0 : pSqlServer->GetInt(4);
+	if(NumRuns == 0)
+	{
+		log_info("gtrain", "no %s runs of %s on %s", pData->m_Ban ? "unbanned" : "banned", pWho, pWhat);
+		return true;
+	}
+
+	// Banning takes what the runs earned off the stats, lifting the ban adds
+	// it again. Runs stored before their points were keep theirs.
+	str_format(aBuf, sizeof(aBuf),
+		"UPDATE %s_gtrain_stats SET "
+		"  Points = Points %c (SELECT COALESCE(SUM(r.Points), 0) FROM %s_gtrain_runs r WHERE r.Name = %s_gtrain_stats.Name AND %s), "
+		"  Captures = Captures %c (SELECT COUNT(*) FROM %s_gtrain_runs r WHERE r.Name = %s_gtrain_stats.Name AND %s) "
+		"WHERE Name IN (SELECT r.Name FROM %s_gtrain_runs r WHERE %s)",
+		pPrefix,
+		pData->m_Ban ? '-' : '+', pPrefix, pPrefix, aFilter,
+		pData->m_Ban ? '-' : '+', pPrefix, pPrefix, aFilter,
+		pPrefix, aFilter);
+	if(!pSqlServer->PrepareStatement(aBuf, pError, ErrorSize))
+	{
+		return false;
+	}
+	BindFilter(BindFilter(BindFilter(1)));
+	int NumUpdated;
+	if(!pSqlServer->ExecuteUpdate(&NumUpdated, pError, ErrorSize))
+	{
+		return false;
+	}
+
+	str_format(aBuf, sizeof(aBuf),
+		"UPDATE %s_gtrain_runs AS r SET Banned = %s WHERE %s",
+		pPrefix, pData->m_Ban ? pSqlServer->True() : pSqlServer->False(), aFilter);
+	if(!pSqlServer->PrepareStatement(aBuf, pError, ErrorSize))
+	{
+		return false;
+	}
+	BindFilter(1);
+	if(!pSqlServer->ExecuteUpdate(&NumUpdated, pError, ErrorSize))
+	{
+		return false;
+	}
+
+	log_info("gtrain", "%s %d runs of %s on %s: %s %" PRId64 " points and %d captures of %d players",
+		pData->m_Ban ? "banned" : "unbanned", NumRuns, pWho, pWhat,
+		pData->m_Ban ? "took off" : "gave back", Points, NumRuns, NumPlayers);
+	if(NumWithoutPoints > 0)
+		log_warn("gtrain", "%d of the runs have no stored points, their points stay as they are", NumWithoutPoints);
+	return true;
 }
 
 bool CScoreWorker::AddGTrainStats(IDbConnection *pSqlServer, const ISqlData *pGameData, Write w, char *pError, int ErrorSize)

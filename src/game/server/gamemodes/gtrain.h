@@ -32,6 +32,8 @@ class CGameControllerGTrain : public CGameControllerDDNet
 		NUM_DIRECTION_PARTICLES = 256,
 		MAX_PATH_NODES = 256,
 		MIN_GOAL_DISTANCE = 50,
+		// Short goals on Deranged maps were farmed, their goals are longer.
+		DERANGED_MIN_GOAL_DISTANCE = 100,
 		MAX_GOAL_DISTANCE = 1000,
 		DEFAULT_SCORE_LIMIT = 10,
 		MAX_SCORE_LIMIT = 1000,
@@ -135,6 +137,11 @@ class CGameControllerGTrain : public CGameControllerDDNet
 	void RestartFight(int Group, std::optional<int> ChosenStart = std::nullopt);
 	bool LeaveFight(int ClientId, bool NewAttempt);
 	int FightSize(int Group) const;
+	bool IsDeranged() const { return m_EloStep == GTrainElo::DERANGED_STEP; }
+	// The shortest /distance, more on Deranged maps.
+	int MinGoalDistance() const;
+	// The group's /distance or the server default, at least
+	// DERANGED_MIN_GOAL_DISTANCE on Deranged maps.
 	int GoalDistance(int Group) const;
 	int HoverTicks(int Group) const;
 	bool CheckFightLeader(int ClientId, const char *pAction);
@@ -147,6 +154,7 @@ class CGameControllerGTrain : public CGameControllerDDNet
 		double m_SpeedFactor;
 		// why the capture earns nothing, like being frozen
 		const char *m_pNoElo = nullptr;
+		int64_t m_Points = 0;
 	};
 	static void FormatCaptureResult(char *pBuf, int BufSize, int Fails, const std::optional<CEloGain> &Gain);
 	// Returns whether the capture won the fight.
@@ -178,6 +186,9 @@ public:
 	// Before the database shows stats, so they include the latest changes.
 	void SaveAllStats();
 	const CGTrainStats &Stats(int ClientId) const { return m_aStats[ClientId]; }
+	// Shadow-bans the stored runs on a map, of a player or both (empty for
+	// all) or lifts the ban, see CScore::BanGTrainRuns.
+	void BanRuns(const char *pMap, const char *pName, bool Ban);
 
 	void OnCharacterSpawn(class CCharacter *pChr) override;
 	int OnCharacterDeath(class CCharacter *pVictim, class CPlayer *pKiller, int Weapon) override;
