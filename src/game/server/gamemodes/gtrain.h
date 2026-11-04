@@ -40,6 +40,7 @@ class CGameControllerGTrain : public CGameControllerDDNet
 		// Shorter attempts are no attempts, unless they capture the flag.
 		MIN_ATTEMPT_SECONDS = 2,
 		STATS_SAVE_SECONDS = 60,
+		TEAM_REQUEST_SECONDS = 60,
 	};
 
 	// centers of all non-freeze tiles between the start and the finish line,
@@ -91,7 +92,14 @@ class CGameControllerGTrain : public CGameControllerDDNet
 		int m_Weapons = 0; // bit per weapon kept for good
 	};
 	CAttempt m_aAttempts[MAX_CLIENTS];
+	// Players sharing an attempt form a group, named after its leader: a
+	// fight, or a team with /team. Teams play together in one DDRace team,
+	// fights race each other solo. Nobody is in both.
 	int m_aFightGroup[MAX_CLIENTS];
+	bool m_aTeamGroup[MAX_CLIENTS] = {};
+	// The player each player asked to team up with, and when.
+	int m_aTeamRequest[MAX_CLIENTS];
+	int m_aTeamRequestTick[MAX_CLIENTS] = {};
 	int m_aFightTeam[MAX_CLIENTS] = {};
 	int m_aScoreboardTeams[MAX_CLIENTS] = {};
 	bool m_aFightRestart[MAX_CLIENTS] = {};
@@ -134,9 +142,14 @@ class CGameControllerGTrain : public CGameControllerDDNet
 	// Deletes the player's character if it played already, see the definition.
 	void PlaceForAttempt(class CPlayer *pPlayer, const std::shared_ptr<CGTrainGoal> &pGoal, int Start, int TargetDistance, bool Retry);
 	// Places the whole group at the chosen start, a random spot without one.
+	void HoldHoverDoor(class CCharacter *pChr, int Hover);
 	void RestartFight(int Group, std::optional<int> ChosenStart = std::nullopt);
+	void PlaceGroup(int Group, const std::shared_ptr<CGTrainGoal> &pGoal, int Start, int TargetDistance, bool Retry);
 	bool LeaveFight(int ClientId, bool NewAttempt);
 	int FightSize(int Group) const;
+	bool InTeam(int ClientId) const { return m_aTeamGroup[m_aFightGroup[ClientId]]; }
+	const char *GroupName(int Group) const { return m_aTeamGroup[Group] ? "team" : "fight"; }
+	void UpdateDDRaceTeam(class CCharacter *pChr);
 	bool IsDeranged() const { return m_EloStep == GTrainElo::DERANGED_STEP; }
 	// The shortest /distance, more on Deranged maps.
 	int MinGoalDistance() const;
@@ -200,6 +213,8 @@ public:
 	void Snap(int SnappingClient) override;
 	std::optional<int> RaceTimerStartTick(class CCharacter *pChr) override;
 	void Fight(int ClientId, const char *pName);
+	void TeamUp(int ClientId, const char *pName);
+	void AcceptTeam(int ClientId);
 	void Freeplay(int ClientId);
 	void Retry(int ClientId);
 	// Retries like the other practice binds, freeplay starts where the player

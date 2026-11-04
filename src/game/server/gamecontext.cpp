@@ -4134,6 +4134,8 @@ void CGameContext::RegisterChatCommands()
 	Console()->Register("invite", "r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConInvite, this, "Invite a person to a locked team");
 	Console()->Register("join", "r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConJoin, this, "Join the team of the specified player");
 	Console()->Register("fight", "?r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConFight, this, "Join a GTrain fight with a player (no name to leave)");
+	Console()->Register("accept", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConAcceptTeam, this, "Join the team of the last player who asked you with /team in GTrain");
+	Console()->Register("a", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConAcceptTeam, this, "Join the team of the last player who asked you with /team in GTrain");
 	Console()->Register("freeplay", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConFreeplay, this, "Toggle training without flags or paths (fight leader only in a group)");
 	Console()->Register("retry", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRetry, this, "Retry the current training position and goal");
 	Console()->Register("r", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRetry, this, "Retry the current training position and goal");
@@ -4302,19 +4304,27 @@ void CGameContext::OnInit(const void *pPersistentData)
 	const bool IsGTrain = !str_comp(Config()->m_SvGametype, "gtrain");
 	if(IsGTrain)
 		g_Config.m_SvSoloServer = 1;
+	// The GTrain controller replaces /team with its own, this brings DDNet's
+	// back after it.
+	Console()->Register("team", "?i[id]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTeam, this, "Lets you join team i (shows your team if left blank)");
 
 	if(g_Config.m_SvSoloServer)
 	{
 		g_Config.m_SvTeam = SV_TEAM_FORCED_SOLO;
 		g_Config.m_SvShowOthersDefault = SHOW_OTHERS_ON;
 
-		GlobalTuning()->Set("player_collision", 0);
-		GlobalTuning()->Set("player_hooking", 0);
-
-		for(int i = 0; i < TuneZone::NUM; i++)
+		// GTrain keeps the map's player collision and hooking for its teams.
+		// Everyone else plays solo, which clients predict from the solo flag.
+		if(!IsGTrain)
 		{
-			TuningList()[i].Set("player_collision", 0);
-			TuningList()[i].Set("player_hooking", 0);
+			GlobalTuning()->Set("player_collision", 0);
+			GlobalTuning()->Set("player_hooking", 0);
+
+			for(int i = 0; i < TuneZone::NUM; i++)
+			{
+				TuningList()[i].Set("player_collision", 0);
+				TuningList()[i].Set("player_hooking", 0);
+			}
 		}
 	}
 

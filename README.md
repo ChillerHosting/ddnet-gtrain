@@ -19,6 +19,8 @@ A server-side [DDNet](https://github.com/ddnet/ddnet) mod for training Gores map
 | Kill | New random spot and flag |
 | `/r`, `/retry` | Retry the current spot and flag; practice binds like `/tc`, `/telecursor`, `/invincible`, `/rescue`, `/back`, `/tp`, `/teleport` and `/lasttp` do the same, except `/tc` and `/telecursor` in freeplay |
 | `/fight <player>` | Join a player's fight; `/fight` alone leaves it |
+| `/team <player>` | Ask a player to play together in a [team](#teams); `/team` alone leaves it |
+| `/accept`, `/a` | Join the team of the last player who asked you, within a minute |
 | `/distance <50-1000>` | Your goal distance in tiles, at least 100 on Deranged maps; `0` uses the server default |
 | `/nodj` | Toggle starting attempts without double jump; touching the ground gives it back |
 | `/forwards` | Toggle goals that only lead towards the finish line, see [below](#forwards) |
@@ -33,7 +35,7 @@ A server-side [DDNet](https://github.com/ddnet/ddnet) mod for training Gores map
 | `/top5captures`, `/top5attempts`, `/top5respawns`, `/top5playtime [rank]` | Show five players of these ladders |
 | `/help` | List these commands, plus `/map`, `/mapinfo` and `/cmdlist` |
 
-`/distance` and `/scorelimit` show the current value without an argument. In a fight, only the leader can change these settings, and they apply to the whole group. Leaving a fight keeps its settings, and joining one adopts its settings, including removing weapons it has disabled.
+`/distance` and `/scorelimit` show the current value without an argument. In a fight or a team, only the leader can change these settings, and they apply to the whole group. Leaving a fight keeps its settings, and joining one adopts its settings, including removing weapons it has disabled.
 
 ### Forwards
 
@@ -73,7 +75,7 @@ Every capture earns points, and your ELO shows them on a scale from 0 to 9999. B
 - The capture message shows the ELO you gained and your speed factor, e.g. `(2 fails, +0.42 ELO, 1.3x speed)`.
 - Reaching the flag frozen still captures it and scores in fights, but earns no ELO: `(0 fails, +0 ELO (frozen))`.
 - Neither do attempts with kept weapons, also when the weapons were on for only part of the attempt: `(0 fails, +0 ELO (kept weapons))`. Weapons turned off again before the release don't count.
-- In a fight, only the player capturing the flag earns ELO. Freeplay never does, and neither does a server where rcon cheats were used.
+- In a fight, only the player capturing the flag earns ELO. Teams, freeplay and servers where rcon cheats were used never do.
 - Outside fights, the scoreboard and the server browser show each player's ELO as their score.
 
 ## Stats
@@ -98,6 +100,17 @@ Freeplay has no attempts, and rcon cheats stop everything but the playtime from 
 - Leaving a fight resets your score. A fight with one player left ends and that score resets too.
 - Paused and `/spec` players can fight; players in the spectator team cannot.
 
+## Teams
+
+Teams play together instead of solo: teammates collide, hook and hit each other, and share the map's switches, like a DDRace team.
+
+- `/team <player>` asks a player to team up, `/accept` or `/a` joins within a minute. Members can ask more players, who join the same team. The one who asked first leads it, shown as `*name*`, and chooses the [settings](#commands) everyone plays with.
+- The team trains at one spot with one flag. When any member reaches the flag, it counts for the whole team and everyone starts at a new spot together: `'name' captured the flag for their team in 3.20 seconds (0 fails, +0 ELO (team))`.
+- Any member's death, kill or `/r` acts for the whole team: a new spot after deaths, the same one after `/r`.
+- Teams earn no [ELO](#elo) for now. Captures, attempts and playtime still count in the [stats](#stats).
+- `/team` alone leaves it, and the others start over at a new spot. A team with one player left ends, so does a member's leaving for the spectators.
+- Teams and [fights](#fights) don't mix: fights race solo, so a team can't fight and a fight can't team up.
+
 ## Pathfinding
 
 The walkable tile graph is built once when the map loads. Paths never go through solid, freeze or death tiles, never pass stoppers against their direction, and diagonal steps can't cut corners. The one way through freeze is falling straight down it onto unfreeze, with nothing but freeze and empty tiles in between: no hookable or unhookable tiles, stoppers, teleporters, speedups or deep freeze. Frozen tees can't steer, so these paths only go down, every tile fallen counts, and they can't be entered or left sideways. Teleporters count as path steps; checkpoint teleporters are skipped because they depend on each player's history. Every new flag stores its distance to all nearby tiles, so redrawing the path when you leave it costs no search. If you stray more than the goal distance plus 32 tiles behind your start, the path is hidden until you come back.
@@ -110,7 +123,7 @@ Build the server as described in the [DDNet building guide](docs/BUILDING.md) an
 ./DDNet-Server "sv_map <map>"
 ```
 
-`sv_gametype` defaults to `gtrain`. The mod forces `sv_solo_server 1` and `sv_kill_delay 0`. Chat commands for races, teams and practice, like `/team`, `/practice` or `/save`, are removed from the chat and its command completion; rcon keeps them.
+`sv_gametype` defaults to `gtrain`. The mod forces `sv_solo_server 1` and `sv_kill_delay 0`, but keeps the map's `player_collision` and `player_hooking` tunings for its teams: solo players never touch, and DDNet clients predict that from their solo flag. Chat commands for races, DDRace teams and practice, like `/practice`, `/save` or `/lock`, are removed from the chat and its command completion; rcon keeps them. `/team` is GTrain's own.
 
 ### Map downloads
 

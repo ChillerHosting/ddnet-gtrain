@@ -1138,6 +1138,20 @@ void CGameContext::AttemptJoinTeam(int ClientId, int Team)
 	}
 }
 
+void CGameContext::ConAcceptTeam(IConsole::IResult *pResult, void *pUserData)
+{
+	CGameContext *pSelf = (CGameContext *)pUserData;
+	if(!CheckClientId(pResult->m_ClientId) || !pSelf->m_apPlayers[pResult->m_ClientId])
+		return;
+	auto *pController = dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController);
+	if(!pController)
+	{
+		pSelf->SendChatTarget(pResult->m_ClientId, "Team requests are only available in GTrain.");
+		return;
+	}
+	pController->AcceptTeam(pResult->m_ClientId);
+}
+
 void CGameContext::ConFight(IConsole::IResult *pResult, void *pUserData)
 {
 	CGameContext *pSelf = (CGameContext *)pUserData;
@@ -1386,11 +1400,9 @@ void CGameContext::ConTeam(IConsole::IResult *pResult, void *pUserData)
 	CPlayer *pPlayer = pSelf->m_apPlayers[pResult->m_ClientId];
 	if(!pPlayer)
 		return;
+	// GTrain registers its own /team, which takes player names.
 	if(dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController))
-	{
-		pSelf->SendChatTarget(pResult->m_ClientId, "/team is disabled in GTrain. Use /fight to join a fight group.");
 		return;
-	}
 
 	if(pResult->NumArguments() > 0)
 	{

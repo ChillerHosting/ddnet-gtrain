@@ -964,12 +964,16 @@ TEST_F(GameWorld, GTrainTeamAndPracticeCommandsPreserveFight)
 	{
 		const int PhysicalTeam = GameServer()->GetDDRaceTeam(ClientId);
 		m_pServer->m_avChatMessages[ClientId].clear();
-		// Chat replies to unknown commands, which these are in GTrain.
-		for(const char *pCommand : {"/team", "/team 0", "/team 1", "/practice", "/practice 1", "/practice 0"})
-			Say(ClientId, pCommand);
+		// /team asks players by name, fights can't. Practice is an unknown
+		// command in GTrain, chat replies to it.
+		const std::string Other = m_pServer->ClientName(ClientId == Anna ? Bob : Anna);
+		for(const std::string &Command : {std::string("/team"), std::string("/team 1"), "/team " + Other, std::string("/practice"), std::string("/practice 1"), std::string("/practice 0")})
+			Say(ClientId, Command.c_str());
 		const auto &vMessages = m_pServer->m_avChatMessages[ClientId];
 		ASSERT_EQ(vMessages.size(), 6);
-		EXPECT_EQ(vMessages[0], "No such command: team. Use /cmdlist for a list of all commands.");
+		EXPECT_EQ(vMessages[0], "You are not in a team. /team <player> asks a player to team up.");
+		EXPECT_EQ(vMessages[1], "Player not found. Use their full name.");
+		EXPECT_EQ(vMessages[2], "You are in a fight, which can't team up. /fight alone leaves it.");
 		EXPECT_EQ(vMessages[3], "No such command: practice. Use /cmdlist for a list of all commands.");
 		pController->Tick();
 		ASSERT_NE(GameServer()->GetPlayerChar(ClientId), nullptr);
@@ -1418,6 +1422,169 @@ TEST_F(GameWorld, GTrainFreeplayTeleCursorChoosesTheStart)
 	pAnna->m_ViewPos = Tile(6, 2);
 	EXPECT_EQ(AimAndSay(Anna, Tile(3, 2), "/tc"), "You are force-paused and can't choose a start position.");
 	EXPECT_GT(pAnna->IsPaused(), 0);
+}
+
+TEST_F(GameWorld, GTrainTeamsPlayTogetherWithoutElo)
+{
+	PrepareTrainingCorridor();
+	// GTrain keeps the map's player collision and hooking for teams.
+	for(int Zone = 0; Zone < TuneZone::NUM; ++Zone)
+	{
+		GameServer()->TuningList()[Zone].Set("player_collision", 1);
+		GameServer()->TuningList()[Zone].Set("player_hooking", 1);
+	}
+	g_Config.m_SvSpamprotection = 0;
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob", "Carl"});
+	const int Anna = vIds[0], Bob = vIds[1], Carl = vIds[2];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	CGameTeams &Teams = pController->Teams();
+	const auto LastMessage = [&](int ClientId) {
+		return m_pServer->m_avChatMessages[ClientId].empty() ? std::string() : m_pServer->m_avChatMessages[ClientId].back();
+	};
+	const auto Reply = [&](int ClientId, const char *pText) {
+		m_pServer->m_avChatMessages[ClientId].clear();
+		Say(ClientId, pText);
+		return LastMessage(ClientId);
+	};
+	const auto Chr = [&](int ClientId) { return GameServer()->GetPlayerChar(ClientId); };
+	// Members share a spot, a flag and a DDRace team, collide and hook each
+	// other, and show as a team. Everyone else stays solo.
+	const auto CheckTogether = [&](std::initializer_list<int> Members) {
+		const int Leader = *Members.begin();
+		ASSERT_NE(Chr(Leader), nullptr);
+		for(int ClientId : Members)
+		{
+			ASSERT_NE(Chr(ClientId), nullptr);
+			EXPECT_EQ(Chr(ClientId)->m_Pos, Chr(Leader)->m_Pos);
+			EXPECT_EQ(TrainingGoal(ClientId), TrainingGoal(Leader));
+			EXPECT_EQ(Chr(ClientId)->Team(), Leader);
+			EXPECT_FALSE(Teams.m_Core.GetSolo(ClientId));
+			EXPECT_TRUE(Teams.m_Core.CanCollide(ClientId, Leader));
+			EXPECT_EQ(Teams.ScoreboardTeam(ClientId), Teams.ScoreboardTeam(Leader));
+			EXPECT_EQ(pController->SnapPlayerScore(ClientId, GameServer()->m_apPlayers[ClientId]), (int)GTrainElo::FromPoints(pController->Stats(ClientId).m_Points));
+		}
+		EXPECT_GT(Teams.ScoreboardTeam(Leader), 0);
+		EXPECT_TRUE(GameServer()->m_apPlayers[Leader]->IsNameMarked());
+	};
+	const auto CheckSolo = [&](int ClientId) {
+		ASSERT_NE(Chr(ClientId), nullptr);
+		EXPECT_TRUE(Teams.m_Core.GetSolo(ClientId));
+		EXPECT_EQ(Chr(ClientId)->Team(), ClientId);
+		EXPECT_EQ(Teams.ScoreboardTeam(ClientId), 0);
+	};
+	for(int ClientId : vIds)
+		CheckSolo(ClientId);
+
+	// Requests by name, accepted with /accept or /a within a minute.
+	EXPECT_EQ(Reply(Bob, "/accept"), "You have no team request. Requests last a minute.");
+	EXPECT_EQ(Reply(Anna, "/team Anna"), "You cannot team up with yourself.");
+	EXPECT_EQ(Reply(Anna, "/team Carl"), "You asked 'Carl' to team up. They can join with /accept or /a within a minute.");
+	m_pServer->AdvanceTicks((60 + 1) * m_pServer->TickSpeed());
+	EXPECT_EQ(Reply(Carl, "/a"), "You have no team request. Requests last a minute.");
+	EXPECT_EQ(Reply(Anna, "/team Bob"), "You asked 'Bob' to team up. They can join with /accept or /a within a minute.");
+	EXPECT_EQ(LastMessage(Bob), "'Anna' wants to team up with you. Say /accept or /a within a minute to join.");
+	EXPECT_EQ(Reply(Bob, "/a"), "'Bob' joined the team of 'Anna'. /team alone leaves it.");
+	EXPECT_EQ(LastMessage(Anna), "'Bob' joined the team of 'Anna'. /team alone leaves it.");
+	EXPECT_EQ(Reply(Bob, "/a"), "You have no team request. Requests last a minute.");
+	pController->Tick();
+	CheckTogether({Anna, Bob});
+	CheckSolo(Carl);
+	EXPECT_FALSE(Teams.m_Core.CanCollide(Anna, Carl));
+	EXPECT_EQ(Reply(Anna, "/team Bob"), "'Bob' is already in your team.");
+
+	// Teams and fights don't mix.
+	EXPECT_EQ(Reply(Bob, "/fight Carl"), "You are in a team, which can't fight. /team alone leaves it.");
+	EXPECT_EQ(Reply(Bob, "/fight"), "You are in a team, which can't fight. /team alone leaves it.");
+	EXPECT_EQ(Reply(Carl, "/fight Anna"), "'Anna' is in a team, which can't fight.");
+	CheckTogether({Anna, Bob});
+	CheckSolo(Carl);
+
+	// The leader chooses the settings.
+	EXPECT_EQ(Reply(Bob, "/distance 60"), "Only the team leader can change the goal distance.");
+
+	// Any member's capture counts for the team and earns no ELO, then the
+	// team starts over together.
+	pController->SetMapDifficulty("Hard", 2);
+	Chr(Anna)->Unfreeze();
+	Chr(Bob)->Unfreeze();
+	pController->Tick();
+	m_pServer->AdvanceTicks(2 * m_pServer->TickSpeed());
+	const CGTrainStats Before = pController->Stats(Bob);
+	const vec2 Goal = TrainingGoal(Bob);
+	Chr(Bob)->SetPosition(Goal);
+	Chr(Bob)->m_Pos = Chr(Bob)->m_PrevPos = Goal;
+	Chr(Bob)->ResetVelocity();
+	CMemoryLogger Logger;
+	{
+		CLogScope Scope(&Logger);
+		pController->Tick();
+	}
+	EXPECT_NE(Logger.ConcatenatedLines().find("'Bob' captured the flag for their team in 2.00 seconds (0 fails, +0 ELO (team))."), std::string::npos) << Logger.ConcatenatedLines();
+	EXPECT_EQ(pController->Stats(Bob).m_Points, Before.m_Points);
+	EXPECT_EQ(pController->Stats(Bob).m_Captures, Before.m_Captures + 1);
+	CheckTogether({Anna, Bob});
+
+	// Any member's /r retries the whole team.
+	const vec2 Spot = Chr(Anna)->m_Pos;
+	Chr(Anna)->Unfreeze();
+	Chr(Bob)->Unfreeze();
+	pController->Tick();
+	for(int ClientId : {Anna, Bob})
+	{
+		Chr(ClientId)->SetPosition(Spot + vec2(64, 0));
+		Chr(ClientId)->m_Pos = Chr(ClientId)->m_PrevPos = Spot + vec2(64, 0);
+	}
+	Say(Bob, "/r");
+	CheckTogether({Anna, Bob});
+	EXPECT_EQ(Chr(Anna)->m_Pos, Spot);
+
+	// Any member's death starts the team over.
+	GameServer()->m_apPlayers[Bob]->KillCharacter(WEAPON_SELF);
+	EXPECT_EQ(Chr(Anna), nullptr);
+	ASSERT_NE(Chr(Carl), nullptr);
+	pController->Tick();
+	CheckTogether({Anna, Bob});
+
+	// Members can add players too, who join everyone.
+	EXPECT_EQ(Reply(Bob, "/team Carl"), "You asked 'Carl' to team up. They can join with /accept or /a within a minute.");
+	EXPECT_EQ(LastMessage(Carl), "'Bob' wants to add you to their team. Say /accept or /a within a minute to join.");
+	Say(Carl, "/accept");
+	pController->Tick();
+	CheckTogether({Anna, Bob, Carl});
+
+	// Leaving starts the others over, the last one alone.
+	EXPECT_EQ(Reply(Anna, "/team"), "You left the team.");
+	EXPECT_EQ(LastMessage(Bob), "'Anna' left the team.");
+	pController->Tick();
+	CheckSolo(Anna);
+	CheckTogether({Carl, Bob});
+	Say(Bob, "/team");
+	EXPECT_EQ(LastMessage(Carl), "'Bob' left the team, you train alone again.");
+	pController->Tick();
+	for(int ClientId : vIds)
+		CheckSolo(ClientId);
+	EXPECT_EQ(Reply(Carl, "/team"), "You are not in a team. /team <player> asks a player to team up.");
+
+	// Fights can't team up.
+	pController->Fight(Bob, "Anna");
+	pController->Tick();
+	EXPECT_EQ(Reply(Bob, "/team Carl"), "You are in a fight, which can't team up. /fight alone leaves it.");
+	EXPECT_EQ(Reply(Carl, "/team Anna"), "'Anna' is in a fight, which can't team up.");
+	for(int ClientId : vIds)
+		EXPECT_TRUE(Teams.m_Core.GetSolo(ClientId));
+
+	// Spectators leave their team.
+	pController->Fight(Bob, "");
+	pController->Tick();
+	Say(Carl, "/team Anna");
+	Say(Anna, "/a");
+	pController->Tick();
+	CheckTogether({Carl, Anna});
+	GameServer()->m_apPlayers[Anna]->SetTeam(TEAM_SPECTATORS, false);
+	pController->Tick();
+	EXPECT_EQ(LastMessage(Carl), "'Anna' left the team, you train alone again.");
+	pController->Tick();
+	CheckSolo(Carl);
 }
 
 TEST_F(GameWorld, GTrainRetryPreservesGoalAndRestartsTimer)
@@ -2952,16 +3119,18 @@ TEST_F(GameWorld, GTrainChatOnlyHasGTrainCommands)
 	ASSERT_TRUE(IsChatCommand("team"));
 	ASSERT_TRUE(IsChatCommand("solo"));
 	PrepareTrainingCorridor();
-	// Races, teams and practice have no use in GTrain.
-	for(const char *pName : {"team", "practice", "save", "load", "kill", "times", "swap", "solo", "weapons", "unlaser", "tpxy"})
+	// Races, DDRace teams and practice have no use in GTrain.
+	for(const char *pName : {"practice", "save", "load", "kill", "times", "swap", "solo", "weapons", "unlaser", "tpxy", "invite", "join", "lock"})
 		EXPECT_FALSE(IsChatCommand(pName)) << pName;
-	for(const char *pName : {"r", "retry", "fight", "distance", "forwards", "trail", "settings", "laser", "rifle", "top5", "rank", "profile", "top5playtime", "spec", "pause", "w", "help", "cmdlist", "map", "timeout"})
+	for(const char *pName : {"r", "retry", "fight", "team", "accept", "a", "distance", "forwards", "trail", "settings", "laser", "rifle", "top5", "rank", "profile", "top5playtime", "spec", "pause", "w", "help", "cmdlist", "map", "timeout"})
 		EXPECT_TRUE(IsChatCommand(pName)) << pName;
 	// Practice binds stay, they retry.
 	for(const char *pName : {"invincible", "tc", "telecursor", "rescue", "back", "tp", "teleport", "lasttp"})
 		EXPECT_TRUE(IsChatCommand(pName)) << pName;
 	// Rcon keeps them.
-	EXPECT_NE(pConsole->GetCommandInfo("team", CFGFLAG_SERVER, false), nullptr);
+	EXPECT_NE(pConsole->GetCommandInfo("practice", CFGFLAG_SERVER, false), nullptr);
+	// GTrain's /team takes player names.
+	EXPECT_STREQ(pConsole->GetCommandInfo("team", CFGFLAG_CHAT, false)->Params(), "?r[player name]");
 }
 
 TEST_F(GameWorld, GTrainSettingsShowsThoseOfPlayersAndFights)
@@ -3371,7 +3540,7 @@ TEST_F(GameWorld, GTrainHelpListsOnlyGTrainCommands)
 	m_pServer->m_avChatMessages[Runner].clear();
 	Say(Runner, "/help");
 	const auto &vMessages = m_pServer->m_avChatMessages[Runner];
-	ASSERT_EQ(vMessages.size(), 19);
+	ASSERT_EQ(vMessages.size(), 20);
 	EXPECT_EQ(vMessages.front(), "GTrain commands:");
 	EXPECT_EQ(vMessages.back(), "Captures on this map earn no ELO.");
 	std::string Help;
@@ -3392,7 +3561,7 @@ TEST_F(GameWorld, GTrainHelpListsOnlyGTrainCommands)
 		pCmd = pConsole->NextCommandInfo(pCmd, IConsole::CLIENT_ID_UNSPECIFIED, CFGFLAG_CHAT))
 		if(std::find(vGeneral.begin(), vGeneral.end(), pCmd->Name()) == vGeneral.end())
 			EXPECT_TRUE(Lists(std::string("/") + pCmd->Name())) << pCmd->Name();
-	for(const char *pOther : {"/practice", "/team", "/save"})
+	for(const char *pOther : {"/practice", "/save", "/join"})
 		EXPECT_FALSE(Lists(pOther)) << pOther;
 
 	// Help for a single command still shows its usage.
