@@ -1748,14 +1748,22 @@ void CGameControllerGTrain::Snap(int SnappingClient)
 	if(ClientId < 0 || ClientId >= MAX_CLIENTS)
 		return;
 	CCharacter *pChr = GameServer()->GetPlayerChar(ClientId);
-	// Only the held player gets their door, as a short laser on its tile.
 	const CAttempt &Attempt = m_aAttempts[ClientId];
-	if(pChr && Attempt.m_DoorIndex >= 0 && Attempt.m_StartTick < 0 && m_aDoorSnapIds[ClientId] &&
-		GameServer()->Switchers()[m_DoorSwitch].m_aStatus[pChr->Team()])
+	// The doors holding the tees of the viewed tee's ddrace team, as short
+	// lasers on their tiles: its own, and with /team those of its teammates,
+	// which clients predict with the same switch states. Other tees are
+	// solo, their doors follow switches of their own.
+	for(int Other = 0; pChr && Other < MAX_CLIENTS; ++Other)
 	{
-		const vec2 DoorPos = GameServer()->Collision()->GetPos(Attempt.m_DoorIndex);
+		const CAttempt &OtherAttempt = m_aAttempts[Other];
+		CCharacter *pOther = GameServer()->GetPlayerChar(Other);
+		if(!pOther || pOther->Team() != pChr->Team() || OtherAttempt.m_DoorIndex < 0 || OtherAttempt.m_StartTick >= 0 || !m_aDoorSnapIds[Other])
+			continue;
+		if(!GameServer()->Switchers()[m_DoorSwitch].m_aStatus[pChr->Team()])
+			break;
+		const vec2 DoorPos = GameServer()->Collision()->GetPos(OtherAttempt.m_DoorIndex);
 		const CSnapContext Context(GameServer()->GetClientVersion(SnappingClient), Server()->IsSixup(SnappingClient), SnappingClient);
-		GameServer()->SnapLaserObject(Context, *m_aDoorSnapIds[ClientId], DoorPos - vec2(12, 0), DoorPos + vec2(12, 0), -1, -1, LASERTYPE_DOOR, 0, m_DoorSwitch);
+		GameServer()->SnapLaserObject(Context, *m_aDoorSnapIds[Other], DoorPos - vec2(12, 0), DoorPos + vec2(12, 0), -1, -1, LASERTYPE_DOOR, 0, m_DoorSwitch);
 	}
 	if(m_aSettings[m_aFightGroup[ClientId]].m_Freeplay)
 		return;

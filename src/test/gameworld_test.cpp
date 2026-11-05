@@ -1431,6 +1431,50 @@ TEST_F(GameWorld, GTrainFreeplayTeleCursorChoosesTheStart)
 	EXPECT_GT(pAnna->IsPaused(), 0);
 }
 
+TEST_F(GameWorld, GTrainTeamsSeeTheDoorsHoldingTheirTeammates)
+{
+	// Clients predict teammates with their team's switch states, so they
+	// need the doors holding them too, or teammates would seem to fall.
+	PrepareTrainingCorridor();
+	ClearMapExtras();
+	g_Config.m_SvGtrainHoverDoor = 1;
+	g_Config.m_SvSpamprotection = 0;
+	g_Config.m_SvGtrainGoalDistance = 6;
+	m_pServer->AdvanceTicks(10); // switch end ticks are only sent after tick 0
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob", "Carl"});
+	const int Anna = vIds[0], Bob = vIds[1], Carl = vIds[2];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	const auto Doors = [&](int ClientId) {
+		CSnapshotBuffer Buffer;
+		m_pServer->m_SnapshotBuilder.Init();
+		GameServer()->m_pController->Snap(ClientId);
+		m_pServer->m_SnapshotBuilder.Finish(&Buffer);
+		std::vector<vec2> vDoors;
+		const CSnapshot *pSnap = Buffer.AsSnapshot();
+		for(int i = 0; i < pSnap->NumItems(); ++i)
+			if(pSnap->GetItemType(i) == NETOBJTYPE_DDNETLASER && ((const CNetObj_DDNetLaser *)pSnap->GetItem(i)->Data())->m_Type == LASERTYPE_DOOR)
+			{
+				const auto *pDoor = (const CNetObj_DDNetLaser *)pSnap->GetItem(i)->Data();
+				vDoors.emplace_back(pDoor->m_ToX, pDoor->m_ToY);
+			}
+		std::sort(vDoors.begin(), vDoors.end(), [](vec2 A, vec2 B) { return A.x < B.x; });
+		return vDoors;
+	};
+	const auto DoorUnder = [&](int ClientId) { return GameServer()->GetPlayerChar(ClientId)->m_Pos + vec2(-12, 32); };
+
+	Say(Anna, "/team Bob");
+	Say(Bob, "/a");
+	pController->Tick();
+	ASSERT_EQ(GameServer()->GetPlayerChar(Bob)->Team(), Anna);
+	ASSERT_NE(GameServer()->GetPlayerChar(Anna)->m_Pos, GameServer()->GetPlayerChar(Bob)->m_Pos);
+	std::vector<vec2> vTeam = {DoorUnder(Anna), DoorUnder(Bob)};
+	std::sort(vTeam.begin(), vTeam.end(), [](vec2 A, vec2 B) { return A.x < B.x; });
+	EXPECT_EQ(Doors(Anna), vTeam);
+	EXPECT_EQ(Doors(Bob), vTeam);
+	// Solo tees only see their own.
+	EXPECT_EQ(Doors(Carl), std::vector<vec2>{DoorUnder(Carl)});
+}
+
 TEST_F(GameWorld, GTrainTeamsPlayTogetherWithoutElo)
 {
 	PrepareTrainingCorridor();
