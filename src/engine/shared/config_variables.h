@@ -278,6 +278,7 @@ MACRO_CONFIG_INT(SvGtrainHoverDoor, sv_gtrain_hover_door, 1, 0, 1, CFGFLAG_SERVE
 MACRO_CONFIG_INT(SvGtrainPathClearRadius, sv_gtrain_path_clear_radius, 64, 0, 4096, CFGFLAG_SERVER, "GTrain particle-free radius in world units around the player")
 MACRO_CONFIG_INT(SvGtrainPathParticleSpacing, sv_gtrain_path_particle_spacing, 192, 1, 4096, CFGFLAG_SERVER, "Distance in world units between GTrain path particles (32 units per tile)")
 MACRO_CONFIG_INT(SvGtrainStartExclusion, sv_gtrain_start_exclusion, 50, 0, 10000, CFGFLAG_SERVER, "Path distance in tiles from the start line in which GTrain places no players or goals (applies on map change)")
+MACRO_CONFIG_INT(SvGtrainTileRatings, sv_gtrain_tile_ratings, 1, 0, 1, CFGFLAG_SERVER, "Rate the spots of each map by simulating tees on them, captures then earn ELO by the tiles they went through; 0 rates all tiles like the map (applies on map change)")
 MACRO_CONFIG_INT(SvGtrainRecordRuns, sv_gtrain_record_runs, 0, 0, 1, CFGFLAG_SERVER, "Store every GTrain capture that earns ELO in the database, as the start state and inputs that replay it, with the ELO and speed multiplier it earned")
 MACRO_CONFIG_INT(SvTournamentMode, sv_tournament_mode, 0, 0, 1, CFGFLAG_SERVER, "Tournament mode. When enabled, players joins the server as spectator")
 MACRO_CONFIG_INT(SvSpamprotection, sv_spamprotection, 1, 0, 1, CFGFLAG_SERVER, "Spam protection for: team change, chat, skin change, emotes and votes")

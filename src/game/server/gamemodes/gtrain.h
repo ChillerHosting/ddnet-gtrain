@@ -3,8 +3,10 @@
 
 #include "ddnet.h"
 #include "gtrain_elo.h"
+#include "gtrain_map.h"
 #include "gtrain_path.h"
 #include "gtrain_run.h"
+#include "gtrain_tiles.h"
 
 #include <base/vmath.h>
 
@@ -28,7 +30,6 @@ class CGameControllerGTrain : public CGameControllerDDNet
 		HOVER_TICKS = 50,
 		// The hover after a won fight, to see its result.
 		FIGHT_BREAK_SECONDS = 10,
-		MAX_FREEZE_DISTANCE = 20,
 		NUM_DIRECTION_PARTICLES = 256,
 		MAX_PATH_NODES = 256,
 		MIN_GOAL_DISTANCE = 50,
@@ -45,17 +46,20 @@ class CGameControllerGTrain : public CGameControllerDDNet
 		TEAM_SPOT_SPACING = 2, // tiles between teammates
 	};
 
-	// centers of all non-freeze tiles between the start and the finish line,
-	// ordered by their path distance to the finish
-	std::vector<vec2> m_vTrainPositions;
+	CGTrainMap m_Map;
 	bool m_aPendingPlace[MAX_CLIENTS];
-	CGTrainPathGraph m_PathGraph;
-	std::vector<int> m_vTileNodes;
-	// nodes of tiles tees fall through frozen onto unfreeze, -1 elsewhere
-	std::vector<int> m_vFallNodes;
-	// path distance of every node to the finish line, -1 without a path
-	std::vector<int> m_vFinishDistances;
 	CGTrainPathfinder m_Pathfinder;
+	// The difficulty of every tile from the spot ratings, -1 for tiles that
+	// are no spots. Without ratings it is empty, and captures earn by the
+	// map's difficulty.
+	std::vector<float> m_vTileDifficulties;
+	// of the mean difficulty of all spots, for /help
+	double m_MapTileStep = 0;
+	// Rates the spots of a map version once, everyone spectates until it is
+	// done. See InitTileRatings().
+	std::unique_ptr<CGTrainTileRatingJob> m_pRatingJob;
+	// put into spectators while rating, to put back into the game once done
+	bool m_aRatingSpectators[MAX_CLIENTS] = {};
 	struct CAttempt
 	{
 		std::shared_ptr<CGTrainGoal> m_pGoal;
@@ -80,6 +84,9 @@ class CGameControllerGTrain : public CGameControllerDDNet
 		// Recorded from the release on, to store the run if its capture earns
 		// ELO.
 		std::optional<CGTrainRun> m_Run;
+		// Rated tiles the tee was on unfrozen since the release, a tile again
+		// only after another one. Captures earn by each of them once.
+		std::vector<int> m_vTouchedTiles;
 	};
 	// Fight leaders choose these for their whole group. Leaving players and
 	// promoted leaders keep the group's settings.
@@ -122,6 +129,9 @@ class CGameControllerGTrain : public CGameControllerDDNet
 	// Difficulty step of the map for capture points, unset on maps without
 	// ELO.
 	std::optional<int> m_EloStep;
+	// The map's category earns ELO, even if its stars don't count: with
+	// rated tiles, those tell how hard a capture is.
+	bool m_EloCategory = false;
 	// The stats of each player's name: their changes since requesting them
 	// from the database, plus the loaded stats once the request completes.
 	CGTrainStats m_aStats[MAX_CLIENTS];
@@ -132,10 +142,6 @@ class CGameControllerGTrain : public CGameControllerDDNet
 	int m_aPlaytimeTicks[MAX_CLIENTS] = {};
 
 	void HideUnrelatedChatCommands();
-	void FindTrainPositions();
-	// path nodes beside tiles of this game or front layer index
-	std::vector<int> NodesBeside(int Tile) const;
-	void ExcludeStartArea();
 	int RandomStart(int Group) const;
 	int HoverDoorIndex(int Start, class CCharacter *pChr) const;
 	void DelayHoverDoor(class CCharacter *pChr);
@@ -181,9 +187,20 @@ class CGameControllerGTrain : public CGameControllerDDNet
 	void StartRun(class CCharacter *pChr);
 	void SaveRun(class CCharacter *pChr, const CEloGain &Gain);
 	void SaveStats(int ClientId);
-	int PathNode(vec2 Pos) const;
 	void UpdatePath(class CCharacter *pChr);
 	void CheckGoal(class CCharacter *pChr);
+	void TileRatingsPath(char *pBuf, int BufSize) const;
+	void InitTileRatings();
+	void HoldForTileRatings();
+	void FinishTileRatings();
+	int TileRatingsPercent() const;
+	void TrackTouchedTile(class CCharacter *pChr);
+	void UseTileDifficulties(std::vector<float> vDifficulties);
+	// The mean difficulty of the rated tiles of the attempt, each once.
+	std::optional<double> TouchedTileDifficulty(const CAttempt &Attempt) const;
+	// From the tiles, which must be rated. Tiles without a rating count as 0.
+	double CaptureStep(const CAttempt &Attempt) const;
+	void AppendCaptureStep(char *pBuf, int BufSize, const CAttempt &Attempt) const;
 
 public:
 	CGameControllerGTrain(class CGameContext *pGameServer);
@@ -194,6 +211,9 @@ public:
 	// step makes captures worth more.
 	// Other categories and ratings have no ELO.
 	static std::optional<int> EloStep(const char *pServer, int Stars);
+	// "Hard ★★☆" for the nearest whole step of a capture's tiles, "Deranged
+	// ★★★★" for four steps above Extreme with three stars.
+	static void FormatStep(char *pBuf, int BufSize, double Step);
 	void LoadMapDifficulty();
 	void SetMapDifficulty(const char *pServer, int Stars);
 	// Loads the stats of the player's current name, after joining or
@@ -210,6 +230,12 @@ public:
 	int OnCharacterDeath(class CCharacter *pVictim, class CPlayer *pKiller, int Weapon) override;
 	void OnPlayerDisconnect(class CPlayer *pPlayer, const char *pReason) override;
 	void OnPlayerConnect(class CPlayer *pPlayer) override;
+	bool CanJoinTeam(int Team, int NotThisId, char *pErrorReason, int ErrorReasonSize) override;
+	void DoTeamChange(class CPlayer *pPlayer, int Team, bool DoChatMsg) override;
+	bool RatingTiles() const { return m_pRatingJob != nullptr; }
+	// Rates the tiles directly, -1 for none, like the spot ratings would.
+	// For tests, whose maps differ from their files.
+	void SetTileDifficulties(std::vector<float> vDifficulties) { UseTileDifficulties(std::move(vDifficulties)); }
 	int SnapPlayerScore(int SnappingClient, CPlayer *pPlayer) override;
 	bool HasTimeScore() const override { return false; }
 	CFinishTime SnapPlayerTime(int SnappingClient, CPlayer *pPlayer) override { return CFinishTime::Unset(); }

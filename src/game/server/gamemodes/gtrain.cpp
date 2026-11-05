@@ -22,13 +22,14 @@
 #include <algorithm>
 #include <iterator>
 #include <string>
+#include <thread>
 
 #define GAME_TYPE_NAME "GTrain"
 #define TEST_TYPE_NAME "TestGTrain"
 
 CGameControllerGTrain::CGameControllerGTrain(class CGameContext *pGameServer) :
 	CGameControllerDDNet(pGameServer),
-	m_Pathfinder(m_PathGraph)
+	m_Pathfinder(m_Map.m_PathGraph)
 {
 	m_pGameType = g_Config.m_SvTestingCommands ? TEST_TYPE_NAME : GAME_TYPE_NAME;
 	m_GameFlags = 0; // Fight wins are numeric scores, including on 0.7 clients.
@@ -68,7 +69,8 @@ CGameControllerGTrain::CGameControllerGTrain(class CGameContext *pGameServer) :
 	};
 
 	HideUnrelatedChatCommands();
-	FindTrainPositions();
+	m_Map.Init(GameServer()->Collision(), g_Config.m_SvGtrainStartExclusion);
+	InitTileRatings();
 	Teams().SetScoreboardTeams(m_aScoreboardTeams);
 }
 
@@ -172,10 +174,32 @@ void CGameControllerGTrain::LoadMapDifficulty()
 	GameServer()->Score()->LoadMapDifficulty(m_pMapDifficultyResult);
 }
 
+void CGameControllerGTrain::FormatStep(char *pBuf, int BufSize, double Step)
+{
+	const int Rounded = std::max((int)std::lround(Step), 0);
+	if(Rounded <= GTrainElo::EXTREME_STEP)
+	{
+		str_format(pBuf, BufSize, "%s %s", s_apEloDifficulties[Rounded / std::size(s_apEloStars)], s_apEloStars[Rounded % std::size(s_apEloStars)]);
+		return;
+	}
+	// Deranged has as many stars as it takes, at least three of them.
+	const int Stars = Rounded - GTrainElo::EXTREME_STEP;
+	str_format(pBuf, BufSize, "%s ", s_pDeranged);
+	for(int Star = 0; Star < std::max(Stars, (int)std::size(s_apEloStars)) && str_length(pBuf) + 4 < BufSize; ++Star)
+		str_append(pBuf, Star < Stars ? "★" : "☆", BufSize);
+}
+
 void CGameControllerGTrain::SetMapDifficulty(const char *pServer, int Stars)
 {
 	m_EloStep = EloStep(pServer, Stars);
-	if(m_EloStep)
+	m_EloCategory = EloStep(pServer, 1).has_value();
+	if(m_EloCategory && !m_vTileDifficulties.empty())
+	{
+		char aStep[64];
+		FormatStep(aStep, sizeof(aStep), m_MapTileStep);
+		log_info("gtrain", "map is %s, captures earn by their tiles, which average %s", pServer, aStep);
+	}
+	else if(m_EloStep)
 		log_info("gtrain", "map is %s with %d stars, captures are worth %.1f times as much as on Easy with one star", pServer, Stars, GTrainElo::PointsPerTile(*m_EloStep) / GTrainElo::PointsPerTile(0));
 	else
 		log_info("gtrain", "map is '%s' with %d stars, captures earn no ELO", pServer, Stars);
@@ -242,7 +266,7 @@ void CGameControllerGTrain::StartRun(CCharacter *pChr)
 		return;
 	Attempt.m_Run.emplace();
 	Attempt.m_Run->m_Start.Save(pChr, m_DoorSwitch);
-	Attempt.m_Run->m_Goal = m_PathGraph.m_vNodes[Attempt.m_pGoal->m_Goal].m_Pos;
+	Attempt.m_Run->m_Goal = m_Map.m_PathGraph.m_vNodes[Attempt.m_pGoal->m_Goal].m_Pos;
 }
 
 void CGameControllerGTrain::SaveRun(CCharacter *pChr, const CEloGain &Gain)
@@ -257,12 +281,206 @@ void CGameControllerGTrain::SaveRun(CCharacter *pChr, const CEloGain &Gain)
 	Attempt.m_Run.reset();
 }
 
+void CGameControllerGTrain::TileRatingsPath(char *pBuf, int BufSize) const
+{
+	char aSha256[SHA256_MAXSTRSIZE];
+	sha256_str(GameServer()->Map()->Sha256(), aSha256, sizeof(aSha256));
+	str_format(pBuf, BufSize, "gtrain_ratings/%s_%s.gtr", fs_filename(g_Config.m_SvMap), aSha256);
+}
+
+void CGameControllerGTrain::InitTileRatings()
+{
+	// The ratings of a map version are saved, gtrain_rate_tiles can make
+	// them beforehand. Only rating them takes a while.
+	if(!g_Config.m_SvGtrainTileRatings || m_Map.m_vTrainPositions.empty())
+		return;
+	const int Width = GameServer()->Collision()->GetWidth();
+	std::vector<int> vSpots;
+	for(const vec2 Pos : m_Map.m_vTrainPositions)
+		vSpots.push_back((int)(Pos.y / 32) * Width + (int)(Pos.x / 32));
+	std::sort(vSpots.begin(), vSpots.end());
+	char aPath[IO_MAX_PATH_LENGTH];
+	TileRatingsPath(aPath, sizeof(aPath));
+	char aFullPath[IO_MAX_PATH_LENGTH];
+	GameServer()->Storage()->GetCompletePath(IStorage::TYPE_SAVE, aPath, aFullPath, sizeof(aFullPath));
+	CGTrainTileRatings Ratings;
+	// Spots found differently, by another version, are rated again.
+	if(Ratings.Load(aFullPath, GameServer()->Map()->Sha256()) && Ratings.m_vSpots == vSpots)
+	{
+		UseTileDifficulties(Ratings.TileDifficulties());
+		log_info("gtrain", "loaded the ratings of %d spots from '%s'", (int)vSpots.size(), aPath);
+		return;
+	}
+	void *pMapData = nullptr;
+	unsigned MapSize = 0;
+	if(!GameServer()->Storage()->ReadFile(GameServer()->Map()->Path(), IStorage::TYPE_ALL, &pMapData, &MapSize))
+	{
+		log_error("gtrain", "failed to read '%s' to rate its spots, captures earn by the map's difficulty", GameServer()->Map()->Path());
+		return;
+	}
+	// One core stays free, the rest is left to the server's ticks anyway.
+	const int NumThreads = std::max(1, (int)std::thread::hardware_concurrency() - 1);
+	auto pJob = std::make_unique<CGTrainTileRatingJob>();
+	const bool Started = pJob->Start(pMapData, MapSize, GameServer()->Collision(), m_Map.m_vTileNodes, GameServer()->Map()->Sha256(), std::move(vSpots), NumThreads, true);
+	free(pMapData);
+	if(!Started)
+	{
+		log_error("gtrain", "ddnet_physics failed to load the map, captures earn by the map's difficulty");
+		return;
+	}
+	log_info("gtrain", "rating %d spots on %d threads, everyone spectates until it is done", pJob->NumSpots(), NumThreads);
+	m_pRatingJob = std::move(pJob);
+}
+
+int CGameControllerGTrain::TileRatingsPercent() const
+{
+	return m_pRatingJob->NumSpots() ? 100 * m_pRatingJob->NumRated() / m_pRatingJob->NumSpots() : 100;
+}
+
+void CGameControllerGTrain::HoldForTileRatings()
+{
+	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
+	{
+		CPlayer *pPlayer = GameServer()->m_apPlayers[ClientId];
+		if(pPlayer && pPlayer->GetTeam() != TEAM_SPECTATORS)
+		{
+			m_aRatingSpectators[ClientId] = true;
+			DoTeamChange(pPlayer, TEAM_SPECTATORS, false);
+		}
+	}
+	if(Server()->Tick() % Server()->TickSpeed() != 0)
+		return;
+	constexpr int BAR_LENGTH = 20;
+	const int Percent = TileRatingsPercent();
+	char aBar[BAR_LENGTH * 3 + 1] = "";
+	for(int i = 0; i < BAR_LENGTH; ++i)
+		str_append(aBar, i < Percent * BAR_LENGTH / 100 ? "█" : "░");
+	char aBroadcast[256];
+	str_format(aBroadcast, sizeof(aBroadcast), "Rating this map's spots for ELO\n%s %d%%\nEveryone spectates until it is done.", aBar, Percent);
+	GameServer()->SendBroadcast(aBroadcast, -1);
+}
+
+void CGameControllerGTrain::FinishTileRatings()
+{
+	if(m_pRatingJob->Failed())
+		log_error("gtrain", "the map has no spawn for the rating tee, captures earn by the map's difficulty");
+	else
+	{
+		const CGTrainTileRatings Ratings = m_pRatingJob->TakeRatings();
+		UseTileDifficulties(Ratings.TileDifficulties());
+		char aPath[IO_MAX_PATH_LENGTH];
+		TileRatingsPath(aPath, sizeof(aPath));
+		char aFullPath[IO_MAX_PATH_LENGTH];
+		GameServer()->Storage()->GetCompletePath(IStorage::TYPE_SAVE, aPath, aFullPath, sizeof(aFullPath));
+		if(GameServer()->Storage()->CreateFolder("gtrain_ratings", IStorage::TYPE_SAVE) && Ratings.Save(aFullPath))
+			log_info("gtrain", "rated %d spots, saved to '%s'", (int)Ratings.m_vSpots.size(), aPath);
+		else
+			log_error("gtrain", "rated %d spots, but failed to save them to '%s'", (int)Ratings.m_vSpots.size(), aPath);
+	}
+	m_pRatingJob = nullptr;
+	GameServer()->SendBroadcast("", -1);
+	// Everyone who waited plays now.
+	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
+	{
+		CPlayer *pPlayer = GameServer()->m_apPlayers[ClientId];
+		if(pPlayer && m_aRatingSpectators[ClientId] && pPlayer->GetTeam() == TEAM_SPECTATORS)
+			DoTeamChange(pPlayer, TEAM_GAME, false);
+		m_aRatingSpectators[ClientId] = false;
+	}
+}
+
+bool CGameControllerGTrain::CanJoinTeam(int Team, int NotThisId, char *pErrorReason, int ErrorReasonSize)
+{
+	if(m_pRatingJob && Team != TEAM_SPECTATORS)
+	{
+		if(pErrorReason)
+			str_format(pErrorReason, ErrorReasonSize, "Everyone spectates until this map's spots are rated for ELO (%d%%).", TileRatingsPercent());
+		return false;
+	}
+	return CGameControllerDDNet::CanJoinTeam(Team, NotThisId, pErrorReason, ErrorReasonSize);
+}
+
+void CGameControllerGTrain::DoTeamChange(CPlayer *pPlayer, int Team, bool DoChatMsg)
+{
+	// Spectators leave their fight before their tee dies, so a leader leaving
+	// doesn't start the next attempt for everyone else.
+	if(Team == TEAM_SPECTATORS && pPlayer->GetTeam() != TEAM_SPECTATORS)
+		LeaveFight(pPlayer->GetCid(), false);
+	CGameControllerDDNet::DoTeamChange(pPlayer, Team, DoChatMsg);
+}
+
+void CGameControllerGTrain::TrackTouchedTile(CCharacter *pChr)
+{
+	// Frozen tees go where they are thrown, which takes no skill.
+	CAttempt &Attempt = m_aAttempts[pChr->GetPlayer()->GetCid()];
+	if(m_vTileDifficulties.empty() || !Attempt.m_Running || Attempt.m_StartTick < 0 ||
+		pChr->m_FreezeTime > 0 || pChr->Core()->m_DeepFrozen || pChr->Core()->m_LiveFrozen)
+		return;
+	const int Width = GameServer()->Collision()->GetWidth();
+	const int Height = GameServer()->Collision()->GetHeight();
+	const vec2 Pos = pChr->m_Pos;
+	if(Pos.x < 0 || Pos.y < 0 || Pos.x >= Width * 32.0f || Pos.y >= Height * 32.0f)
+		return;
+	const int Index = (int)(Pos.y / 32) * Width + (int)(Pos.x / 32);
+	if(m_vTileDifficulties[Index] >= 0 && (Attempt.m_vTouchedTiles.empty() || Attempt.m_vTouchedTiles.back() != Index))
+		Attempt.m_vTouchedTiles.push_back(Index);
+}
+
+void CGameControllerGTrain::UseTileDifficulties(std::vector<float> vDifficulties)
+{
+	m_vTileDifficulties = std::move(vDifficulties);
+	double Sum = 0;
+	int NumRated = 0;
+	for(const float Difficulty : m_vTileDifficulties)
+		if(Difficulty >= 0)
+		{
+			Sum += Difficulty;
+			++NumRated;
+		}
+	m_MapTileStep = GTrainElo::TileStep(NumRated ? Sum / NumRated : 0.0);
+}
+
+std::optional<double> CGameControllerGTrain::TouchedTileDifficulty(const CAttempt &Attempt) const
+{
+	if(m_vTileDifficulties.empty() || Attempt.m_vTouchedTiles.empty())
+		return std::nullopt;
+	std::vector<int> vTiles = Attempt.m_vTouchedTiles;
+	std::sort(vTiles.begin(), vTiles.end());
+	vTiles.erase(std::unique(vTiles.begin(), vTiles.end()), vTiles.end());
+	double Sum = 0;
+	for(const int Index : vTiles)
+		Sum += m_vTileDifficulties[Index];
+	return Sum / vTiles.size();
+}
+
+double CGameControllerGTrain::CaptureStep(const CAttempt &Attempt) const
+{
+	return GTrainElo::TileStep(TouchedTileDifficulty(Attempt).value_or(0.0));
+}
+
+void CGameControllerGTrain::AppendCaptureStep(char *pBuf, int BufSize, const CAttempt &Attempt) const
+{
+	if(m_vTileDifficulties.empty())
+		return;
+	char aStep[64];
+	FormatStep(aStep, sizeof(aStep), CaptureStep(Attempt));
+	str_append(pBuf, ", ", BufSize);
+	str_append(pBuf, aStep, BufSize);
+}
+
 std::optional<CGameControllerGTrain::CEloGain> CGameControllerGTrain::AwardElo(int ClientId, bool Frozen)
 {
 	// The goal's path distance, never more than the chosen goal distance.
 	const CAttempt &Attempt = m_aAttempts[ClientId];
 	const int Distance = Attempt.m_pGoal->m_Distance;
-	if(!m_EloStep || Distance <= 0 || ((CConsole *)GameServer()->Console())->Cheated())
+	// The tiles tell how hard the capture was. Without them, the map's
+	// category and stars do.
+	std::optional<double> Step;
+	if(m_EloCategory && !m_vTileDifficulties.empty())
+		Step = CaptureStep(Attempt);
+	else if(m_EloStep)
+		Step = *m_EloStep;
+	if(!Step || Distance <= 0 || ((CConsole *)GameServer()->Console())->Cheated())
 		return std::nullopt;
 	// Teammates can carry each other through anything.
 	if(InTeam(ClientId))
@@ -278,10 +496,10 @@ std::optional<CGameControllerGTrain::CEloGain> CGameControllerGTrain::AwardElo(i
 		return CEloGain{0.0, 0.0, "goal under 100 tiles"};
 	const double Seconds = (Server()->Tick() - Attempt.m_StartTick) / (double)Server()->TickSpeed();
 	CGTrainStats Gain;
-	Gain.m_Points = GTrainElo::CapturePoints(*m_EloStep, Distance, Seconds);
+	Gain.m_Points = GTrainElo::CapturePoints(*Step, IsDeranged(), Distance, Seconds);
 	const double EloBefore = GTrainElo::FromPoints(m_aStats[ClientId].m_Points);
 	AddStats(ClientId, Gain);
-	return CEloGain{GTrainElo::FromPoints(m_aStats[ClientId].m_Points) - EloBefore, GTrainElo::SpeedFactor(*m_EloStep, Distance, Seconds), nullptr, Gain.m_Points};
+	return CEloGain{GTrainElo::FromPoints(m_aStats[ClientId].m_Points) - EloBefore, GTrainElo::SpeedFactor(*Step, IsDeranged(), Distance, Seconds), nullptr, Gain.m_Points};
 }
 
 void CGameControllerGTrain::BanRuns(const char *pMap, const char *pName, bool Ban)
@@ -311,331 +529,27 @@ void CGameControllerGTrain::FormatCaptureResult(char *pBuf, int BufSize, int Fai
 	str_append(pBuf, aElo, BufSize);
 }
 
-void CGameControllerGTrain::FindTrainPositions()
-{
-	CCollision *pCollision = GameServer()->Collision();
-	const int Width = pCollision->GetWidth();
-	const int Height = pCollision->GetHeight();
-
-	const auto HasTile = [&](int Index, int Tile) {
-		return pCollision->GetTileIndex(Index) == Tile || pCollision->GetFrontTileIndex(Index) == Tile;
-	};
-	const auto IsBlocked = [&](int Index) {
-		const int Tile = pCollision->GetTileIndex(Index);
-		return Tile == TILE_SOLID || Tile == TILE_NOHOOK;
-	};
-	const auto IsCheckTeleport = [&](int Index) {
-		return pCollision->IsCheckTeleport(Index) || pCollision->IsCheckEvilTeleport(Index);
-	};
-	const auto ForEachNeighbor = [&](int Index, auto &&Func) {
-		const int x = Index % Width;
-		const int y = Index / Width;
-		if(x > 0)
-			Func(Index - 1);
-		if(x < Width - 1)
-			Func(Index + 1);
-		if(y > 0)
-			Func(Index - Width);
-		if(y < Height - 1)
-			Func(Index + Width);
-	};
-
-	// flood-fill every side of the start line, the start and the finish
-	// line are not crossed, so only the sides reaching the finish are kept
-	std::vector<int> vSideOf(Width * Height, 0);
-	std::vector<bool> vWalked(Width * Height, false); // reached from a start line neighbor without teleporting
-	std::vector<bool> vKept(Width * Height, false);
-	std::vector<bool> vDiscarded(Width * Height, false);
-	std::vector<int> vSide;
-	std::vector<int> vTeleported;
-	std::vector<int> vTeleCheckpoints;
-	int NumSides = 0;
-	bool FoundStart = false;
-	for(int StartIndex = 0; StartIndex < Width * Height; StartIndex++)
-	{
-		if(!HasTile(StartIndex, TILE_START))
-			continue;
-		FoundStart = true;
-
-		ForEachNeighbor(StartIndex, [&](int SeedIndex) {
-			if(vWalked[SeedIndex] || IsBlocked(SeedIndex) || HasTile(SeedIndex, TILE_START) || HasTile(SeedIndex, TILE_FINISH))
-				return;
-
-			const int Side = ++NumSides;
-			bool HitsFinish = false;
-			bool HitsCheckTeleport = false;
-			const auto Reach = [&](int Index, std::vector<int> &vQueue) {
-				if(HasTile(Index, TILE_FINISH))
-					HitsFinish = true;
-				else if(vSideOf[Index] != Side && !IsBlocked(Index) && !HasTile(Index, TILE_START))
-				{
-					vSideOf[Index] = Side;
-					vQueue.push_back(Index);
-				}
-			};
-			const auto TeleportTo = [&](const std::vector<vec2> &vTeleOuts) {
-				for(const vec2 &TeleOut : vTeleOuts)
-					Reach(pCollision->GetPureMapIndex(TeleOut), vTeleported);
-			};
-			const auto TeleportToCheckpoint = [&](int TeleCheckpoint) {
-				// same order as the character, fall back to previous checkpoints
-				for(int k = TeleCheckpoint - 1; k >= 0; k--)
-				{
-					if(!pCollision->TeleCheckOuts(k).empty())
-					{
-						TeleportTo(pCollision->TeleCheckOuts(k));
-						return;
-					}
-				}
-			};
-
-			vSide.clear();
-			vTeleported.clear();
-			vTeleCheckpoints.clear();
-			Reach(SeedIndex, vSide);
-			size_t NumDone = 0;
-			bool Walking = true;
-			while(true)
-			{
-				for(; NumDone < vSide.size(); NumDone++)
-				{
-					const int Index = vSide[NumDone];
-					if(Walking)
-						vWalked[Index] = true;
-
-					// teleporters can't be passed, the fill continues at their destinations
-					const int Teleport = pCollision->IsTeleport(Index) ? pCollision->IsTeleport(Index) : pCollision->IsEvilTeleport(Index);
-					if(Teleport)
-					{
-						TeleportTo(pCollision->TeleOuts(Teleport - 1));
-						continue;
-					}
-					if(IsCheckTeleport(Index))
-					{
-						if(!HitsCheckTeleport)
-						{
-							HitsCheckTeleport = true;
-							for(const int TeleCheckpoint : vTeleCheckpoints)
-								TeleportToCheckpoint(TeleCheckpoint);
-						}
-						continue;
-					}
-					const int TeleCheckpoint = pCollision->IsTeleCheckpoint(Index);
-					if(TeleCheckpoint && std::find(vTeleCheckpoints.begin(), vTeleCheckpoints.end(), TeleCheckpoint) == vTeleCheckpoints.end())
-					{
-						vTeleCheckpoints.push_back(TeleCheckpoint);
-						if(HitsCheckTeleport)
-							TeleportToCheckpoint(TeleCheckpoint);
-					}
-
-					ForEachNeighbor(Index, [&](int Neighbor) { Reach(Neighbor, vSide); });
-				}
-				if(vTeleported.empty())
-					break;
-				Walking = false;
-				vSide.insert(vSide.end(), vTeleported.begin(), vTeleported.end());
-				vTeleported.clear();
-			}
-
-			for(const int Index : vSide)
-			{
-				if(HitsFinish)
-					vKept[Index] = true;
-				else
-					vDiscarded[Index] = true;
-			}
-		});
-	}
-
-	// positions must have freeze straight below, before any solid tile
-	const auto HasFreezeBelow = [&](int Index) {
-		for(int i = 1; i <= MAX_FREEZE_DISTANCE && Index + i * Width < Width * Height; i++)
-		{
-			const int Below = Index + i * Width;
-			if(IsBlocked(Below))
-				return false;
-			if(HasTile(Below, TILE_FREEZE) || HasTile(Below, TILE_DFREEZE))
-				return true;
-		}
-		return false;
-	};
-
-	for(int Index = 0; Index < Width * Height; Index++)
-	{
-		// sides not reaching the finish stay discarded, even if a teleporter leads back to them
-		if(!vKept[Index] || vDiscarded[Index])
-			continue;
-		// death tiles and teleporters are discarded as well, to not kill or move the player instantly,
-		// and unfreeze tiles, which would end the hover right away
-		if(HasTile(Index, TILE_FREEZE) || HasTile(Index, TILE_DFREEZE) || HasTile(Index, TILE_DEATH) || HasTile(Index, TILE_UNFREEZE))
-			continue;
-		if(pCollision->IsTeleport(Index) || pCollision->IsEvilTeleport(Index) || IsCheckTeleport(Index))
-			continue;
-		if(!HasFreezeBelow(Index))
-			continue;
-		m_vTrainPositions.emplace_back((Index % Width) * 32.0f + 16.0f, (Index / Width) * 32.0f + 16.0f);
-	}
-
-	if(m_vTrainPositions.empty())
-		log_warn("gtrain", "no tiles found between start and finish line%s, training is disabled on this map", FoundStart ? "" : " (map has no start line)");
-	else
-		log_info("gtrain", "found %d tiles between start and finish line", (int)m_vTrainPositions.size());
-
-	// Spawn eligibility and path eligibility differ: routes may pass safe tiles
-	// without freeze below, but never route through freeze, death or race lines.
-	// Checkpoint teleports depend on character history, so they cannot be
-	// represented as unconditional edges in a shared static graph.
-	const auto IsNodeTile = [&](int Index) {
-		return vKept[Index] && !vDiscarded[Index] && !IsBlocked(Index) &&
-		       !HasTile(Index, TILE_FREEZE) && !HasTile(Index, TILE_DFREEZE) && !HasTile(Index, TILE_DEATH) &&
-		       !HasTile(Index, TILE_START) && !HasTile(Index, TILE_FINISH) && !IsCheckTeleport(Index);
-	};
-	// Only falling straight through freeze onto unfreeze crosses freeze.
-	// Anything else in the way, like hookable or unhookable tiles, stoppers,
-	// teleporters, speedups or deep freeze, could stop the fall or change it.
-	std::vector<uint8_t> vFall(Width * Height, CGTrainPathGraph::FALL_STOP);
-	std::vector<bool> vNodeTiles(Width * Height);
-	for(int Index = 0; Index < Width * Height; ++Index)
-	{
-		vNodeTiles[Index] = IsNodeTile(Index);
-		const int Tile = pCollision->GetTileIndex(Index);
-		const int FrontTile = pCollision->GetFrontTileIndex(Index);
-		const auto Only = [&](int Allowed) { return (Tile == Allowed || Tile == TILE_AIR) && (FrontTile == Allowed || FrontTile == TILE_AIR); };
-		CDoorTile Door;
-		pCollision->GetDoorTile(Index, &Door);
-		if(Only(TILE_UNFREEZE) && (Tile == TILE_UNFREEZE || FrontTile == TILE_UNFREEZE) && vNodeTiles[Index])
-			vFall[Index] = CGTrainPathGraph::FALL_UNFREEZE;
-		else if(Only(TILE_FREEZE) && !pCollision->IsTeleport(Index) && !pCollision->IsEvilTeleport(Index) && !IsCheckTeleport(Index) &&
-			!pCollision->IsTeleCheckpoint(Index) && !pCollision->IsSpeedup(Index) && !pCollision->GetSwitchType(Index) && !Door.m_Index)
-			vFall[Index] = Tile == TILE_FREEZE || FrontTile == TILE_FREEZE ? CGTrainPathGraph::FALL_FREEZE : CGTrainPathGraph::FALL_EMPTY;
-	}
-	const std::vector<bool> vFrozenFalls = CGTrainPathGraph::FindFrozenFalls(Width, Height, vFall, vNodeTiles);
-	const int NumFallTiles = std::count(vFrozenFalls.begin(), vFrozenFalls.end(), true);
-	if(NumFallTiles)
-		log_info("gtrain", "found %d tiles to fall through frozen onto unfreeze", NumFallTiles);
-	// Nodes follow the map rows, falling ones too, so goal fields stay small.
-	m_vTileNodes.assign(Width * Height, -1);
-	m_vFallNodes.assign(Width * Height, -1);
-	for(int Index = 0; Index < Width * Height; ++Index)
-	{
-		const vec2 Pos((Index % Width) * 32.0f + 16.0f, (Index / Width) * 32.0f + 16.0f);
-		if(vNodeTiles[Index])
-		{
-			m_vTileNodes[Index] = (int)m_PathGraph.m_vNodes.size();
-			m_PathGraph.m_vNodes.push_back({Pos, false});
-		}
-		if(vFrozenFalls[Index])
-		{
-			m_vFallNodes[Index] = (int)m_PathGraph.m_vNodes.size();
-			m_PathGraph.m_vNodes.push_back({Pos, false});
-		}
-	}
-
-	// Paths cannot pass stoppers against their direction. One-way stoppers
-	// also block moving off them, like CCollision::GetMoveRestrictions.
-	static_assert((int)CGTrainPathGraph::DIRECTION_LEFT == CANTMOVE_LEFT && (int)CGTrainPathGraph::DIRECTION_RIGHT == CANTMOVE_RIGHT &&
-		      (int)CGTrainPathGraph::DIRECTION_UP == CANTMOVE_UP && (int)CGTrainPathGraph::DIRECTION_DOWN == CANTMOVE_DOWN);
-	std::vector<uint8_t> vStoppers(Width * Height);
-	for(int Index = 0; Index < Width * Height; ++Index)
-		vStoppers[Index] = pCollision->GetTileMoveRestrictions(Index, false) | pCollision->GetTileMoveRestrictions(Index, true) << 4;
-	std::vector<std::pair<int, CGTrainPathGraph::CEdge>> vEdges;
-	for(int Index = 0; Index < Width * Height; ++Index)
-	{
-		const int Node = m_vTileNodes[Index];
-		if(Node < 0)
-			continue;
-		const int Teleport = pCollision->IsTeleport(Index) ? pCollision->IsTeleport(Index) : pCollision->IsEvilTeleport(Index);
-		if(Teleport)
-		{
-			for(vec2 Out : pCollision->TeleOuts(Teleport - 1))
-			{
-				const int Destination = m_vTileNodes[pCollision->GetPureMapIndex(Out)];
-				if(Destination >= 0)
-					vEdges.push_back({Node, {Destination, 0}});
-			}
-			continue;
-		}
-		CGTrainPathGraph::AddTileEdges(Index, Width, Height, m_vTileNodes, vStoppers, vEdges);
-	}
-	CGTrainPathGraph::AddFallEdges(Width, m_vTileNodes, m_vFallNodes, vStoppers, vEdges);
-	m_PathGraph.InitEdges(vEdges);
-	m_Pathfinder.FindDistances(NodesBeside(TILE_FINISH), m_vFinishDistances);
-
-	ExcludeStartArea();
-	// Spots far enough from the finish for /forwards are a suffix then.
-	std::stable_sort(m_vTrainPositions.begin(), m_vTrainPositions.end(), [&](vec2 A, vec2 B) {
-		return m_vFinishDistances[PathNode(A)] < m_vFinishDistances[PathNode(B)];
-	});
-	for(vec2 Pos : m_vTrainPositions)
-		m_PathGraph.m_vNodes[PathNode(Pos)].m_Goal = true;
-}
-
-std::vector<int> CGameControllerGTrain::NodesBeside(int Tile) const
-{
-	CCollision *pCollision = GameServer()->Collision();
-	const int Width = pCollision->GetWidth();
-	const int Height = pCollision->GetHeight();
-	std::vector<int> vNodes;
-	for(int Index = 0; Index < Width * Height; ++Index)
-	{
-		if(pCollision->GetTileIndex(Index) != Tile && pCollision->GetFrontTileIndex(Index) != Tile)
-			continue;
-		const int Column = Index % Width;
-		const int Row = Index / Width;
-		for(const int Neighbor : {Column > 0 ? Index - 1 : -1, Column < Width - 1 ? Index + 1 : -1, Row > 0 ? Index - Width : -1, Row < Height - 1 ? Index + Width : -1})
-			if(Neighbor >= 0 && m_vTileNodes[Neighbor] >= 0)
-				vNodes.push_back(m_vTileNodes[Neighbor]);
-	}
-	return vNodes;
-}
-
-void CGameControllerGTrain::ExcludeStartArea()
-{
-	// Map starts are usually easy. No spawn or goal is placed within the
-	// configured path distance of the start line, measured like goals.
-	const int Distance = g_Config.m_SvGtrainStartExclusion;
-	if(Distance <= 0 || m_vTrainPositions.empty())
-		return;
-	// Tiles beside the start line are already one tile away from it.
-	std::vector<int> vNearStart;
-	m_Pathfinder.FindReachable(NodesBeside(TILE_START), Distance - 1, vNearStart);
-	std::vector<bool> vExcluded(m_PathGraph.m_vNodes.size(), false);
-	for(const int Node : vNearStart)
-		vExcluded[Node] = true;
-	std::vector<vec2> vRemaining;
-	for(vec2 Pos : m_vTrainPositions)
-		if(!vExcluded[PathNode(Pos)])
-			vRemaining.push_back(Pos);
-	if(vRemaining.empty())
-	{
-		log_warn("gtrain", "all tiles are within %d tiles of the start line, keeping them", Distance);
-		return;
-	}
-	log_info("gtrain", "skipped %d tiles within %d tiles of the start line", (int)(m_vTrainPositions.size() - vRemaining.size()), Distance);
-	m_vTrainPositions = std::move(vRemaining);
-}
-
 int CGameControllerGTrain::RandomStart(int Group) const
 {
 	// Forward goals have their full distance from spots at least that far
 	// from the finish, so the others are skipped. Maps shorter than that use
 	// their spots farthest from the finish.
-	auto Begin = m_vTrainPositions.begin();
+	auto Begin = m_Map.m_vTrainPositions.begin();
 	const CSettings &Settings = m_aSettings[Group];
 	if(Settings.m_Forwards && !Settings.m_Freeplay)
 	{
-		const int MinDistance = std::min(GoalDistance(Group), m_vFinishDistances[PathNode(m_vTrainPositions.back())]);
-		Begin = std::partition_point(Begin, m_vTrainPositions.end(), [&](vec2 Pos) {
-			return m_vFinishDistances[PathNode(Pos)] < MinDistance;
+		const int MinDistance = std::min(GoalDistance(Group), m_Map.m_vFinishDistances[m_Map.PathNode(m_Map.m_vTrainPositions.back())]);
+		Begin = std::partition_point(Begin, m_Map.m_vTrainPositions.end(), [&](vec2 Pos) {
+			return m_Map.m_vFinishDistances[m_Map.PathNode(Pos)] < MinDistance;
 		});
 	}
-	return PathNode(Begin[secure_rand_below((int)(m_vTrainPositions.end() - Begin))]);
+	return m_Map.PathNode(Begin[secure_rand_below((int)(m_Map.m_vTrainPositions.end() - Begin))]);
 }
 
 void CGameControllerGTrain::PlaceRandomly(CPlayer *pPlayer)
 {
 	const int ClientId = pPlayer->GetCid();
-	if(m_vTrainPositions.empty())
+	if(m_Map.m_vTrainPositions.empty())
 	{
 		m_aPendingPlace[ClientId] = false;
 		return;
@@ -650,7 +564,7 @@ void CGameControllerGTrain::PlaceRandomly(CPlayer *pPlayer)
 	if(m_aSettings[Group].m_Freeplay)
 		*Attempt.m_pGoal = CGTrainGoal();
 	else
-		m_Pathfinder.Build(*Attempt.m_pGoal, Start, TargetDistance, secure_rand_below(1 << 30), m_aSettings[Group].m_Forwards ? &m_vFinishDistances : nullptr);
+		m_Pathfinder.Build(*Attempt.m_pGoal, Start, TargetDistance, secure_rand_below(1 << 30), m_aSettings[Group].m_Forwards ? &m_Map.m_vFinishDistances : nullptr);
 	PlaceForAttempt(pPlayer, Attempt.m_pGoal, Start, TargetDistance, false);
 }
 
@@ -658,7 +572,7 @@ void CGameControllerGTrain::PlaceForAttempt(CPlayer *pPlayer, const std::shared_
 {
 	const int ClientId = pPlayer->GetCid();
 	const CSettings &Settings = m_aSettings[m_aFightGroup[ClientId]];
-	const vec2 Pos = m_PathGraph.m_vNodes[Start].m_Pos;
+	const vec2 Pos = m_Map.m_PathGraph.m_vNodes[Start].m_Pos;
 	EndAttempt(ClientId, false);
 	// Every attempt starts like after a kill, without the weapons and
 	// powerups picked up during the previous one. Characters that spawned
@@ -760,7 +674,7 @@ int CGameControllerGTrain::HoverDoorIndex(int Start, CCharacter *pChr) const
 	if(m_DoorSwitch < 0 || !g_Config.m_SvGtrainHoverDoor || pChr->Team() == TEAM_SUPER)
 		return -1;
 	CCollision *pCollision = GameServer()->Collision();
-	const vec2 Below = m_PathGraph.m_vNodes[Start].m_Pos + vec2(0, 32);
+	const vec2 Below = m_Map.m_PathGraph.m_vNodes[Start].m_Pos + vec2(0, 32);
 	if(Below.y >= pCollision->GetHeight() * 32)
 		return -1;
 	// Clients only lay doors down from tiles without solid, death or laser
@@ -904,7 +818,7 @@ void CGameControllerGTrain::UpdateFightTeams()
 void CGameControllerGTrain::RestartFight(int Group, std::optional<int> ChosenStart)
 {
 	m_aFightRestart[Group] = false;
-	if(m_vTrainPositions.empty())
+	if(m_Map.m_vTrainPositions.empty())
 		return;
 	const int Start = ChosenStart ? *ChosenStart : RandomStart(Group);
 	const int TargetDistance = GoalDistance(Group);
@@ -916,7 +830,7 @@ void CGameControllerGTrain::RestartFight(int Group, std::optional<int> ChosenSta
 	if(m_aSettings[Group].m_Freeplay)
 		*pGoal = CGTrainGoal();
 	else
-		m_Pathfinder.Build(*pGoal, Start, TargetDistance, secure_rand_below(1 << 30), m_aSettings[Group].m_Forwards ? &m_vFinishDistances : nullptr);
+		m_Pathfinder.Build(*pGoal, Start, TargetDistance, secure_rand_below(1 << 30), m_aSettings[Group].m_Forwards ? &m_Map.m_vFinishDistances : nullptr);
 	PlaceGroup(Group, pGoal, Start, TargetDistance, false);
 }
 
@@ -959,7 +873,7 @@ std::vector<int> CGameControllerGTrain::TeamStarts(const CGTrainGoal &Goal, int 
 	// ones every time, so retries keep everyone's spot. Where the map runs
 	// out of spots, the rest share the start.
 	std::vector<int> vStarts = {Start};
-	const vec2 StartPos = m_PathGraph.m_vNodes[Start].m_Pos;
+	const vec2 StartPos = m_Map.m_PathGraph.m_vNodes[Start].m_Pos;
 	std::vector<int> vNearby;
 	m_Pathfinder.FindReachable({Start}, TEAM_SPOT_RANGE, vNearby);
 	const int StartDistance = Goal.m_Ready ? Goal.FieldDistance(Start) : -1;
@@ -970,14 +884,14 @@ std::vector<int> CGameControllerGTrain::TeamStarts(const CGTrainGoal &Goal, int 
 		{
 			if((int)vStarts.size() >= Count)
 				break;
-			const vec2 Pos = m_PathGraph.m_vNodes[Node].m_Pos;
+			const vec2 Pos = m_Map.m_PathGraph.m_vNodes[Node].m_Pos;
 			// Spots like the random ones, not behind a teleporter.
-			if(!m_PathGraph.m_vNodes[Node].m_Goal || distance(Pos, StartPos) > TEAM_SPOT_RANGE * 32.0f)
+			if(!m_Map.m_PathGraph.m_vNodes[Node].m_Goal || distance(Pos, StartPos) > TEAM_SPOT_RANGE * 32.0f)
 				continue;
 			const int Distance = Goal.FieldDistance(Node);
 			if(HasGoal && (Distance >= 0 && Distance < StartDistance) != Ahead)
 				continue;
-			if(std::all_of(vStarts.begin(), vStarts.end(), [&](int Other) { return distance(Pos, m_PathGraph.m_vNodes[Other].m_Pos) >= TEAM_SPOT_SPACING * 32.0f; }))
+			if(std::all_of(vStarts.begin(), vStarts.end(), [&](int Other) { return distance(Pos, m_Map.m_PathGraph.m_vNodes[Other].m_Pos) >= TEAM_SPOT_SPACING * 32.0f; }))
 				vStarts.push_back(Node);
 		}
 		if(!HasGoal)
@@ -1088,7 +1002,7 @@ void CGameControllerGTrain::Fight(int ClientId, const char *pName)
 		GameServer()->SendChatTarget(ClientId, "Spectators cannot join a fight.");
 		return;
 	}
-	if(m_vTrainPositions.empty())
+	if(m_Map.m_vTrainPositions.empty())
 	{
 		GameServer()->SendChatTarget(ClientId, "Training is disabled on this map.");
 		return;
@@ -1100,26 +1014,22 @@ void CGameControllerGTrain::Fight(int ClientId, const char *pName)
 		GameServer()->SendChatTarget(ClientId, "You are already in the same fight.");
 		return;
 	}
+	// Only the player switches fights, the rest of their fight goes on
+	// without them, like after /fight alone.
+	LeaveFight(ClientId, false);
 	// Joining players enter the target group's current attempt, so the target
 	// group keeps its positions. Dead joiners are placed there on respawn.
 	const CAttempt &TargetAttempt = m_aAttempts[TargetGroup];
 	const bool JoinAttempt = TargetAttempt.m_pGoal && TargetAttempt.m_Start >= 0;
 	// Joiners adopt the target group's settings, losing weapons it lacks.
-	const int RemovedWeapons = m_aSettings[SourceGroup].m_Weapons & ~m_aSettings[TargetGroup].m_Weapons;
-	for(int Other = 0; Other < MAX_CLIENTS; ++Other)
-	{
-		if(m_aFightGroup[Other] != SourceGroup)
-			continue;
-		m_aFightGroup[Other] = TargetGroup;
-		CCharacter *pChr = GameServer()->GetPlayerChar(Other);
-		for(int Weapon = WEAPON_SHOTGUN; pChr && Weapon <= WEAPON_NINJA; ++Weapon)
-			if((RemovedWeapons & (1 << Weapon)) && pChr->GetWeaponGot(Weapon))
-				pChr->GiveWeapon(Weapon, true);
-		if(JoinAttempt && pChr)
-			PlaceForAttempt(GameServer()->m_apPlayers[Other], TargetAttempt.m_pGoal, TargetAttempt.m_Start, TargetAttempt.m_TargetDistance, false);
-	}
-	m_aFightRestart[SourceGroup] = false;
-	m_aFightBreakEndTick[SourceGroup] = 0;
+	const int RemovedWeapons = m_aSettings[ClientId].m_Weapons & ~m_aSettings[TargetGroup].m_Weapons;
+	m_aFightGroup[ClientId] = TargetGroup;
+	CCharacter *pChr = GameServer()->GetPlayerChar(ClientId);
+	for(int Weapon = WEAPON_SHOTGUN; pChr && Weapon <= WEAPON_NINJA; ++Weapon)
+		if((RemovedWeapons & (1 << Weapon)) && pChr->GetWeaponGot(Weapon))
+			pChr->GiveWeapon(Weapon, true);
+	if(JoinAttempt && pChr)
+		PlaceForAttempt(pPlayer, TargetAttempt.m_pGoal, TargetAttempt.m_Start, TargetAttempt.m_TargetDistance, false);
 	if(!JoinAttempt)
 		m_aFightRestart[TargetGroup] = true;
 	UpdateFightTeams();
@@ -1161,7 +1071,7 @@ void CGameControllerGTrain::TeamUp(int ClientId, const char *pName)
 		GameServer()->SendChatTarget(ClientId, "Spectators cannot team up.");
 		return;
 	}
-	if(m_vTrainPositions.empty())
+	if(m_Map.m_vTrainPositions.empty())
 	{
 		GameServer()->SendChatTarget(ClientId, "Training is disabled on this map.");
 		return;
@@ -1343,7 +1253,7 @@ void CGameControllerGTrain::TeleCursor(int ClientId)
 		GameServer()->SendChatTarget(ClientId, "You are force-paused and can't choose a start position.");
 		return;
 	}
-	if(m_vTrainPositions.empty())
+	if(m_Map.m_vTrainPositions.empty())
 	{
 		GameServer()->SendChatTarget(ClientId, "Training is disabled on this map.");
 		return;
@@ -1366,7 +1276,7 @@ void CGameControllerGTrain::TeleCursor(int ClientId)
 	{
 		const int Index = (int)(Pos.y / 32) * Width + (int)(Pos.x / 32);
 		if(!pCollision->IsTeleport(Index) && !pCollision->IsEvilTeleport(Index))
-			Start = m_vTileNodes[Index];
+			Start = m_Map.m_vTileNodes[Index];
 	}
 	if(Start < 0)
 	{
@@ -1560,7 +1470,17 @@ void CGameControllerGTrain::Help()
 	log_info("chatresp", "/points or /elo [player]: show ELO, /top5, /top, /top5points or /top5elo: the ELO ladder");
 	log_info("chatresp", "/rank or /profile [player]: stats and playtime, /top5captures, /top5attempts, /top5respawns, /top5playtime: their ladders");
 	log_info("chatresp", "/map <name>: vote a map, /mapinfo: map details, /cmdlist: every chat command");
-	if(m_EloStep)
+	if(m_EloCategory && !m_vTileDifficulties.empty())
+	{
+		char aDifficulty[64];
+		FormatStep(aDifficulty, sizeof(aDifficulty), m_MapTileStep);
+		log_info("chatresp", "Captures earn by the tiles they go through unfrozen, rated by simulating tees there: harder parts earn more. This map's spots average %s, worth %.1f times Easy ★☆☆.", aDifficulty, GTrainElo::PointsPerTile(m_MapTileStep) / GTrainElo::PointsPerTile(0));
+		if(IsDeranged())
+			log_info("chatresp", "Longer captures earn more, speed doesn't count, and goals have at least %d tiles.", (int)DERANGED_MIN_GOAL_DISTANCE);
+		else
+			log_info("chatresp", "Longer and faster captures earn more.");
+	}
+	else if(m_EloStep)
 	{
 		char aDifficulty[32];
 		if(*m_EloStep == GTrainElo::DERANGED_STEP)
@@ -1622,24 +1542,12 @@ int CGameControllerGTrain::OnCharacterDeath(CCharacter *pVictim, CPlayer *pKille
 	return Result;
 }
 
-int CGameControllerGTrain::PathNode(vec2 Pos) const
-{
-	// Do not use the collision lookup's clamping outside the map.
-	const int Width = GameServer()->Collision()->GetWidth();
-	const int Height = GameServer()->Collision()->GetHeight();
-	if(Pos.x < 0 || Pos.y < 0 || Pos.x >= Width * 32.0f || Pos.y >= Height * 32.0f)
-		return -1;
-	// Tees falling through freeze are on its falling node.
-	const int Index = (int)(Pos.y / 32) * Width + (int)(Pos.x / 32);
-	return m_vTileNodes[Index] >= 0 ? m_vTileNodes[Index] : m_vFallNodes[Index];
-}
-
 void CGameControllerGTrain::UpdatePath(CCharacter *pChr)
 {
 	CAttempt &Attempt = m_aAttempts[pChr->GetPlayer()->GetCid()];
 	if(!Attempt.m_pGoal || !Attempt.m_pGoal->m_Ready)
 		return;
-	const int Node = Attempt.m_StartTick < 0 ? Attempt.m_Start : PathNode(pChr->m_Pos);
+	const int Node = Attempt.m_StartTick < 0 ? Attempt.m_Start : m_Map.PathNode(pChr->m_Pos);
 	if(Node == Attempt.m_RouteNode)
 		return;
 	if(Node < 0)
@@ -1734,7 +1642,7 @@ void CGameControllerGTrain::CheckGoal(CCharacter *pChr)
 	CAttempt &Attempt = m_aAttempts[ClientId];
 	const CGTrainGoal &Target = *Attempt.m_pGoal;
 
-	const vec2 Goal = m_PathGraph.m_vNodes[Target.m_Goal].m_Pos;
+	const vec2 Goal = m_Map.m_PathGraph.m_vNodes[Target.m_Goal].m_Pos;
 	// Check the movement segment too, so a fast tee cannot skip the flag.
 	// A teleport's long displacement must not collect a flag along the way.
 	vec2 Closest = pChr->m_Pos;
@@ -1754,8 +1662,9 @@ void CGameControllerGTrain::CheckGoal(CCharacter *pChr)
 		EndAttempt(ClientId, true);
 		if(m_aTeamGroup[Group])
 		{
-			char aResult[64];
+			char aResult[128];
 			FormatCaptureResult(aResult, sizeof(aResult), Attempt.m_Fails, Gain);
+			AppendCaptureStep(aResult, sizeof(aResult), Attempt);
 			char aMessage[256];
 			const double Seconds = (Server()->Tick() - Attempt.m_StartTick) / (double)Server()->TickSpeed();
 			str_format(aMessage, sizeof(aMessage), "'%s' captured the flag for their team in %.2f seconds (%s).", Server()->ClientName(ClientId), Seconds, aResult);
@@ -1770,8 +1679,9 @@ void CGameControllerGTrain::CheckGoal(CCharacter *pChr)
 		}
 		else
 		{
-			char aResult[64];
+			char aResult[128];
 			FormatCaptureResult(aResult, sizeof(aResult), Attempt.m_Fails, Gain);
+			AppendCaptureStep(aResult, sizeof(aResult), Attempt);
 			char aMessage[256];
 			const double Seconds = (Server()->Tick() - Attempt.m_StartTick) / (double)Server()->TickSpeed();
 			str_format(aMessage, sizeof(aMessage), "'%s' captured the flag in %.2f seconds (%s).", Server()->ClientName(ClientId), Seconds, aResult);
@@ -1796,6 +1706,7 @@ void CGameControllerGTrain::OnPlayerDisconnect(CPlayer *pPlayer, const char *pRe
 	const int ClientId = pPlayer->GetCid();
 	LeaveFight(ClientId, false);
 	m_aFightBreakEndTick[ClientId] = 0;
+	m_aRatingSpectators[ClientId] = false;
 	m_aTeamRequest[ClientId] = -1;
 	for(int &Target : m_aTeamRequest)
 		if(Target == ClientId)
@@ -1816,6 +1727,8 @@ void CGameControllerGTrain::OnPlayerDisconnect(CPlayer *pPlayer, const char *pRe
 
 void CGameControllerGTrain::OnPlayerConnect(CPlayer *pPlayer)
 {
+	// Players joining while the spots are rated spectate, until it is done.
+	m_aRatingSpectators[pPlayer->GetCid()] = m_pRatingJob != nullptr;
 	CGameControllerDDNet::OnPlayerConnect(pPlayer);
 	LoadStats(pPlayer->GetCid());
 	UpdateFightTeams();
@@ -1848,7 +1761,7 @@ void CGameControllerGTrain::Snap(int SnappingClient)
 		return;
 	if(!pChr || !Attempt.m_pGoal || !Attempt.m_pGoal->m_Ready || !m_FlagSnapId)
 		return;
-	const vec2 Goal = m_PathGraph.m_vNodes[Attempt.m_pGoal->m_Goal].m_Pos;
+	const vec2 Goal = m_Map.m_PathGraph.m_vNodes[Attempt.m_pGoal->m_Goal].m_Pos;
 	CNetObj_Flag Flag = {};
 	Flag.m_X = (int)Goal.x;
 	Flag.m_Y = (int)Goal.y;
@@ -1895,7 +1808,7 @@ void CGameControllerGTrain::Snap(int SnappingClient)
 		}
 		DistanceToNext -= Length;
 	};
-	vec2 Incoming = m_PathGraph.m_vNodes[Attempt.m_vRoute[Attempt.m_RouteIndex]].m_Pos;
+	vec2 Incoming = m_Map.m_PathGraph.m_vNodes[Attempt.m_vRoute[Attempt.m_RouteIndex]].m_Pos;
 	// Bounded traversal and a shared snapshot-ID pool: no per-snapshot heap
 	// allocations or map searches, even with very distant goals.
 	for(int Step = 0; Step < MAX_PATH_NODES && NumParticles < NUM_DIRECTION_PARTICLES; ++Step)
@@ -1904,7 +1817,7 @@ void CGameControllerGTrain::Snap(int SnappingClient)
 		if(Index >= Attempt.m_vRoute.size())
 			break;
 		const int Node = Attempt.m_vRoute[Index];
-		const vec2 Center = m_PathGraph.m_vNodes[Node].m_Pos;
+		const vec2 Center = m_Map.m_PathGraph.m_vNodes[Node].m_Pos;
 		const int Next = Index + 1 < Attempt.m_vRoute.size() ? Attempt.m_vRoute[Index + 1] : -1;
 		if(Next < 0)
 		{
@@ -1917,14 +1830,14 @@ void CGameControllerGTrain::Snap(int SnappingClient)
 			}
 			break;
 		}
-		if(m_PathGraph.IsTeleportStep(Node, Next))
+		if(m_Map.m_PathGraph.IsTeleportStep(Node, Next))
 		{
 			// A teleport is a discontinuity, not a line across the map.
-			Incoming = m_PathGraph.m_vNodes[Next].m_Pos;
+			Incoming = m_Map.m_PathGraph.m_vNodes[Next].m_Pos;
 			DistanceToNext = Spacing;
 			continue;
 		}
-		const vec2 Outgoing = (Center + m_PathGraph.m_vNodes[Next].m_Pos) * 0.5f;
+		const vec2 Outgoing = (Center + m_Map.m_PathGraph.m_vNodes[Next].m_Pos) * 0.5f;
 		// Round turns through each tile center. This curve stays within the
 		// traversable tiles and avoids a staircase of right-angle corners.
 		const vec2 In = Center - Incoming, Out = Outgoing - Center;
@@ -1952,6 +1865,12 @@ void CGameControllerGTrain::Snap(int SnappingClient)
 void CGameControllerGTrain::Tick()
 {
 	CGameControllerDDNet::Tick();
+	if(m_pRatingJob)
+	{
+		HoldForTileRatings();
+		if(m_pRatingJob->Done())
+			FinishTileRatings();
+	}
 
 	if(m_pMapDifficultyResult && m_pMapDifficultyResult->m_Completed)
 	{
@@ -2078,6 +1997,7 @@ void CGameControllerGTrain::Tick()
 			OpenHoverDoor(pChr);
 			Attempt.m_StartTick = Server()->Tick();
 			Attempt.m_Running = !m_aSettings[m_aFightGroup[ClientId]].m_Freeplay && Attempt.m_pGoal && Attempt.m_pGoal->m_Ready;
+			Attempt.m_vTouchedTiles.clear();
 			Attempt.m_WithWeapons = m_aSettings[m_aFightGroup[ClientId]].m_Weapons != 0;
 			// Team runs earn no ELO, and replays can't move the teammates.
 			if(Attempt.m_Running && g_Config.m_SvGtrainRecordRuns && !InTeam(ClientId))
@@ -2087,6 +2007,7 @@ void CGameControllerGTrain::Tick()
 			Attempt.m_WithWeapons = true;
 		if(m_aSettings[m_aFightGroup[ClientId]].m_Freeplay)
 			continue;
+		TrackTouchedTile(pChr);
 		UpdatePath(pChr);
 		if(Attempt.m_StartTick >= 0 && Attempt.m_pGoal && Attempt.m_pGoal->m_Ready)
 			CheckGoal(pChr);

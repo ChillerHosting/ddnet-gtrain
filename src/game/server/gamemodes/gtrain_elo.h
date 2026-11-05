@@ -25,6 +25,8 @@ namespace GTrainElo
 	// not cost points. Deranged continues the line past Extreme.
 	inline constexpr double EASY_TILES_PER_SECOND = 12;
 	inline constexpr double EXTREME_TILES_PER_SECOND = 6;
+	// The line goes on above Extreme with three stars, but no slower.
+	inline constexpr double MIN_TILES_PER_SECOND = 2;
 	inline constexpr double MIN_SPEED_FACTOR = 0.5;
 	inline constexpr double MAX_SPEED_FACTOR = 4;
 	// Instant captures count as taking one tick.
@@ -47,14 +49,56 @@ namespace GTrainElo
 	// inhuman.
 	inline constexpr double MAX_POINTS = 1000.0 * 8000 * PointsPerTile(EXTREME_STEP) * 2;
 
+	// Steps between the whole ones, from the tiles of a capture.
+	inline double PointsPerTile(double Step)
+	{
+		return POINTS_PER_TILE * std::pow(STEP_MULTIPLIER, Step);
+	}
+
 	// The capture's speed relative to the typical one of its difficulty.
 	// Deranged maps have no speed bonus, every capture counts as typical.
+	inline double SpeedFactor(double Step, bool Deranged, int Distance, double Seconds)
+	{
+		if(Deranged)
+			return 1;
+		const double Typical = std::max(EASY_TILES_PER_SECOND + (EXTREME_TILES_PER_SECOND - EASY_TILES_PER_SECOND) * Step / EXTREME_STEP, MIN_TILES_PER_SECOND);
+		return std::clamp(Distance / std::max(Seconds, MIN_SECONDS) / Typical, MIN_SPEED_FACTOR, MAX_SPEED_FACTOR);
+	}
 	inline double SpeedFactor(int Step, int Distance, double Seconds)
 	{
-		if(Step == DERANGED_STEP)
-			return 1;
-		const double Typical = EASY_TILES_PER_SECOND + (EXTREME_TILES_PER_SECOND - EASY_TILES_PER_SECOND) * Step / EXTREME_STEP;
-		return std::clamp(Distance / std::max(Seconds, MIN_SECONDS) / Typical, MIN_SPEED_FACTOR, MAX_SPEED_FACTOR);
+		return SpeedFactor((double)Step, Step == DERANGED_STEP, Distance, Seconds);
+	}
+
+	// With rated tiles (see CGTrainTileRatings), the step of a capture comes
+	// from the mean difficulty of the tiles it went through instead of the
+	// map's category and stars. These are the mean difficulties along the
+	// races of the KoG maps of steps 0 to 14, fitted as a curve over the
+	// steps, so that the maps of each category and stars come out at that
+	// step on average: 0.59 steps off over 664 maps, 95% of them within 1.5.
+	// Between them the step is interpolated, beyond them extrapolated, and
+	// it is at least 0. Above Extreme with three stars it goes on without an
+	// end, as Deranged with more and more stars. Fit them again whenever the
+	// ratings change, see CGTrainRatingSettings.
+	inline constexpr double TILE_STEP_DIFFICULTIES[EXTREME_STEP + 1] = {
+		0.4140, 1.3744, 2.3303, 3.2817, 4.2287, 5.1712, 6.1092, 7.0427, 7.9718, 8.8964, 9.8165, 10.7322, 11.6434, 12.5501, 13.4524};
+
+	inline double TileStep(double Difficulty)
+	{
+		constexpr int LAST = EXTREME_STEP;
+		const auto Between = [&](int Step) { return Step + (Difficulty - TILE_STEP_DIFFICULTIES[Step]) / (TILE_STEP_DIFFICULTIES[Step + 1] - TILE_STEP_DIFFICULTIES[Step]); };
+		double Step;
+		if(Difficulty <= TILE_STEP_DIFFICULTIES[0])
+			Step = Between(0);
+		else if(Difficulty >= TILE_STEP_DIFFICULTIES[LAST])
+			Step = Between(LAST - 1);
+		else
+		{
+			int Lower = 0;
+			while(TILE_STEP_DIFFICULTIES[Lower + 1] < Difficulty)
+				++Lower;
+			Step = Between(Lower);
+		}
+		return std::max(Step, 0.0);
 	}
 
 	// Long goals are harder than their length, every tile is another chance
@@ -63,10 +107,14 @@ namespace GTrainElo
 	inline constexpr double DISTANCE_EXPONENT = 1.5;
 	inline constexpr double REFERENCE_DISTANCE = 100;
 
-	inline int64_t CapturePoints(int Step, int Distance, double Seconds)
+	inline int64_t CapturePoints(double Step, bool Deranged, int Distance, double Seconds)
 	{
 		const double Tiles = REFERENCE_DISTANCE * std::pow(Distance / REFERENCE_DISTANCE, DISTANCE_EXPONENT);
-		return std::llround(Tiles * PointsPerTile(Step) * SpeedFactor(Step, Distance, Seconds));
+		return std::llround(Tiles * PointsPerTile(Step) * SpeedFactor(Step, Deranged, Distance, Seconds));
+	}
+	inline int64_t CapturePoints(int Step, int Distance, double Seconds)
+	{
+		return CapturePoints((double)Step, Step == DERANGED_STEP, Distance, Seconds);
 	}
 
 	inline double FromPoints(int64_t Points)

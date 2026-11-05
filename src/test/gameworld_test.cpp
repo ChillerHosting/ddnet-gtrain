@@ -1,5 +1,7 @@
 #include "test.h"
 
+#include <base/fs.h>
+#include <base/hash.h>
 #include <base/logger.h>
 #include <base/types.h>
 
@@ -212,6 +214,10 @@ public:
 		GameServer()->OnInit(nullptr);
 		pServer->ReadAnnouncementsFile();
 		pServer->InitMaplist();
+		// Rating the spots simulates the map file, which tests change in
+		// memory. Tests of the ratings turn them on. (The config manager
+		// reset the config to its defaults above.)
+		g_Config.m_SvGtrainTileRatings = 0;
 	}
 
 	void PrepareTrainingCorridor()
@@ -2090,7 +2096,40 @@ TEST_F(GameWorld, GTrainFightAllowsPausedPlayersButNotSpectators)
 		EXPECT_EQ(pController->Teams().ScoreboardTeam(ClientId), Team);
 }
 
-TEST_F(GameWorld, GTrainFightTeamsMergeLeaveAndDisconnect)
+TEST_F(GameWorld, GTrainFightGoesOnWhenSomeoneLeaves)
+{
+	// However players leave, the others keep their spot and flag. The leader
+	// joining the spectators is no death of the leader.
+	PrepareTrainingCorridor();
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob", "Wilson", "Dee"});
+	const int Anna = vIds[0], Bob = vIds[1], Wilson = vIds[2], Dee = vIds[3];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	for(int ClientId : {Bob, Wilson, Dee})
+		pController->Fight(ClientId, "Anna");
+	pController->Tick();
+	const vec2 Position = GameServer()->GetPlayerChar(Anna)->m_Pos;
+	const vec2 Goal = TrainingGoal(Anna);
+	const auto ExpectKept = [&](std::initializer_list<int> Ids, const char *pHow) {
+		for(int i = 0; i < 3; ++i)
+			pController->Tick();
+		for(int ClientId : Ids)
+		{
+			ASSERT_TRUE(GameServer()->GetPlayerChar(ClientId)) << pHow;
+			EXPECT_EQ(GameServer()->GetPlayerChar(ClientId)->m_Pos, Position) << pHow;
+			EXPECT_EQ(TrainingGoal(ClientId), Goal) << pHow;
+		}
+	};
+	pController->DoTeamChange(GameServer()->m_apPlayers[Anna], TEAM_SPECTATORS, false);
+	ExpectKept({Bob, Wilson, Dee}, "the leader spectating");
+	EXPECT_EQ(pController->Teams().ScoreboardTeam(Anna), 0);
+	EXPECT_NE(pController->Teams().ScoreboardTeam(Bob), 0);
+	m_pServer->Console()->ExecuteLineFlag("fight", CFGFLAG_CHAT, Bob);
+	ExpectKept({Wilson, Dee}, "the new leader using /fight");
+	pController->DoTeamChange(GameServer()->m_apPlayers[Dee], TEAM_SPECTATORS, false);
+	ExpectKept({Wilson}, "the last member spectating");
+}
+
+TEST_F(GameWorld, GTrainFightTeamsSwitchLeaveAndDisconnect)
 {
 	PrepareTrainingCorridor();
 	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob", "Wilson", "Dee", "Ed"});
@@ -2101,7 +2140,27 @@ TEST_F(GameWorld, GTrainFightTeamsMergeLeaveAndDisconnect)
 	pController->Tick();
 	EXPECT_NE(pController->Teams().ScoreboardTeam(Anna), pController->Teams().ScoreboardTeam(Dee));
 	const int Team = pController->Teams().ScoreboardTeam(Dee);
-	pController->Fight(Bob, "Ed"); // merges both groups; the target group's leader stays
+	const int OldTeam = pController->Teams().ScoreboardTeam(Anna);
+	const vec2 OldPosition = GameServer()->GetPlayerChar(Anna)->m_Pos;
+	const vec2 OldGoal = TrainingGoal(Anna);
+	// Only the player switches fights, the rest of theirs goes on.
+	pController->Fight(Bob, "Ed");
+	pController->Tick();
+	EXPECT_EQ(pController->Teams().ScoreboardTeam(Bob), Team);
+	EXPECT_EQ(TrainingGoal(Bob), TrainingGoal(Dee));
+	for(int ClientId : {Anna, Wilson})
+	{
+		EXPECT_EQ(pController->Teams().ScoreboardTeam(ClientId), OldTeam);
+		EXPECT_EQ(GameServer()->GetPlayerChar(ClientId)->m_Pos, OldPosition);
+		EXPECT_EQ(TrainingGoal(ClientId), OldGoal);
+	}
+	EXPECT_TRUE(GameServer()->m_apPlayers[Anna]->IsNameMarked());
+	// The leader switching leaves the rest to a promoted leader.
+	pController->Fight(Anna, "Dee");
+	pController->Tick();
+	EXPECT_EQ(pController->Teams().ScoreboardTeam(Anna), Team);
+	EXPECT_EQ(pController->Teams().ScoreboardTeam(Wilson), 0); // alone now
+	pController->Fight(Wilson, "Dee");
 	pController->Tick();
 	for(int ClientId : vIds)
 	{
@@ -3241,8 +3300,10 @@ TEST_F(GameWorld, GTrainSkipsTheStartOfTheMap)
 	}
 	EXPECT_TRUE(FoundFirstAllowed);
 
-	// Maps entirely within the distance keep all their tiles.
+	// Maps entirely within the distance keep all their tiles. Characters
+	// keep the controller's teams, so the runner must not outlive it.
 	g_Config.m_SvGtrainStartExclusion = 10000;
+	GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_GAME);
 	delete GameServer()->m_pController;
 	GameServer()->m_pController = new CGameControllerGTrain(GameServer());
 	bool FoundBesideStart = false;
@@ -3253,6 +3314,213 @@ TEST_F(GameWorld, GTrainSkipsTheStartOfTheMap)
 		FoundBesideStart = GameServer()->GetPlayerChar(Runner)->m_Pos.x == 2 * 32 + 16;
 	}
 	EXPECT_TRUE(FoundBesideStart);
+}
+
+TEST_F(GameWorld, GTrainOnlyPlacesWithinTheRace)
+{
+	// Spots and goals farther from the start line than the finish line is,
+	// or farther from the finish line than the start line is, are off the
+	// race. The fill reaches past both lines through the freeze below.
+	PrepareTrainingCorridor();
+	CCollision *pCollision = GameServer()->Collision();
+	const int Width = pCollision->GetWidth();
+	ASSERT_GE(Width, 30);
+	const int StartX = 10, FinishX = Width - 10;
+	const auto Tile = [](int x, int y) { return vec2(x * 32 + 16, y * 32 + 16); };
+	const auto SetTile = [&](int x, int y, int Index) { pCollision->SetCollisionAt(x * 32 + 16, y * 32 + 16, Index); };
+	SetTile(1, 2, TILE_AIR);
+	SetTile(Width - 2, 2, TILE_AIR);
+	SetTile(StartX, 2, TILE_START);
+	SetTile(FinishX, 2, TILE_FINISH);
+	const int Runner = SpawnTrainingPlayers({"Runner"})[0];
+	// Every spot, in rows, as starts and goals of many attempts.
+	std::vector<vec2> vStarts, vGoals;
+	const auto CollectSpots = [&]() {
+		// Characters keep the controller's teams, they must not outlive it.
+		GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_GAME);
+		delete GameServer()->m_pController;
+		GameServer()->m_pController = new CGameControllerGTrain(GameServer());
+		vStarts.clear();
+		vGoals.clear();
+		const auto Add = [](std::vector<vec2> &vSpots, vec2 Pos) {
+			if(std::find(vSpots.begin(), vSpots.end(), Pos) == vSpots.end())
+				vSpots.push_back(Pos);
+		};
+		for(int Attempt = 0; Attempt < 1500; ++Attempt)
+		{
+			GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_SELF);
+			GameServer()->m_apPlayers[Runner]->ForceSpawn(vec2(80, 80));
+			GameServer()->m_pController->Tick();
+			Add(vStarts, GameServer()->GetPlayerChar(Runner)->m_Pos);
+			Add(vGoals, TrainingGoal(Runner));
+		}
+		const auto Order = [](vec2 A, vec2 B) { return A.y != B.y ? A.y < B.y : A.x < B.x; };
+		std::sort(vStarts.begin(), vStarts.end(), Order);
+		std::sort(vGoals.begin(), vGoals.end(), Order);
+	};
+	std::vector<vec2> vBetween;
+	for(int x = StartX + 1; x < FinishX; ++x)
+		vBetween.push_back(Tile(x, 2));
+
+	// Behind the start, no path leads to the finish, and none leads past
+	// the finish from the start.
+	CollectSpots();
+	EXPECT_EQ(vStarts, vBetween);
+	EXPECT_EQ(vGoals, vBetween);
+
+	// Around the lines, the tiles above them connect both sides. Going around
+	// a line takes longer than passing it, so the tiles above the lines and
+	// behind them are farther from the other line than this line is. Those
+	// beside the race are not.
+	for(int x : {StartX - 1, StartX, StartX + 1, FinishX - 1, FinishX, FinishX + 1})
+		SetTile(x, 1, TILE_AIR);
+	std::vector<vec2> vInRace = vBetween;
+	vInRace.insert(vInRace.begin(), {Tile(StartX + 1, 1), Tile(FinishX - 1, 1)});
+	CollectSpots();
+	EXPECT_EQ(vStarts, vInRace);
+	EXPECT_EQ(vGoals, vInRace);
+}
+
+TEST_F(GameWorld, GTrainRatesSpotsWhileEveryoneSpectates)
+{
+	PrepareTrainingCorridor();
+	const int Runner = SpawnTrainingPlayers({"Runner"})[0];
+	ASSERT_TRUE(GameServer()->GetPlayerChar(Runner));
+	g_Config.m_SvGtrainTileRatings = 1;
+	GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_GAME);
+	delete GameServer()->m_pController;
+	auto *pController = new CGameControllerGTrain(GameServer());
+	GameServer()->m_pController = pController;
+	ASSERT_TRUE(pController->RatingTiles());
+	char aReason[128] = "";
+	EXPECT_FALSE(pController->CanJoinTeam(TEAM_GAME, Runner, aReason, sizeof(aReason)));
+	EXPECT_TRUE(str_find(aReason, "rated")) << aReason;
+
+	// Everyone spectates with the progress shown, and plays once it is done.
+	m_pServer->AdvanceTicks(SERVER_TICK_SPEED - m_pServer->Tick() % SERVER_TICK_SPEED);
+	m_pServer->m_avBroadcasts[Runner].clear();
+	for(int Wait = 0; Wait < 6000 && pController->RatingTiles(); ++Wait)
+	{
+		pController->Tick();
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	ASSERT_FALSE(pController->RatingTiles());
+	EXPECT_EQ(GameServer()->m_apPlayers[Runner]->GetTeam(), TEAM_GAME);
+	ASSERT_GE(m_pServer->m_avBroadcasts[Runner].size(), 2u);
+	EXPECT_TRUE(str_find(m_pServer->m_avBroadcasts[Runner].front().c_str(), "Rating this map's spots")) << m_pServer->m_avBroadcasts[Runner].front();
+	EXPECT_EQ(m_pServer->m_avBroadcasts[Runner].back(), "");
+	EXPECT_TRUE(pController->CanJoinTeam(TEAM_GAME, Runner, aReason, sizeof(aReason)));
+
+	// The ratings are saved for this version of the map, and loaded again.
+	char aSha256[SHA256_MAXSTRSIZE];
+	sha256_str(GameServer()->Map()->Sha256(), aSha256, sizeof(aSha256));
+	char aPath[IO_MAX_PATH_LENGTH];
+	str_format(aPath, sizeof(aPath), "gtrain_ratings/%s_%s.gtr", fs_filename(g_Config.m_SvMap), aSha256);
+	EXPECT_TRUE(m_pStorage->FileExists(aPath, IStorage::TYPE_SAVE)) << aPath;
+	GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_GAME);
+	delete GameServer()->m_pController;
+	CMemoryLogger Logger;
+	{
+		CLogScope Scope(&Logger);
+		GameServer()->m_pController = new CGameControllerGTrain(GameServer());
+	}
+	EXPECT_FALSE(static_cast<CGameControllerGTrain *>(GameServer()->m_pController)->RatingTiles());
+	EXPECT_TRUE(str_find(Logger.ConcatenatedLines().c_str(), "loaded the ratings of")) << Logger.ConcatenatedLines();
+}
+
+TEST_F(GameWorld, GTrainCapturesEarnByTheirTiles)
+{
+	PrepareTrainingCorridor();
+	g_Config.m_SvSpamprotection = 0;
+	CCollision *pCollision = GameServer()->Collision();
+	const int Width = pCollision->GetWidth();
+	const int Runner = SpawnTrainingPlayers({"Runner"})[0];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	// The stars don't count with rated tiles, only that the category earns.
+	pController->SetMapDifficulty("Easy", 1);
+	const auto TileX = [](vec2 Pos) { return (int)(Pos.x / 32); };
+	// A spot with two corridor tiles behind it, away from the goal.
+	int Direction = 0;
+	for(int Attempt = 0; Attempt < 1000; ++Attempt)
+	{
+		const int StartX = TileX(GameServer()->GetPlayerChar(Runner)->m_Pos);
+		Direction = TileX(TrainingGoal(Runner)) > StartX ? 1 : -1;
+		if(StartX - 2 * Direction >= 2 && StartX - 2 * Direction <= Width - 3)
+			break;
+		GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_SELF);
+		GameServer()->m_apPlayers[Runner]->ForceSpawn(vec2(80, 80));
+		pController->Tick();
+		Direction = 0;
+	}
+	ASSERT_NE(Direction, 0);
+	CCharacter *pChr = GameServer()->GetPlayerChar(Runner);
+	const vec2 Start = pChr->m_Pos, Goal = TrainingGoal(Runner);
+	const int Distance = std::abs(TileX(Goal) - TileX(Start));
+	const vec2 Behind = Start - vec2(32.0f * Direction, 0), FarBehind = Start - vec2(64.0f * Direction, 0);
+	const auto &aSteps = GTrainElo::TILE_STEP_DIFFICULTIES;
+	std::vector<float> vDifficulties((size_t)Width * pCollision->GetHeight(), -1.0f);
+	const auto Rate = [&](vec2 Pos, float Difficulty) { vDifficulties[pCollision->GetPureMapIndex(Pos)] = Difficulty; };
+	Rate(Start, aSteps[6]);
+	Rate(Behind, aSteps[8]);
+	Rate(FarBehind, aSteps[14]); // only reached frozen
+	Rate(Goal, aSteps[7]);
+	pController->SetTileDifficulties(vDifficulties);
+
+	const auto MoveTo = [&](vec2 Pos) {
+		pChr->m_Pos = pChr->m_PrevPos = Pos;
+		pChr->SetPosition(Pos);
+		CMemoryLogger Logger;
+		{
+			CLogScope Scope(&Logger);
+			pController->Tick();
+		}
+		return Logger.ConcatenatedLines();
+	};
+	pChr->Unfreeze();
+	MoveTo(Start); // the release
+	MoveTo(Behind);
+	pChr->Freeze();
+	MoveTo(FarBehind);
+	pChr->Unfreeze();
+	MoveTo(Behind);
+	MoveTo(Start); // each tile counts once
+	const std::string Messages = MoveTo(Goal);
+
+	// The start, the tile behind it and the goal, about Hard with two stars.
+	const double Step = GTrainElo::TileStep((aSteps[6] + aSteps[7] + aSteps[8]) / 3);
+	EXPECT_NEAR(Step, 7, 0.1);
+	const double Seconds = GTrainElo::MIN_SECONDS;
+	char aExpected[128];
+	str_format(aExpected, sizeof(aExpected), "(0 fails, +%.2f ELO, %.1fx speed, Hard ★★☆)",
+		GTrainElo::FromPoints(GTrainElo::CapturePoints(Step, false, Distance, Seconds)), GTrainElo::SpeedFactor(Step, false, Distance, Seconds));
+	EXPECT_TRUE(str_find(Messages.c_str(), aExpected)) << Messages << "\nexpected " << aExpected;
+}
+
+TEST_F(GameWorld, GTrainTileStepsFollowTheKoGRatings)
+{
+	// Each whole step is at its difficulty, steps between are interpolated,
+	// those beyond extrapolated, at least Easy with one star and without an
+	// end above Extreme with three.
+	const auto &aSteps = GTrainElo::TILE_STEP_DIFFICULTIES;
+	for(int Step = 0; Step <= GTrainElo::EXTREME_STEP; ++Step)
+		EXPECT_NEAR(GTrainElo::TileStep(aSteps[Step]), Step, 1e-9);
+	EXPECT_NEAR(GTrainElo::TileStep((aSteps[3] + aSteps[4]) / 2), 3.5, 1e-9);
+	EXPECT_NEAR(GTrainElo::TileStep(aSteps[14] + (aSteps[14] - aSteps[13])), 15, 1e-9);
+	EXPECT_NEAR(GTrainElo::TileStep(aSteps[14] + 6 * (aSteps[14] - aSteps[13])), 20, 1e-9);
+	EXPECT_EQ(GTrainElo::TileStep(-100), 0);
+
+	// Every category has three stars, Deranged as many as it takes.
+	const std::pair<double, const char *> aLabels[] = {{-1.0, "Easy ★☆☆"}, {0.4, "Easy ★☆☆"}, {2.6, "Main ★☆☆"}, {7.0, "Hard ★★☆"},
+		{14.0, "Extreme ★★★"}, {14.6, "Deranged ★☆☆"}, {16.0, "Deranged ★★☆"}, {17.0, "Deranged ★★★"}, {19.0, "Deranged ★★★★★"}};
+	for(const auto &[Step, pLabel] : aLabels)
+	{
+		char aLabel[64];
+		CGameControllerGTrain::FormatStep(aLabel, sizeof(aLabel), Step);
+		EXPECT_STREQ(aLabel, pLabel) << Step;
+	}
+	// Whole steps earn what the categories and stars did.
+	EXPECT_EQ(GTrainElo::CapturePoints(7.0, false, 100, 10), GTrainElo::CapturePoints(7, 100, 10));
+	EXPECT_EQ(GTrainElo::CapturePoints(16.0, true, 100, 10), GTrainElo::CapturePoints(GTrainElo::DERANGED_STEP, 100, 10));
 }
 
 TEST_F(GameWorld, GTrainRaceTimerRestartsWithEveryAttempt)
