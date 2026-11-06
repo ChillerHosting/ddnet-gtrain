@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -62,13 +63,22 @@ public:
 	// ratings of the KoG maps. Open spots are harder than their survival
 	// says, the more so the safer they seem.
 	float SpotDifficulty(int Spot) const;
-	// Of every tile, -1 where there is no spot.
+	// Of every tile, UNRATED where there is no spot.
 	std::vector<float> TileDifficulties() const;
+	// Ratings go below 0 too, the easiest spots have them.
+	static constexpr float UNRATED = -std::numeric_limits<float>::infinity();
+	static bool IsRated(float Difficulty) { return Difficulty != UNRATED; }
 
 	bool Save(const char *pFilename) const;
 	// Fails for missing files, other versions and other maps.
 	bool Load(const char *pFilename, const SHA256_DIGEST &MapSha256);
 };
+
+// Each rated tile gets the mean difficulty of the rated tiles within Radius
+// tiles, a disc, itself included. A spot is rated from few tees, so single
+// spots come out far harder or easier than their surroundings, which counts
+// once captures add up their tiles. Tiles without a rating stay UNRATED.
+std::vector<float> BlurTileDifficulties(const std::vector<float> &vDifficulties, int Width, int Radius);
 
 // The map as ddnet_physics loads it, for the simulation.
 class CGTrainPhysicsMap

@@ -44,14 +44,18 @@ class CGameControllerGTrain : public CGameControllerDDNet
 		TEAM_REQUEST_SECONDS = 60,
 		TEAM_SPOT_RANGE = 8, // tiles from the team's start
 		TEAM_SPOT_SPACING = 2, // tiles between teammates
+		// Tiles earn by the mean difficulty of the rated tiles this close,
+		// see BlurTileDifficulties(). On the lain captures, it ranked maps
+		// closer to their KoG ratings than single tiles did.
+		TILE_BLUR_RADIUS = 3,
 	};
 
 	CGTrainMap m_Map;
 	bool m_aPendingPlace[MAX_CLIENTS];
 	CGTrainPathfinder m_Pathfinder;
-	// The difficulty of every tile from the spot ratings, -1 for tiles that
-	// are no spots. Without ratings it is empty, and captures earn by the
-	// map's difficulty.
+	// The difficulty of every tile from the spot ratings, blurred, UNRATED
+	// for tiles that are no spots. Without ratings it is empty, and captures earn
+	// by the map's difficulty.
 	std::vector<float> m_vTileDifficulties;
 	// of the mean difficulty of all spots, for /help
 	double m_MapTileStep = 0;
@@ -195,11 +199,18 @@ class CGameControllerGTrain : public CGameControllerDDNet
 	void FinishTileRatings();
 	int TileRatingsPercent() const;
 	void TrackTouchedTile(class CCharacter *pChr);
-	void UseTileDifficulties(std::vector<float> vDifficulties);
+	void UseTileDifficulties(const std::vector<float> &vDifficulties);
+	// The rated tiles of the attempt, each once.
+	static std::vector<int> UniqueTouchedTiles(const CAttempt &Attempt);
 	// The mean difficulty of the rated tiles of the attempt, each once.
 	std::optional<double> TouchedTileDifficulty(const CAttempt &Attempt) const;
-	// From the tiles, which must be rated. Tiles without a rating count as 0.
+	// The difficulty of the capture as a whole, for its label and typical
+	// speed. From the tiles, which must be rated. Without any rated tile
+	// touched it is the easiest.
 	double CaptureStep(const CAttempt &Attempt) const;
+	// What the attempt's tiles earn, each once by its own step.
+	double TouchedTilePoints(const CAttempt &Attempt) const;
+
 	void AppendCaptureStep(char *pBuf, int BufSize, const CAttempt &Attempt) const;
 
 public:
@@ -233,9 +244,9 @@ public:
 	bool CanJoinTeam(int Team, int NotThisId, char *pErrorReason, int ErrorReasonSize) override;
 	void DoTeamChange(class CPlayer *pPlayer, int Team, bool DoChatMsg) override;
 	bool RatingTiles() const { return m_pRatingJob != nullptr; }
-	// Rates the tiles directly, -1 for none, like the spot ratings would.
+	// Rates the tiles directly, UNRATED for none, like the spot ratings would.
 	// For tests, whose maps differ from their files.
-	void SetTileDifficulties(std::vector<float> vDifficulties) { UseTileDifficulties(std::move(vDifficulties)); }
+	void SetTileDifficulties(const std::vector<float> &vDifficulties) { UseTileDifficulties(vDifficulties); }
 	int SnapPlayerScore(int SnappingClient, CPlayer *pPlayer) override;
 	bool HasTimeScore() const override { return false; }
 	CFinishTime SnapPlayerTime(int SnappingClient, CPlayer *pPlayer) override { return CFinishTime::Unset(); }

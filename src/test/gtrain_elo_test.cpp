@@ -50,6 +50,24 @@ TEST(GTrainElo, CapturePoints)
 	EXPECT_EQ(CapturePoints(DERANGED_STEP, 100, 1), CapturePoints(DERANGED_STEP, 100, 1000));
 }
 
+TEST(GTrainElo, CapturesOfRatedTilesEarnTheirSum)
+{
+	// Each tile earns by its own step, times the distance multiplier: a
+	// capture without tile ratings counts every goal tile at the map's step.
+	EXPECT_DOUBLE_EQ(RatedTilePoints(0), 50);
+	EXPECT_DOUBLE_EQ(RatedTilePoints(7.5), PointsPerTile(7.5) / 2);
+	EXPECT_DOUBLE_EQ(DistanceMultiplier(100), 1);
+	EXPECT_DOUBLE_EQ(DistanceMultiplier(400), 2);
+	EXPECT_EQ(CapturePointsOfTiles(PointsPerTile(0) + PointsPerTile(14), 7.0, false, 100, 100 / ((EASY_TILES_PER_SECOND + EXTREME_TILES_PER_SECOND) / 2)),
+		std::llround(PointsPerTile(0) + PointsPerTile(14)));
+	EXPECT_EQ(CapturePointsOfTiles(1000, 0.0, false, 400, 400 / EASY_TILES_PER_SECOND), 2000);
+	for(const int Distance : {50, 100, 237, 500})
+		EXPECT_EQ(CapturePointsOfTiles(Distance * PointsPerTile(9), 9.0, false, Distance, 7.5), CapturePoints(9, Distance, 7.5)) << Distance;
+	// Only the step's typical speed matters for the speed factor.
+	EXPECT_EQ(CapturePointsOfTiles(1000, EXTREME_STEP, false, 100, 100 / (2 * EXTREME_TILES_PER_SECOND)), 2000);
+	EXPECT_EQ(CapturePointsOfTiles(1000, DERANGED_STEP, true, 100, 1), 1000);
+}
+
 TEST(GTrainElo, LongerGoalsEarnMoreThanTheirLength)
 {
 	// At the same speed, twice the distance earns 2^DISTANCE_EXPONENT times the points.

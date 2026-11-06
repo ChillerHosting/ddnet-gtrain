@@ -7,8 +7,8 @@
 #include <cmath>
 #include <cstdint>
 
-// GTrain captures earn points: the goal's distance in tiles, worth more on
-// every difficulty step of the map and when captured fast. ELO shows a
+// GTrain captures earn points: the tiles they went through, each worth more on
+// every difficulty step, on long goals and when captured fast. ELO shows a
 // player's total points on a logarithmic scale up to MAX_ELO: it grows by the
 // same amount whenever they double, which harder maps make them do faster.
 namespace GTrainElo
@@ -55,6 +55,16 @@ namespace GTrainElo
 		return POINTS_PER_TILE * std::pow(STEP_MULTIPLIER, Step);
 	}
 
+	// Captures go through more tiles than their goal is long, and adding up
+	// the tiles makes the hard ones count for more than their mean did: on
+	// the lain runs, rated tiles earned 2.2 times as much that way. They earn
+	// half the points per tile instead.
+	inline constexpr double RATED_TILE_DIVISOR = 2.0;
+	inline double RatedTilePoints(double Step)
+	{
+		return PointsPerTile(Step) / RATED_TILE_DIVISOR;
+	}
+
 	// The capture's speed relative to the typical one of its difficulty.
 	// Deranged maps have no speed bonus, every capture counts as typical.
 	inline double SpeedFactor(double Step, bool Deranged, int Distance, double Seconds)
@@ -69,9 +79,11 @@ namespace GTrainElo
 		return SpeedFactor((double)Step, Step == DERANGED_STEP, Distance, Seconds);
 	}
 
-	// With rated tiles (see CGTrainTileRatings), the step of a capture comes
-	// from the mean difficulty of the tiles it went through instead of the
-	// map's category and stars. These are the mean difficulties along the
+	// With rated tiles (see CGTrainTileRatings), every tile a capture went
+	// through earns by its own step instead of the map's category and stars.
+	// The steps come from the tiles' difficulties along this curve, which
+	// is only checked on means: those of whole races. These are the mean
+	// difficulties along the
 	// races of the KoG maps of steps 0 to 14, fitted as a curve over the
 	// steps, so that the maps of each category and stars come out at that
 	// step on average: 0.59 steps off over 664 maps, 95% of them within 1.5.
@@ -102,15 +114,29 @@ namespace GTrainElo
 	}
 
 	// Long goals are harder than their length, every tile is another chance
-	// to fail. Twice the distance earns 2^1.5, about 2.8 times the points.
-	// Goals of the default 100 tiles earn the points per tile.
+	// to fail. Twice the distance earns 2^1.5, about 2.8 times the points:
+	// twice the tiles, each worth sqrt(2) times as much. Goals of the default
+	// 100 tiles earn the points per tile.
 	inline constexpr double DISTANCE_EXPONENT = 1.5;
 	inline constexpr double REFERENCE_DISTANCE = 100;
 
+	inline double DistanceMultiplier(int Distance)
+	{
+		return std::pow(Distance / REFERENCE_DISTANCE, DISTANCE_EXPONENT - 1);
+	}
+
+	// A capture earns the points of the tiles it went through, more on long
+	// goals and when fast. Step is the difficulty of the capture as a whole,
+	// which sets its typical speed.
+	inline int64_t CapturePointsOfTiles(double TilePoints, double Step, bool Deranged, int Distance, double Seconds)
+	{
+		return std::llround(TilePoints * DistanceMultiplier(Distance) * SpeedFactor(Step, Deranged, Distance, Seconds));
+	}
+	// Every tile of the goal's distance at the same step, for maps without
+	// tile ratings.
 	inline int64_t CapturePoints(double Step, bool Deranged, int Distance, double Seconds)
 	{
-		const double Tiles = REFERENCE_DISTANCE * std::pow(Distance / REFERENCE_DISTANCE, DISTANCE_EXPONENT);
-		return std::llround(Tiles * PointsPerTile(Step) * SpeedFactor(Step, Deranged, Distance, Seconds));
+		return CapturePointsOfTiles(Distance * PointsPerTile(Step), Step, Deranged, Distance, Seconds);
 	}
 	inline int64_t CapturePoints(int Step, int Distance, double Seconds)
 	{

@@ -149,10 +149,45 @@ float CGTrainTileRatings::SpotDifficulty(int Spot) const
 
 std::vector<float> CGTrainTileRatings::TileDifficulties() const
 {
-	std::vector<float> vDifficulties((size_t)m_Width * m_Height, -1.0f);
+	std::vector<float> vDifficulties((size_t)m_Width * m_Height, UNRATED);
 	for(int Spot = 0; Spot < (int)m_vSpots.size(); ++Spot)
 		vDifficulties[m_vSpots[Spot]] = SpotDifficulty(Spot);
 	return vDifficulties;
+}
+
+std::vector<float> BlurTileDifficulties(const std::vector<float> &vDifficulties, int Width, int Radius)
+{
+	if(Width <= 0 || Radius <= 0)
+		return vDifficulties;
+	const int Height = (int)(vDifficulties.size() / Width);
+	std::vector<std::pair<int, int>> vOffsets;
+	for(int y = -Radius; y <= Radius; ++y)
+		for(int x = -Radius; x <= Radius; ++x)
+			if(x * x + y * y <= Radius * Radius + Radius)
+				vOffsets.emplace_back(x, y);
+	std::vector<float> vBlurred(vDifficulties.size(), CGTrainTileRatings::UNRATED);
+	for(int y = 0; y < Height; ++y)
+		for(int x = 0; x < Width; ++x)
+		{
+			if(!CGTrainTileRatings::IsRated(vDifficulties[(size_t)y * Width + x]))
+				continue;
+			double Sum = 0;
+			int Count = 0;
+			for(const auto &[OffsetX, OffsetY] : vOffsets)
+			{
+				const int OtherX = x + OffsetX, OtherY = y + OffsetY;
+				if(OtherX < 0 || OtherY < 0 || OtherX >= Width || OtherY >= Height)
+					continue;
+				const float Difficulty = vDifficulties[(size_t)OtherY * Width + OtherX];
+				if(CGTrainTileRatings::IsRated(Difficulty))
+				{
+					Sum += Difficulty;
+					++Count;
+				}
+			}
+			vBlurred[(size_t)y * Width + x] = (float)(Sum / Count);
+		}
+	return vBlurred;
 }
 
 bool CGTrainTileRatings::Save(const char *pFilename) const

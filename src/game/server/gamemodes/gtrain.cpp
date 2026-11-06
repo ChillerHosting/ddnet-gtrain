@@ -422,17 +422,17 @@ void CGameControllerGTrain::TrackTouchedTile(CCharacter *pChr)
 	if(Pos.x < 0 || Pos.y < 0 || Pos.x >= Width * 32.0f || Pos.y >= Height * 32.0f)
 		return;
 	const int Index = (int)(Pos.y / 32) * Width + (int)(Pos.x / 32);
-	if(m_vTileDifficulties[Index] >= 0 && (Attempt.m_vTouchedTiles.empty() || Attempt.m_vTouchedTiles.back() != Index))
+	if(CGTrainTileRatings::IsRated(m_vTileDifficulties[Index]) && (Attempt.m_vTouchedTiles.empty() || Attempt.m_vTouchedTiles.back() != Index))
 		Attempt.m_vTouchedTiles.push_back(Index);
 }
 
-void CGameControllerGTrain::UseTileDifficulties(std::vector<float> vDifficulties)
+void CGameControllerGTrain::UseTileDifficulties(const std::vector<float> &vDifficulties)
 {
-	m_vTileDifficulties = std::move(vDifficulties);
+	m_vTileDifficulties = BlurTileDifficulties(vDifficulties, GameServer()->Collision()->GetWidth(), TILE_BLUR_RADIUS);
 	double Sum = 0;
 	int NumRated = 0;
 	for(const float Difficulty : m_vTileDifficulties)
-		if(Difficulty >= 0)
+		if(CGTrainTileRatings::IsRated(Difficulty))
 		{
 			Sum += Difficulty;
 			++NumRated;
@@ -440,13 +440,19 @@ void CGameControllerGTrain::UseTileDifficulties(std::vector<float> vDifficulties
 	m_MapTileStep = GTrainElo::TileStep(NumRated ? Sum / NumRated : 0.0);
 }
 
+std::vector<int> CGameControllerGTrain::UniqueTouchedTiles(const CAttempt &Attempt)
+{
+	std::vector<int> vTiles = Attempt.m_vTouchedTiles;
+	std::sort(vTiles.begin(), vTiles.end());
+	vTiles.erase(std::unique(vTiles.begin(), vTiles.end()), vTiles.end());
+	return vTiles;
+}
+
 std::optional<double> CGameControllerGTrain::TouchedTileDifficulty(const CAttempt &Attempt) const
 {
 	if(m_vTileDifficulties.empty() || Attempt.m_vTouchedTiles.empty())
 		return std::nullopt;
-	std::vector<int> vTiles = Attempt.m_vTouchedTiles;
-	std::sort(vTiles.begin(), vTiles.end());
-	vTiles.erase(std::unique(vTiles.begin(), vTiles.end()), vTiles.end());
+	const std::vector<int> vTiles = UniqueTouchedTiles(Attempt);
 	double Sum = 0;
 	for(const int Index : vTiles)
 		Sum += m_vTileDifficulties[Index];
@@ -456,6 +462,15 @@ std::optional<double> CGameControllerGTrain::TouchedTileDifficulty(const CAttemp
 double CGameControllerGTrain::CaptureStep(const CAttempt &Attempt) const
 {
 	return GTrainElo::TileStep(TouchedTileDifficulty(Attempt).value_or(0.0));
+}
+
+double CGameControllerGTrain::TouchedTilePoints(const CAttempt &Attempt) const
+{
+	// Tiles passed frozen were never added, so being carried earns nothing.
+	double Points = 0;
+	for(const int Index : UniqueTouchedTiles(Attempt))
+		Points += GTrainElo::RatedTilePoints(GTrainElo::TileStep(m_vTileDifficulties[Index]));
+	return Points;
 }
 
 void CGameControllerGTrain::AppendCaptureStep(char *pBuf, int BufSize, const CAttempt &Attempt) const
@@ -475,8 +490,9 @@ std::optional<CGameControllerGTrain::CEloGain> CGameControllerGTrain::AwardElo(i
 	const int Distance = Attempt.m_pGoal->m_Distance;
 	// The tiles tell how hard the capture was. Without them, the map's
 	// category and stars do.
+	const bool ByTiles = m_EloCategory && !m_vTileDifficulties.empty();
 	std::optional<double> Step;
-	if(m_EloCategory && !m_vTileDifficulties.empty())
+	if(ByTiles)
 		Step = CaptureStep(Attempt);
 	else if(m_EloStep)
 		Step = *m_EloStep;
@@ -496,7 +512,8 @@ std::optional<CGameControllerGTrain::CEloGain> CGameControllerGTrain::AwardElo(i
 		return CEloGain{0.0, 0.0, "goal under 100 tiles"};
 	const double Seconds = (Server()->Tick() - Attempt.m_StartTick) / (double)Server()->TickSpeed();
 	CGTrainStats Gain;
-	Gain.m_Points = GTrainElo::CapturePoints(*Step, IsDeranged(), Distance, Seconds);
+	Gain.m_Points = ByTiles ? GTrainElo::CapturePointsOfTiles(TouchedTilePoints(Attempt), *Step, IsDeranged(), Distance, Seconds) :
+				  GTrainElo::CapturePoints(*Step, IsDeranged(), Distance, Seconds);
 	const double EloBefore = GTrainElo::FromPoints(m_aStats[ClientId].m_Points);
 	AddStats(ClientId, Gain);
 	return CEloGain{GTrainElo::FromPoints(m_aStats[ClientId].m_Points) - EloBefore, GTrainElo::SpeedFactor(*Step, IsDeranged(), Distance, Seconds), nullptr, Gain.m_Points};

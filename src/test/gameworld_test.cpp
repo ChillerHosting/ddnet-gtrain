@@ -3476,6 +3476,8 @@ TEST_F(GameWorld, GTrainCapturesEarnByTheirTiles)
 {
 	PrepareTrainingCorridor();
 	g_Config.m_SvSpamprotection = 0;
+	// Far enough for the goal's tile to keep its own rating in the blur.
+	g_Config.m_SvGtrainGoalDistance = 8;
 	CCollision *pCollision = GameServer()->Collision();
 	const int Width = pCollision->GetWidth();
 	const int Runner = SpawnTrainingPlayers({"Runner"})[0];
@@ -3489,7 +3491,7 @@ TEST_F(GameWorld, GTrainCapturesEarnByTheirTiles)
 	{
 		const int StartX = TileX(GameServer()->GetPlayerChar(Runner)->m_Pos);
 		Direction = TileX(TrainingGoal(Runner)) > StartX ? 1 : -1;
-		if(StartX - 2 * Direction >= 2 && StartX - 2 * Direction <= Width - 3)
+		if(StartX - 2 * Direction >= 2 && StartX - 2 * Direction <= Width - 3 && std::abs(TileX(TrainingGoal(Runner)) - StartX) >= 7)
 			break;
 		GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_SELF);
 		GameServer()->m_apPlayers[Runner]->ForceSpawn(vec2(80, 80));
@@ -3502,12 +3504,13 @@ TEST_F(GameWorld, GTrainCapturesEarnByTheirTiles)
 	const int Distance = std::abs(TileX(Goal) - TileX(Start));
 	const vec2 Behind = Start - vec2(32.0f * Direction, 0), FarBehind = Start - vec2(64.0f * Direction, 0);
 	const auto &aSteps = GTrainElo::TILE_STEP_DIFFICULTIES;
-	std::vector<float> vDifficulties((size_t)Width * pCollision->GetHeight(), -1.0f);
+	std::vector<float> vDifficulties((size_t)Width * pCollision->GetHeight(), CGTrainTileRatings::UNRATED);
 	const auto Rate = [&](vec2 Pos, float Difficulty) { vDifficulties[pCollision->GetPureMapIndex(Pos)] = Difficulty; };
 	Rate(Start, aSteps[6]);
 	Rate(Behind, aSteps[8]);
 	Rate(FarBehind, aSteps[14]); // only reached frozen
-	Rate(Goal, aSteps[7]);
+	// The easiest spots are rated below 0, they count all the same.
+	Rate(Goal, -2.0f);
 	pController->SetTileDifficulties(vDifficulties);
 
 	const auto MoveTo = [&](vec2 Pos) {
@@ -3530,14 +3533,50 @@ TEST_F(GameWorld, GTrainCapturesEarnByTheirTiles)
 	MoveTo(Start); // each tile counts once
 	const std::string Messages = MoveTo(Goal);
 
-	// The start, the tile behind it and the goal, about Hard with two stars.
-	const double Step = GTrainElo::TileStep((aSteps[6] + aSteps[7] + aSteps[8]) / 3);
-	EXPECT_NEAR(Step, 7, 0.1);
+	// The start, the tile behind it and the goal earn by their own blurred
+	// steps, their mean sets the typical speed. The Extreme tile passed frozen
+	// earns nothing, it only makes the tiles near it harder.
+	const std::vector<float> vBlurred = BlurTileDifficulties(vDifficulties, Width, 3);
+	const auto Blurred = [&](vec2 Pos) { return (double)vBlurred[pCollision->GetPureMapIndex(Pos)]; };
+	EXPECT_GT(Blurred(Behind), aSteps[8]);
+	EXPECT_FLOAT_EQ(Blurred(Goal), -2.0f);
+	const double Step = GTrainElo::TileStep((Blurred(Start) + Blurred(Behind) + Blurred(Goal)) / 3);
 	const double Seconds = GTrainElo::MIN_SECONDS;
+	double TilePoints = 0;
+	for(const vec2 Pos : {Start, Behind, Goal})
+		TilePoints += GTrainElo::RatedTilePoints(GTrainElo::TileStep(Blurred(Pos)));
+	const int64_t Points = GTrainElo::CapturePointsOfTiles(TilePoints, Step, false, Distance, Seconds);
+	EXPECT_EQ(Points, std::llround(TilePoints * std::sqrt(Distance / 100.0) * GTrainElo::SpeedFactor(Step, false, Distance, Seconds)));
+	EXPECT_EQ(pController->Stats(Runner).m_Points, Points);
+	char aStep[64];
+	CGameControllerGTrain::FormatStep(aStep, sizeof(aStep), Step);
 	char aExpected[128];
-	str_format(aExpected, sizeof(aExpected), "(0 fails, +%.2f ELO, %.1fx speed, Hard ★★☆)",
-		GTrainElo::FromPoints(GTrainElo::CapturePoints(Step, false, Distance, Seconds)), GTrainElo::SpeedFactor(Step, false, Distance, Seconds));
+	str_format(aExpected, sizeof(aExpected), "(0 fails, +%.2f ELO, %.1fx speed, %s)",
+		GTrainElo::FromPoints(Points), GTrainElo::SpeedFactor(Step, false, Distance, Seconds), aStep);
 	EXPECT_TRUE(str_find(Messages.c_str(), aExpected)) << Messages << "\nexpected " << aExpected;
+}
+
+TEST(GTrainTiles, BlurAveragesTheRatedTilesAround)
+{
+	// 7x3 tiles, U without a rating. Ratings below 0 are ratings too.
+	constexpr float U = CGTrainTileRatings::UNRATED;
+	const std::vector<float> vTiles = {
+		1, 1, U, U, U, U, 9,
+		1, 4, U, U, -2, U, U,
+		1, 1, U, U, U, U, U};
+	const std::vector<float> vRadius1 = BlurTileDifficulties(vTiles, 7, 1);
+	// A disc: radius 1 takes the diagonals too (1 + 1 <= 1 + 1).
+	EXPECT_FLOAT_EQ(vRadius1[7 + 1], (5 + 4) / 6.0f);
+	EXPECT_FLOAT_EQ(vRadius1[0], (3 + 4) / 4.0f);
+	EXPECT_FLOAT_EQ(vRadius1[6], 9); // alone, at the edge
+	EXPECT_EQ(vRadius1[2], U); // unrated stays unrated
+	EXPECT_FLOAT_EQ(vRadius1[7 + 4], -2);
+	EXPECT_EQ(BlurTileDifficulties(vTiles, 7, 0), vTiles);
+	// Radius 5 reaches the lone tile from the second column, 5 tiles away,
+	// two rows down too (25 + 4 <= 25 + 5), but not from the first.
+	const std::vector<float> vRadius5 = BlurTileDifficulties(vTiles, 7, 5);
+	EXPECT_FLOAT_EQ(vRadius5[6], (9 + 1 + 4 + 1 - 2) / 5.0f);
+	EXPECT_FLOAT_EQ(vRadius5[14], (5 + 4 - 2) / 7.0f);
 }
 
 TEST_F(GameWorld, GTrainTileStepsFollowTheKoGRatings)
