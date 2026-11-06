@@ -64,6 +64,14 @@ class CGameControllerGTrain : public CGameControllerDDNet
 	std::unique_ptr<CGTrainTileRatingJob> m_pRatingJob;
 	// put into spectators while rating, to put back into the game once done
 	bool m_aRatingSpectators[MAX_CLIENTS] = {};
+	struct CEloGain
+	{
+		double m_Elo;
+		double m_SpeedFactor;
+		// why the capture earns nothing, like being frozen
+		const char *m_pNoElo = nullptr;
+		int64_t m_Points = 0;
+	};
 	struct CAttempt
 	{
 		std::shared_ptr<CGTrainGoal> m_pGoal;
@@ -91,6 +99,19 @@ class CGameControllerGTrain : public CGameControllerDDNet
 		// Rated tiles the tee was on unfrozen since the release, a tile again
 		// only after another one. Captures earn by each of them once.
 		std::vector<int> m_vTouchedTiles;
+		// Team members reaching their flag keep playing until every flag is
+		// taken, which ends the attempt. What they earn waits until then.
+		int m_CaptureTick = -1;
+		std::optional<CEloGain> m_TeamGain;
+		// the teammate the hook held at the release, for the team's run
+		int m_RunHookedPlayer = -1;
+	};
+	// A team's flags around its goal, one for each member, any member takes
+	// any one of them.
+	struct CTeamFlag
+	{
+		int m_Node = -1;
+		int m_Collector = -1;
 	};
 	// Fight leaders choose these for their whole group. Leaving players and
 	// promoted leaders keep the group's settings.
@@ -121,13 +142,16 @@ class CGameControllerGTrain : public CGameControllerDDNet
 	int m_aFightBreakEndTick[MAX_CLIENTS] = {};
 	int m_aFightWins[MAX_CLIENTS] = {};
 	CSettings m_aSettings[MAX_CLIENTS];
+	// By group, empty for groups that are no team.
+	std::vector<CTeamFlag> m_avTeamFlags[MAX_CLIENTS];
 	// Every viewer chooses this for themselves, also in fights.
 	bool m_aHideTrail[MAX_CLIENTS] = {};
 	bool m_SyncFightDeaths = false;
 	// switch number of the hover doors, -1 without door collision
 	int m_DoorSwitch = -1;
 	std::array<std::optional<int>, MAX_CLIENTS> m_aDoorSnapIds;
-	std::optional<int> m_FlagSnapId;
+	// one for each flag a team can have
+	std::array<std::optional<int>, MAX_CLIENTS> m_aFlagSnapIds;
 	std::array<std::optional<int>, NUM_DIRECTION_PARTICLES> m_aDirectionSnapIds;
 	std::shared_ptr<CScoreMapDifficultyResult> m_pMapDifficultyResult;
 	// Difficulty step of the map for capture points, unset on maps without
@@ -158,6 +182,15 @@ class CGameControllerGTrain : public CGameControllerDDNet
 	void RestartFight(int Group, std::optional<int> ChosenStart = std::nullopt);
 	void PlaceGroup(int Group, const std::shared_ptr<CGTrainGoal> &pGoal, int Start, int TargetDistance, bool Retry);
 	std::vector<int> TeamStarts(const CGTrainGoal &Goal, int Start, int Count);
+	// Spots around the goal, spread like the team's starts.
+	std::vector<int> TeamFlagNodes(int Goal, int Count);
+	// The team's flags, if the player plays one of them.
+	const std::vector<CTeamFlag> *TeamFlags(int ClientId) const;
+	bool ReachedFlag(class CCharacter *pChr, vec2 Flag) const;
+	void CollectTeamFlag(class CCharacter *pChr, CTeamFlag &Flag);
+	// Everyone gets what they earned once the last flag is taken.
+	void FinishTeamRun(int Group);
+	void SaveTeamRun(int Group, const std::vector<int> &vMembers);
 	bool LeaveFight(int ClientId, bool NewAttempt);
 	int FightSize(int Group) const;
 	bool InTeam(int ClientId) const { return m_aTeamGroup[m_aFightGroup[ClientId]]; }
@@ -174,17 +207,12 @@ class CGameControllerGTrain : public CGameControllerDDNet
 	void SendFightChat(int Group, const char *pMessage);
 	void KeepWeapons(class CCharacter *pChr);
 	void UpdateFightTeams();
-	struct CEloGain
-	{
-		double m_Elo;
-		double m_SpeedFactor;
-		// why the capture earns nothing, like being frozen
-		const char *m_pNoElo = nullptr;
-		int64_t m_Points = 0;
-	};
 	static void FormatCaptureResult(char *pBuf, int BufSize, int Fails, const std::optional<CEloGain> &Gain);
 	// Returns whether the capture won the fight.
 	bool AnnounceFightScore(int Winner, const std::optional<CEloGain> &Gain);
+	// What the capture earns, without adding it yet. Team members share it.
+	std::optional<CEloGain> CaptureGain(int ClientId, bool Frozen);
+	void AddGain(int ClientId, CEloGain &Gain);
 	std::optional<CEloGain> AwardElo(int ClientId, bool Frozen);
 	void AddStats(int ClientId, const CGTrainStats &Stats);
 	void EndAttempt(int ClientId, bool Captured);
@@ -210,7 +238,6 @@ class CGameControllerGTrain : public CGameControllerDDNet
 	double CaptureStep(const CAttempt &Attempt) const;
 	// What the attempt's tiles earn, each once by its own step.
 	double TouchedTilePoints(const CAttempt &Attempt) const;
-
 	void AppendCaptureStep(char *pBuf, int BufSize, const CAttempt &Attempt) const;
 
 public:

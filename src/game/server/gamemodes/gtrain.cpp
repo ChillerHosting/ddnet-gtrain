@@ -38,7 +38,8 @@ CGameControllerGTrain::CGameControllerGTrain(class CGameContext *pGameServer) :
 	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
 		m_aFightGroup[ClientId] = ClientId;
 	std::fill(std::begin(m_aTeamRequest), std::end(m_aTeamRequest), -1);
-	m_FlagSnapId = Server()->SnapNewId();
+	for(auto &SnapId : m_aFlagSnapIds)
+		SnapId = Server()->SnapNewId();
 	for(auto &SnapId : m_aDirectionSnapIds)
 		SnapId = Server()->SnapNewId();
 	for(auto &SnapId : m_aDoorSnapIds)
@@ -77,8 +78,9 @@ CGameControllerGTrain::CGameControllerGTrain(class CGameContext *pGameServer) :
 CGameControllerGTrain::~CGameControllerGTrain()
 {
 	GameServer()->m_World.m_Core.m_RandomHook = nullptr;
-	if(m_FlagSnapId)
-		Server()->SnapFreeId(*m_FlagSnapId);
+	for(auto SnapId : m_aFlagSnapIds)
+		if(SnapId)
+			Server()->SnapFreeId(*SnapId);
 	for(auto SnapId : m_aDirectionSnapIds)
 		if(SnapId)
 			Server()->SnapFreeId(*SnapId);
@@ -413,7 +415,7 @@ void CGameControllerGTrain::TrackTouchedTile(CCharacter *pChr)
 {
 	// Frozen tees go where they are thrown, which takes no skill.
 	CAttempt &Attempt = m_aAttempts[pChr->GetPlayer()->GetCid()];
-	if(m_vTileDifficulties.empty() || !Attempt.m_Running || Attempt.m_StartTick < 0 ||
+	if(m_vTileDifficulties.empty() || !Attempt.m_Running || Attempt.m_StartTick < 0 || Attempt.m_CaptureTick >= 0 ||
 		pChr->m_FreezeTime > 0 || pChr->Core()->m_DeepFrozen || pChr->Core()->m_LiveFrozen)
 		return;
 	const int Width = GameServer()->Collision()->GetWidth();
@@ -483,7 +485,7 @@ void CGameControllerGTrain::AppendCaptureStep(char *pBuf, int BufSize, const CAt
 	str_append(pBuf, aStep, BufSize);
 }
 
-std::optional<CGameControllerGTrain::CEloGain> CGameControllerGTrain::AwardElo(int ClientId, bool Frozen)
+std::optional<CGameControllerGTrain::CEloGain> CGameControllerGTrain::CaptureGain(int ClientId, bool Frozen)
 {
 	// The goal's path distance, never more than the chosen goal distance.
 	const CAttempt &Attempt = m_aAttempts[ClientId];
@@ -498,9 +500,6 @@ std::optional<CGameControllerGTrain::CEloGain> CGameControllerGTrain::AwardElo(i
 		Step = *m_EloStep;
 	if(!Step || Distance <= 0 || ((CConsole *)GameServer()->Console())->Cheated())
 		return std::nullopt;
-	// Teammates can carry each other through anything.
-	if(InTeam(ClientId))
-		return CEloGain{0.0, 0.0, "team"};
 	// Frozen tees still capture, but only reaching the flag in control earns,
 	// and only without the help of kept weapons.
 	if(Frozen)
@@ -511,12 +510,29 @@ std::optional<CGameControllerGTrain::CEloGain> CGameControllerGTrain::AwardElo(i
 	if(IsDeranged() && Attempt.m_TargetDistance < DERANGED_MIN_GOAL_DISTANCE)
 		return CEloGain{0.0, 0.0, "goal under 100 tiles"};
 	const double Seconds = (Server()->Tick() - Attempt.m_StartTick) / (double)Server()->TickSpeed();
-	CGTrainStats Gain;
-	Gain.m_Points = ByTiles ? GTrainElo::CapturePointsOfTiles(TouchedTilePoints(Attempt), *Step, IsDeranged(), Distance, Seconds) :
-				  GTrainElo::CapturePoints(*Step, IsDeranged(), Distance, Seconds);
+	int64_t Points = ByTiles ? GTrainElo::CapturePointsOfTiles(TouchedTilePoints(Attempt), *Step, IsDeranged(), Distance, Seconds) :
+				   GTrainElo::CapturePoints(*Step, IsDeranged(), Distance, Seconds);
+	// Teams earn what one player would, shared by everyone in them.
+	if(const std::vector<CTeamFlag> *pFlags = TeamFlags(ClientId))
+		Points = std::llround(Points / (double)pFlags->size());
+	return CEloGain{0.0, GTrainElo::SpeedFactor(*Step, IsDeranged(), Distance, Seconds), nullptr, Points};
+}
+
+void CGameControllerGTrain::AddGain(int ClientId, CEloGain &Gain)
+{
+	CGTrainStats Stats;
+	Stats.m_Points = Gain.m_Points;
 	const double EloBefore = GTrainElo::FromPoints(m_aStats[ClientId].m_Points);
-	AddStats(ClientId, Gain);
-	return CEloGain{GTrainElo::FromPoints(m_aStats[ClientId].m_Points) - EloBefore, GTrainElo::SpeedFactor(*Step, IsDeranged(), Distance, Seconds), nullptr, Gain.m_Points};
+	AddStats(ClientId, Stats);
+	Gain.m_Elo = GTrainElo::FromPoints(m_aStats[ClientId].m_Points) - EloBefore;
+}
+
+std::optional<CGameControllerGTrain::CEloGain> CGameControllerGTrain::AwardElo(int ClientId, bool Frozen)
+{
+	std::optional<CEloGain> Gain = CaptureGain(ClientId, Frozen);
+	if(Gain && !Gain->m_pNoElo)
+		AddGain(ClientId, *Gain);
+	return Gain;
 }
 
 void CGameControllerGTrain::BanRuns(const char *pMap, const char *pName, bool Ban)
@@ -619,6 +635,9 @@ void CGameControllerGTrain::PlaceForAttempt(CPlayer *pPlayer, const std::shared_
 	if(!SameSpot)
 		Attempt.m_SpotTried = false;
 	Attempt.m_WithWeapons = false;
+	Attempt.m_CaptureTick = -1;
+	Attempt.m_TeamGain.reset();
+	Attempt.m_RunHookedPlayer = -1;
 	Attempt.m_pGoal = pGoal;
 	Attempt.m_Start = Start;
 	Attempt.m_TargetDistance = TargetDistance;
@@ -865,6 +884,11 @@ void CGameControllerGTrain::PlaceGroup(int Group, const std::shared_ptr<CGTrainG
 	}
 	// Fights race from the same spot, solo. Teammates would collide there.
 	const std::vector<int> vStarts = m_aTeamGroup[Group] ? TeamStarts(*pGoal, Start, vMembers.size()) : std::vector<int>(vMembers.size(), Start);
+	// Each teammate takes a flag of the team's, retries put them back.
+	m_avTeamFlags[Group].clear();
+	if(m_aTeamGroup[Group] && pGoal->m_Ready && !m_aSettings[Group].m_Freeplay)
+		for(const int Node : TeamFlagNodes(pGoal->m_Goal, vMembers.size()))
+			m_avTeamFlags[Group].push_back({Node, -1});
 	m_SyncFightDeaths = true;
 	for(size_t i = 0; i < vMembers.size(); ++i)
 		PlaceForAttempt(GameServer()->m_apPlayers[vMembers[i]], pGoal, vStarts[i], TargetDistance, Retry);
@@ -918,9 +942,167 @@ std::vector<int> CGameControllerGTrain::TeamStarts(const CGTrainGoal &Goal, int 
 	return vStarts;
 }
 
+std::vector<int> CGameControllerGTrain::TeamFlagNodes(int Goal, int Count)
+{
+	// Spots reachable from the goal are reachable wherever it is, the closest
+	// first. Where the map runs out of spots, the rest share the goal.
+	std::vector<int> vFlags = {Goal};
+	const vec2 GoalPos = m_Map.m_PathGraph.m_vNodes[Goal].m_Pos;
+	std::vector<int> vNearby;
+	m_Pathfinder.FindReachable({Goal}, TEAM_SPOT_RANGE, vNearby);
+	for(const int Node : vNearby)
+	{
+		if((int)vFlags.size() >= Count)
+			break;
+		const vec2 Pos = m_Map.m_PathGraph.m_vNodes[Node].m_Pos;
+		if(!m_Map.m_PathGraph.m_vNodes[Node].m_Goal || distance(Pos, GoalPos) > TEAM_SPOT_RANGE * 32)
+			continue;
+		if(std::all_of(vFlags.begin(), vFlags.end(), [&](int Other) { return distance(Pos, m_Map.m_PathGraph.m_vNodes[Other].m_Pos) >= TEAM_SPOT_SPACING * 32; }))
+			vFlags.push_back(Node);
+	}
+	vFlags.resize(std::max(Count, 1), Goal);
+	return vFlags;
+}
+
+const std::vector<CGameControllerGTrain::CTeamFlag> *CGameControllerGTrain::TeamFlags(int ClientId) const
+{
+	const int Group = m_aFightGroup[ClientId];
+	return m_aTeamGroup[Group] && !m_avTeamFlags[Group].empty() ? &m_avTeamFlags[Group] : nullptr;
+}
+
+bool CGameControllerGTrain::ReachedFlag(CCharacter *pChr, vec2 Flag) const
+{
+	// Check the movement segment too, so a fast tee cannot skip the flag.
+	// A teleport's long displacement must not collect a flag along the way.
+	vec2 Closest = pChr->m_Pos;
+	const vec2 Movement = pChr->m_Pos - pChr->m_PrevPos;
+	const float MovementSquared = dot(Movement, Movement);
+	if(MovementSquared > 0 && MovementSquared <= 256.0f * 256.0f)
+		Closest = pChr->m_PrevPos + Movement * std::clamp(dot(Flag - pChr->m_PrevPos, Movement) / MovementSquared, 0.0f, 1.0f);
+	const vec2 Offset = Closest - Flag;
+	return dot(Offset, Offset) < 42.0f * 42.0f;
+}
+
+void CGameControllerGTrain::CollectTeamFlag(CCharacter *pChr, CTeamFlag &Flag)
+{
+	// The member keeps playing to help the others, their tiles and time end
+	// here. Frozen members take flags too, they only earn nothing.
+	const int ClientId = pChr->GetPlayer()->GetCid();
+	const int Group = m_aFightGroup[ClientId];
+	CAttempt &Attempt = m_aAttempts[ClientId];
+	Flag.m_Collector = ClientId;
+	Attempt.m_CaptureTick = Server()->Tick();
+	Attempt.m_TeamGain = CaptureGain(ClientId, pChr->m_FreezeTime > 0 || pChr->Core()->m_DeepFrozen || pChr->Core()->m_LiveFrozen);
+	const std::vector<CTeamFlag> &vFlags = m_avTeamFlags[Group];
+	const int Left = std::count_if(vFlags.begin(), vFlags.end(), [](const CTeamFlag &Other) { return Other.m_Collector < 0; });
+	if(Left == 0)
+	{
+		FinishTeamRun(Group);
+		return;
+	}
+	char aMessage[128];
+	str_format(aMessage, sizeof(aMessage), "'%s' took a flag, %d left.", Server()->ClientName(ClientId), Left);
+	SendFightChat(Group, aMessage);
+	if(Server()->IsSixup(ClientId))
+		GameServer()->CreateSound(pChr->m_Pos, SOUND_CTF_CAPTURE, CClientMask().set(ClientId));
+	else
+		GameServer()->CreateSoundGlobal(SOUND_CTF_CAPTURE, ClientId);
+}
+
+void CGameControllerGTrain::FinishTeamRun(int Group)
+{
+	// Everyone earns their capture now, in the order they took their flags.
+	std::vector<int> vMembers;
+	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
+		if(m_aFightGroup[ClientId] == Group && GameServer()->GetPlayerChar(ClientId) && m_aAttempts[ClientId].m_CaptureTick >= 0)
+			vMembers.push_back(ClientId);
+	std::stable_sort(vMembers.begin(), vMembers.end(), [&](int A, int B) { return m_aAttempts[A].m_CaptureTick < m_aAttempts[B].m_CaptureTick; });
+	for(const int ClientId : vMembers)
+	{
+		std::optional<CEloGain> &Gain = m_aAttempts[ClientId].m_TeamGain;
+		if(Gain && !Gain->m_pNoElo)
+			AddGain(ClientId, *Gain);
+	}
+	SaveTeamRun(Group, vMembers);
+	for(const int ClientId : vMembers)
+	{
+		const CAttempt &Attempt = m_aAttempts[ClientId];
+		char aResult[128];
+		FormatCaptureResult(aResult, sizeof(aResult), Attempt.m_Fails, Attempt.m_TeamGain);
+		AppendCaptureStep(aResult, sizeof(aResult), Attempt);
+		char aMessage[256];
+		const double Seconds = (Attempt.m_CaptureTick - Attempt.m_StartTick) / (double)Server()->TickSpeed();
+		str_format(aMessage, sizeof(aMessage), "'%s' captured a flag for their team in %.2f seconds (%s).", Server()->ClientName(ClientId), Seconds, aResult);
+		GameServer()->SendChat(-1, TEAM_ALL, aMessage);
+		EndAttempt(ClientId, true);
+	}
+	for(const int ClientId : vMembers)
+	{
+		if(Server()->IsSixup(ClientId))
+			GameServer()->CreateSound(GameServer()->GetPlayerChar(ClientId)->m_Pos, SOUND_CTF_CAPTURE, CClientMask().set(ClientId));
+		else
+			GameServer()->CreateSoundGlobal(SOUND_CTF_CAPTURE, ClientId);
+	}
+	RestartFight(Group);
+}
+
+void CGameControllerGTrain::SaveTeamRun(int Group, const std::vector<int> &vMembers)
+{
+	// Like solo runs, only captures earning ELO are stored, each member's in
+	// a row of their own with the whole team's run, which needs every
+	// member's run from the same release on.
+	if(!g_Config.m_SvGtrainRecordRuns || !GameServer()->Score() || vMembers.empty())
+		return;
+	bool Earned = false;
+	for(const int ClientId : vMembers)
+	{
+		const CAttempt &Attempt = m_aAttempts[ClientId];
+		const CGTrainRun *pFirst = m_aAttempts[vMembers.front()].m_Run ? &*m_aAttempts[vMembers.front()].m_Run : nullptr;
+		if(!Attempt.m_Run || !pFirst || Attempt.m_Run->m_Start.m_Tick != pFirst->m_Start.m_Tick || Attempt.m_Run->m_vInputs.size() != pFirst->m_vInputs.size())
+			return;
+		Earned |= Attempt.m_TeamGain && !Attempt.m_TeamGain->m_pNoElo;
+	}
+	if(!Earned)
+		return;
+	auto pRun = std::make_shared<CGTrainTeamRun>();
+	pRun->m_Team = GameServer()->GetPlayerChar(vMembers.front())->Team();
+	// The world moves its newest characters first.
+	for(CEntity *pEntity = GameServer()->m_World.FindFirst(CGameWorld::ENTTYPE_CHARACTER); pEntity; pEntity = pEntity->TypeNext())
+	{
+		const CCharacter *pChr = static_cast<CCharacter *>(pEntity);
+		const int ClientId = pChr->GetPlayer()->GetCid();
+		if(std::find(vMembers.begin(), vMembers.end(), ClientId) == vMembers.end())
+			continue;
+		const CAttempt &Attempt = m_aAttempts[ClientId];
+		CGTrainTeamRun::CMember &Member = pRun->m_vMembers.emplace_back();
+		str_copy(Member.m_aName, Server()->ClientName(ClientId));
+		Member.m_ClientId = ClientId;
+		Member.m_CaptureTicks = Attempt.m_CaptureTick - Attempt.m_Run->m_Start.m_Tick;
+		Member.m_HookedPlayer = Attempt.m_RunHookedPlayer;
+		Member.m_Run = *Attempt.m_Run;
+		for(const CTeamFlag &Flag : m_avTeamFlags[Group])
+			if(Flag.m_Collector == ClientId)
+				Member.m_Run.m_Goal = m_Map.m_PathGraph.m_vNodes[Flag.m_Node].m_Pos;
+		Member.m_Run.m_EndPos = pChr->Core()->m_Pos;
+		Member.m_Run.m_EndVel = pChr->Core()->m_Vel;
+	}
+	if(pRun->m_vMembers.size() != vMembers.size())
+		return;
+	const std::shared_ptr<const CGTrainTeamRun> pShared = std::move(pRun);
+	for(const CGTrainTeamRun::CMember &Member : pShared->m_vMembers)
+	{
+		const std::optional<CEloGain> &Gain = m_aAttempts[Member.m_ClientId].m_TeamGain;
+		if(Gain && !Gain->m_pNoElo)
+			GameServer()->Score()->SaveGTrainTeamRun(Member.m_aName, m_aAttempts[Member.m_ClientId].m_pGoal->m_Distance, Gain->m_Points, Gain->m_Elo, Gain->m_SpeedFactor, Member.m_CaptureTicks, pShared);
+	}
+}
+
 bool CGameControllerGTrain::LeaveFight(int ClientId, bool NewAttempt)
 {
 	const int Group = m_aFightGroup[ClientId];
+	// Teams start over with flags for whoever is left.
+	m_avTeamFlags[Group].clear();
+	m_avTeamFlags[ClientId].clear();
 	if(FightSize(Group) <= 1)
 	{
 		m_aFightWins[ClientId] = 0;
@@ -1474,7 +1656,7 @@ void CGameControllerGTrain::Help()
 	log_info("chatresp", "/tp, /teleport, /lasttp, /back, /rescue, /invincible: retry like /r, for practice binds");
 	log_info("chatresp", "/tc or /telecursor: retry like /r, in freeplay start where you aim, or in /spec at the middle of your view");
 	log_info("chatresp", "/fight <player>: join a player's fight, /fight alone leaves it");
-	log_info("chatresp", "/team <player>: ask a player to play together, /accept or /a joins, /team alone leaves; teams earn no ELO");
+	log_info("chatresp", "/team <player>: ask a player to play together, /accept or /a joins, /team alone leaves; each member takes a flag and earns a share of ELO");
 	log_info("chatresp", "/distance <%d-%d>: goal distance in tiles, 0 for the server default", MinGoalDistance(), (int)MAX_GOAL_DISTANCE);
 	log_info("chatresp", "/nodj: toggle starting attempts without double jump");
 	log_info("chatresp", "/forwards: toggle goals only leading towards the finish line");
@@ -1659,16 +1841,25 @@ void CGameControllerGTrain::CheckGoal(CCharacter *pChr)
 	CAttempt &Attempt = m_aAttempts[ClientId];
 	const CGTrainGoal &Target = *Attempt.m_pGoal;
 
-	const vec2 Goal = m_Map.m_PathGraph.m_vNodes[Target.m_Goal].m_Pos;
-	// Check the movement segment too, so a fast tee cannot skip the flag.
-	// A teleport's long displacement must not collect a flag along the way.
-	vec2 Closest = pChr->m_Pos;
-	const vec2 Movement = pChr->m_Pos - pChr->m_PrevPos;
-	const float MovementSquared = dot(Movement, Movement);
-	if(MovementSquared > 0 && MovementSquared <= 256.0f * 256.0f)
-		Closest = pChr->m_PrevPos + Movement * std::clamp(dot(Goal - pChr->m_PrevPos, Movement) / MovementSquared, 0.0f, 1.0f);
-	const vec2 GoalOffset = Closest - Goal;
-	if(dot(GoalOffset, GoalOffset) < 42.0f * 42.0f)
+	// Teammates take one flag each, any of the team's.
+	if(m_aTeamGroup[m_aFightGroup[ClientId]])
+	{
+		std::vector<CTeamFlag> &vFlags = m_avTeamFlags[m_aFightGroup[ClientId]];
+		if(vFlags.empty())
+			for(const int Node : TeamFlagNodes(Target.m_Goal, FightSize(m_aFightGroup[ClientId])))
+				vFlags.push_back({Node, -1});
+		if(Attempt.m_CaptureTick >= 0)
+			return;
+		for(CTeamFlag &Flag : vFlags)
+			if(Flag.m_Collector < 0 && ReachedFlag(pChr, m_Map.m_PathGraph.m_vNodes[Flag.m_Node].m_Pos))
+			{
+				CollectTeamFlag(pChr, Flag);
+				return;
+			}
+		return;
+	}
+
+	if(ReachedFlag(pChr, m_Map.m_PathGraph.m_vNodes[Target.m_Goal].m_Pos))
 	{
 		const int Group = m_aFightGroup[ClientId];
 		const bool Frozen = pChr->m_FreezeTime > 0 || pChr->Core()->m_DeepFrozen || pChr->Core()->m_LiveFrozen;
@@ -1677,18 +1868,7 @@ void CGameControllerGTrain::CheckGoal(CCharacter *pChr)
 		if(Gain && !Gain->m_pNoElo)
 			SaveRun(pChr, *Gain);
 		EndAttempt(ClientId, true);
-		if(m_aTeamGroup[Group])
-		{
-			char aResult[128];
-			FormatCaptureResult(aResult, sizeof(aResult), Attempt.m_Fails, Gain);
-			AppendCaptureStep(aResult, sizeof(aResult), Attempt);
-			char aMessage[256];
-			const double Seconds = (Server()->Tick() - Attempt.m_StartTick) / (double)Server()->TickSpeed();
-			str_format(aMessage, sizeof(aMessage), "'%s' captured the flag for their team in %.2f seconds (%s).", Server()->ClientName(ClientId), Seconds, aResult);
-			GameServer()->SendChat(-1, TEAM_ALL, aMessage);
-			RestartFight(Group);
-		}
-		else if(FightSize(Group) > 1)
+		if(FightSize(Group) > 1)
 		{
 			if(AnnounceFightScore(ClientId, Gain))
 				m_aFightBreakEndTick[Group] = Server()->Tick() + FIGHT_BREAK_SECONDS * Server()->TickSpeed();
@@ -1784,14 +1964,26 @@ void CGameControllerGTrain::Snap(int SnappingClient)
 	}
 	if(m_aSettings[m_aFightGroup[ClientId]].m_Freeplay)
 		return;
-	if(!pChr || !Attempt.m_pGoal || !Attempt.m_pGoal->m_Ready || !m_FlagSnapId)
+	if(!pChr || !Attempt.m_pGoal || !Attempt.m_pGoal->m_Ready)
 		return;
-	const vec2 Goal = m_Map.m_PathGraph.m_vNodes[Attempt.m_pGoal->m_Goal].m_Pos;
-	CNetObj_Flag Flag = {};
-	Flag.m_X = (int)Goal.x;
-	Flag.m_Y = (int)Goal.y;
-	Flag.m_Team = TEAM_BLUE;
-	Server()->SnapNewItem(*m_FlagSnapId, Flag);
+	const auto SnapFlag = [&](const std::optional<int> &SnapId, int Node) {
+		if(!SnapId)
+			return;
+		const vec2 Pos = m_Map.m_PathGraph.m_vNodes[Node].m_Pos;
+		CNetObj_Flag Flag = {};
+		Flag.m_X = (int)Pos.x;
+		Flag.m_Y = (int)Pos.y;
+		Flag.m_Team = TEAM_BLUE;
+		Server()->SnapNewItem(*SnapId, Flag);
+	};
+	if(const std::vector<CTeamFlag> *pFlags = TeamFlags(ClientId))
+	{
+		for(size_t i = 0; i < pFlags->size() && i < m_aFlagSnapIds.size(); ++i)
+			if((*pFlags)[i].m_Collector < 0)
+				SnapFlag(m_aFlagSnapIds[i], (*pFlags)[i].m_Node);
+	}
+	else
+		SnapFlag(m_aFlagSnapIds[0], Attempt.m_pGoal->m_Goal);
 
 	// The viewer's choice, also when watching someone else.
 	if(m_aHideTrail[SnappingClient] || Attempt.m_RouteNode < 0 || Attempt.m_vRoute.empty())
@@ -1971,6 +2163,22 @@ void CGameControllerGTrain::Tick()
 		if(m_aFightRestart[Group])
 			RestartFight(Group);
 
+	// The input the server applied in this tick, for every run before a flag
+	// ends any of them, so a team's runs all have it. Replays have no pauses,
+	// in which tees keep their last input, nor weapons changing midway.
+	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
+	{
+		CAttempt &Attempt = m_aAttempts[ClientId];
+		CCharacter *pChr = GameServer()->GetPlayerChar(ClientId);
+		if(!Attempt.m_Run || !pChr || m_aPendingPlace[ClientId])
+			continue;
+		if(pChr->IsPaused() || pChr->GetPlayer()->IsPaused() || (int)Attempt.m_Run->m_vInputs.size() == CGTrainRun::MAX_TICKS ||
+			Attempt.m_Run->m_KeptWeapons != m_aSettings[m_aFightGroup[ClientId]].m_Weapons)
+			Attempt.m_Run.reset();
+		else
+			Attempt.m_Run->m_vInputs.push_back(GameServer()->GetLastPlayerInput(ClientId));
+	}
+
 	for(int ClientId = 0; ClientId < MAX_CLIENTS; ClientId++)
 	{
 		CCharacter *pChr = GameServer()->GetPlayerChar(ClientId);
@@ -2000,16 +2208,6 @@ void CGameControllerGTrain::Tick()
 			continue;
 		}
 		CAttempt &Attempt = m_aAttempts[ClientId];
-		// The input the server applied in this tick. Replays have no pauses,
-		// in which tees keep their last input, nor weapons changing midway.
-		if(Attempt.m_Run)
-		{
-			if(pChr->GetPlayer()->IsPaused() || (int)Attempt.m_Run->m_vInputs.size() == CGTrainRun::MAX_TICKS ||
-				Attempt.m_Run->m_KeptWeapons != m_aSettings[m_aFightGroup[ClientId]].m_Weapons)
-				Attempt.m_Run.reset();
-			else
-				Attempt.m_Run->m_vInputs.push_back(GameServer()->GetLastPlayerInput(ClientId));
-		}
 
 		// Standing on the door gives the double jump back, /nodj takes it.
 		if(Attempt.m_StartTick < 0 && Attempt.m_DoorIndex >= 0 && m_aSettings[m_aFightGroup[ClientId]].m_NoDoubleJump)
@@ -2024,9 +2222,12 @@ void CGameControllerGTrain::Tick()
 			Attempt.m_Running = !m_aSettings[m_aFightGroup[ClientId]].m_Freeplay && Attempt.m_pGoal && Attempt.m_pGoal->m_Ready;
 			Attempt.m_vTouchedTiles.clear();
 			Attempt.m_WithWeapons = m_aSettings[m_aFightGroup[ClientId]].m_Weapons != 0;
-			// Team runs earn no ELO, and replays can't move the teammates.
-			if(Attempt.m_Running && g_Config.m_SvGtrainRecordRuns && !InTeam(ClientId))
+			// Teammates release together, their runs start in the same tick.
+			if(Attempt.m_Running && g_Config.m_SvGtrainRecordRuns)
+			{
 				StartRun(pChr);
+				Attempt.m_RunHookedPlayer = pChr->Core()->HookedPlayer();
+			}
 		}
 		else if(Attempt.m_StartTick >= 0 && m_aSettings[m_aFightGroup[ClientId]].m_Weapons)
 			Attempt.m_WithWeapons = true;

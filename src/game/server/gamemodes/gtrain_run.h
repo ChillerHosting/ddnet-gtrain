@@ -136,6 +136,8 @@ public:
 	// For a character spawned in this tick, which also reset its switches
 	// and has no shots yet.
 	void Load(CCharacter *pChr) const;
+	// Whom the character's hook holds, once all of a team's tees exist.
+	static void LoadHookedPlayer(CCharacter *pChr, int HookedPlayer);
 
 	bool operator==(const CGTrainRunState &Other) const;
 
@@ -178,6 +180,46 @@ public:
 	bool operator==(const CGTrainRun &Other) const;
 };
 
+// A /team's capture: every member's run from the team's shared release until
+// the last flag, also after their own. Teammates collide, hook and hit each
+// other, so they only replay together, in one DDRace team: each tick applies
+// the inputs by client id and moves the tees in the world's order, which
+// ReplayGTrainTeamRun restores from the members' ids and order.
+class CGTrainTeamRun
+{
+public:
+	// Solo runs keep CGTrainRun::FORMAT_VERSION, readers tell them apart by
+	// it, see GTrainRunVersion().
+	static constexpr int FORMAT_VERSION = 2;
+
+	struct CMember
+	{
+		char m_aName[MAX_NAME_LENGTH] = "";
+		int m_ClientId = -1;
+		// Ticks from the release until the member reached their flag.
+		int m_CaptureTicks = 0;
+		// The teammate the member's hook held at the release, by client id.
+		int m_HookedPlayer = -1;
+		// m_Goal is the member's flag, m_EndPos and m_EndVel are where the
+		// member was when the last flag was reached. Every member has the
+		// same number of inputs, the whole run.
+		CGTrainRun m_Run;
+	};
+
+	// The DDRace team the members played in.
+	int m_Team = 0;
+	// In the order the world moves them, first to move first.
+	std::vector<CMember> m_vMembers;
+
+	std::vector<unsigned char> Encode() const;
+	bool Decode(const unsigned char *pData, int Size);
+
+	bool operator==(const CGTrainTeamRun &Other) const;
+};
+
+// The format version of an encoded run, 0 if it has none.
+int GTrainRunVersion(const unsigned char *pData, int Size);
+
 // GTrain's kept weapons, given back every tick.
 void KeepGTrainWeapons(CCharacter *pChr, int Weapons);
 
@@ -188,5 +230,11 @@ void KeepGTrainWeapons(CCharacter *pChr, int Weapons);
 // AfterTick sees the character after every tick. Returns whether it ended
 // where the stored run did.
 bool ReplayGTrainRun(CGameContext *pGameServer, int ClientId, const CGTrainRun &Run, const std::function<void()> &AdvanceTick, const std::function<void(CCharacter *pChr)> &AfterTick = nullptr);
+
+// Plays the team run back like ReplayGTrainRun, on new characters of the
+// members' client ids, which must have players. AfterTick sees each member
+// after every tick, with their index in m_vMembers. Returns whether every
+// member ended where the stored run did.
+bool ReplayGTrainTeamRun(CGameContext *pGameServer, const CGTrainTeamRun &Run, const std::function<void()> &AdvanceTick, const std::function<void(int Member, CCharacter *pChr)> &AfterTick = nullptr);
 
 #endif // GAME_SERVER_GAMEMODES_GTRAIN_RUN_H

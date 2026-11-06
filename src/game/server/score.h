@@ -70,6 +70,9 @@ public:
 	// Distance is the path distance of the run's goal, Points, Elo and
 	// SpeedFactor what the capture earned.
 	void SaveGTrainRun(const char *pName, int Distance, int64_t Points, float Elo, float SpeedFactor, CGTrainRun &&Run);
+	// One member's capture of a team run, which every member's row stores
+	// whole. Ticks are the member's own until their flag.
+	void SaveGTrainTeamRun(const char *pName, int Distance, int64_t Points, float Elo, float SpeedFactor, int Ticks, const std::shared_ptr<const CGTrainTeamRun> &pRun);
 	// Shadow-bans the stored runs on a map, of a player or both (empty for
 	// all), or lifts the ban, and takes their points and captures off the
 	// stats or gives them back.

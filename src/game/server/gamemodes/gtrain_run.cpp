@@ -2,6 +2,7 @@
 
 #include <base/dbg.h>
 #include <base/mem.h>
+#include <base/str.h>
 
 #include <engine/shared/compression.h>
 
@@ -10,6 +11,7 @@
 #include <game/server/entities/laser.h>
 #include <game/server/entities/projectile.h>
 #include <game/server/gamecontext.h>
+#include <game/server/gamecontroller.h>
 #include <game/server/player.h>
 
 #include <zlib.h>
@@ -145,6 +147,13 @@ namespace
 		{
 			Int((int)vList.size());
 		}
+
+		void Str(const char *pStr)
+		{
+			const int Length = str_length(pStr);
+			Int(Length);
+			m_vData.insert(m_vData.end(), pStr, pStr + Length);
+		}
 	};
 
 	class CRunReader
@@ -269,6 +278,21 @@ namespace
 				Num = 0;
 			}
 			vList.resize(Num);
+		}
+
+		void Str(char *pBuf, int BufSize)
+		{
+			int Length;
+			Int(Length);
+			pBuf[0] = '\0';
+			if(Length < 0 || Length >= BufSize || Length > Remaining())
+			{
+				Fail();
+				return;
+			}
+			mem_copy(pBuf, m_pCurrent, Length);
+			pBuf[Length] = '\0';
+			m_pCurrent += Length;
 		}
 	};
 } // namespace
@@ -607,6 +631,11 @@ void CGTrainRunState::Load(CCharacter *pChr) const
 	}
 }
 
+void CGTrainRunState::LoadHookedPlayer(CCharacter *pChr, int HookedPlayer)
+{
+	pChr->m_Core.SetHookedPlayer(HookedPlayer);
+}
+
 bool CGTrainRunState::operator==(const CGTrainRunState &Other) const
 {
 	// The encoding keeps every bit, the input structs have no comparison.
@@ -635,14 +664,42 @@ static void WriteRun(const CGTrainRun &Run, CRunWriter &Writer)
 	Writer.Vec(Run.m_EndVel);
 }
 
-std::vector<unsigned char> CGTrainRun::Encode() const
+static bool ReadRun(CGTrainRun &Run, CRunReader &Reader)
 {
-	CRunWriter Raw;
-	WriteRun(*this, Raw);
+	CGTrainRunState::Transfer(Run.m_Start, Reader);
+	Reader.Int(Run.m_KeptWeapons);
+	Reader.Vec(Run.m_Goal);
+	int NumInputs;
+	Reader.Int(NumInputs);
+	if(NumInputs < 0 || NumInputs > CGTrainRun::MAX_TICKS)
+		return false;
+	Reader.Inputs(Run.m_vInputs, NumInputs, Run.m_Start.m_SavedInput);
+	int NumRandom;
+	Reader.Int(NumRandom);
+	if(NumRandom < 0 || NumRandom > Reader.Remaining())
+		return false;
+	Run.m_vRandom.resize(NumRandom);
+	int Tick = 0;
+	for(CGTrainRun::CRandom &Random : Run.m_vRandom)
+	{
+		int TickDifference;
+		Reader.Int(TickDifference);
+		Tick += TickDifference;
+		Random.m_Tick = Tick;
+		Reader.Int(Random.m_Value);
+	}
+	Reader.Vec(Run.m_EndPos);
+	Reader.Vec(Run.m_EndVel);
+	return !Reader.Error();
+}
+
+// The version, the raw size, then the raw data compressed.
+static std::vector<unsigned char> Compress(int Version, const CRunWriter &Raw)
+{
 	CRunWriter Header;
-	Header.Int(FORMAT_VERSION);
+	Header.Int(Version);
 	Header.Int((int)Raw.m_vData.size());
-	std::vector<unsigned char> vEncoded = std::move(Header.m_vData);
+	std::vector<unsigned char> vEncoded = Header.m_vData;
 	const size_t HeaderSize = vEncoded.size();
 	uLongf CompressedSize = compressBound(Raw.m_vData.size());
 	vEncoded.resize(HeaderSize + CompressedSize);
@@ -652,46 +709,96 @@ std::vector<unsigned char> CGTrainRun::Encode() const
 	return vEncoded;
 }
 
+static bool Uncompress(int Version, const unsigned char *pData, int Size, std::vector<unsigned char> &vRaw)
+{
+	CRunReader Header(pData, Size);
+	int EncodedVersion, RawSize;
+	Header.Int(EncodedVersion);
+	Header.Int(RawSize);
+	if(Header.Error() || EncodedVersion != Version || RawSize <= 0 || RawSize > MAX_RAW_SIZE)
+		return false;
+	vRaw.resize(RawSize);
+	uLongf UncompressedSize = RawSize;
+	return uncompress(vRaw.data(), &UncompressedSize, Header.Current(), Header.Remaining()) == Z_OK && UncompressedSize == (uLongf)RawSize;
+}
+
+std::vector<unsigned char> CGTrainRun::Encode() const
+{
+	CRunWriter Raw;
+	WriteRun(*this, Raw);
+	return Compress(FORMAT_VERSION, Raw);
+}
+
 bool CGTrainRun::Decode(const unsigned char *pData, int Size)
 {
 	*this = CGTrainRun();
-	CRunReader Header(pData, Size);
-	int Version, RawSize;
-	Header.Int(Version);
-	Header.Int(RawSize);
-	if(Header.Error() || Version != FORMAT_VERSION || RawSize <= 0 || RawSize > MAX_RAW_SIZE)
+	std::vector<unsigned char> vRaw;
+	if(!Uncompress(FORMAT_VERSION, pData, Size, vRaw))
 		return false;
-	std::vector<unsigned char> vRaw(RawSize);
-	uLongf UncompressedSize = RawSize;
-	if(uncompress(vRaw.data(), &UncompressedSize, Header.Current(), Header.Remaining()) != Z_OK || UncompressedSize != (uLongf)RawSize)
-		return false;
+	CRunReader Reader(vRaw.data(), vRaw.size());
+	return ReadRun(*this, Reader) && Reader.AtEnd();
+}
 
-	CRunReader Reader(vRaw.data(), RawSize);
-	CGTrainRunState::Transfer(m_Start, Reader);
-	Reader.Int(m_KeptWeapons);
-	Reader.Vec(m_Goal);
-	int NumInputs;
-	Reader.Int(NumInputs);
-	if(NumInputs < 0 || NumInputs > MAX_TICKS)
-		return false;
-	Reader.Inputs(m_vInputs, NumInputs, m_Start.m_SavedInput);
-	int NumRandom;
-	Reader.Int(NumRandom);
-	if(NumRandom < 0 || NumRandom > RawSize)
-		return false;
-	m_vRandom.resize(NumRandom);
-	int Tick = 0;
-	for(CRandom &Random : m_vRandom)
+static void WriteTeamRun(const CGTrainTeamRun &Run, CRunWriter &Writer)
+{
+	Writer.Int(Run.m_Team);
+	Writer.Count(Run.m_vMembers);
+	for(const CGTrainTeamRun::CMember &Member : Run.m_vMembers)
 	{
-		int TickDifference;
-		Reader.Int(TickDifference);
-		Tick += TickDifference;
-		Random.m_Tick = Tick;
-		Reader.Int(Random.m_Value);
+		Writer.Str(Member.m_aName);
+		Writer.Int(Member.m_ClientId);
+		Writer.Int(Member.m_CaptureTicks);
+		Writer.Int(Member.m_HookedPlayer);
+		WriteRun(Member.m_Run, Writer);
 	}
-	Reader.Vec(m_EndPos);
-	Reader.Vec(m_EndVel);
+}
+
+std::vector<unsigned char> CGTrainTeamRun::Encode() const
+{
+	CRunWriter Raw;
+	WriteTeamRun(*this, Raw);
+	return Compress(FORMAT_VERSION, Raw);
+}
+
+bool CGTrainTeamRun::Decode(const unsigned char *pData, int Size)
+{
+	*this = CGTrainTeamRun();
+	std::vector<unsigned char> vRaw;
+	if(!Uncompress(FORMAT_VERSION, pData, Size, vRaw))
+		return false;
+	CRunReader Reader(vRaw.data(), vRaw.size());
+	Reader.Int(m_Team);
+	Reader.Count(m_vMembers);
+	if(Reader.Error() || m_vMembers.empty() || (int)m_vMembers.size() > MAX_CLIENTS)
+		return false;
+	for(CMember &Member : m_vMembers)
+	{
+		Reader.Str(Member.m_aName, sizeof(Member.m_aName));
+		Reader.Int(Member.m_ClientId);
+		Reader.Int(Member.m_CaptureTicks);
+		Reader.Int(Member.m_HookedPlayer);
+		if(!ReadRun(Member.m_Run, Reader) || Member.m_ClientId < 0 || Member.m_ClientId >= MAX_CLIENTS ||
+			Member.m_Run.m_vInputs.size() != m_vMembers.front().m_Run.m_vInputs.size() ||
+			Member.m_CaptureTicks < 0 || Member.m_CaptureTicks > (int)Member.m_Run.m_vInputs.size())
+			return false;
+	}
 	return !Reader.Error() && Reader.AtEnd();
+}
+
+bool CGTrainTeamRun::operator==(const CGTrainTeamRun &Other) const
+{
+	CRunWriter Writer, OtherWriter;
+	WriteTeamRun(*this, Writer);
+	WriteTeamRun(Other, OtherWriter);
+	return Writer.m_vData == OtherWriter.m_vData;
+}
+
+int GTrainRunVersion(const unsigned char *pData, int Size)
+{
+	CRunReader Header(pData, Size);
+	int Version;
+	Header.Int(Version);
+	return Header.Error() ? 0 : Version;
 }
 
 bool CGTrainRun::operator==(const CGTrainRun &Other) const
@@ -746,4 +853,82 @@ bool ReplayGTrainRun(CGameContext *pGameServer, int ClientId, const CGTrainRun &
 	}
 	WorldCore.m_RandomHook = RandomHook;
 	return pChr && pChr->Core()->m_Pos == Run.m_EndPos && pChr->Core()->m_Vel == Run.m_EndVel && NextRandom == Run.m_vRandom.size();
+}
+
+bool ReplayGTrainTeamRun(CGameContext *pGameServer, const CGTrainTeamRun &Run, const std::function<void()> &AdvanceTick, const std::function<void(int Member, CCharacter *pChr)> &AfterTick)
+{
+	for(const CGTrainTeamRun::CMember &Member : Run.m_vMembers)
+	{
+		CPlayer *pPlayer = pGameServer->m_apPlayers[Member.m_ClientId];
+		if(!pPlayer || pPlayer->GetTeam() == TEAM_SPECTATORS)
+			return false;
+		pPlayer->KillCharacter(WEAPON_GAME, false, false);
+		pGameServer->m_World.RemoveEntitiesFromPlayer(Member.m_ClientId);
+	}
+	// The world moves the newest character first, so the last member to move
+	// spawns first. All of them are in the team before any state loads its
+	// switches, and hooks hold teammates once they all exist.
+	for(auto pMember = Run.m_vMembers.rbegin(); pMember != Run.m_vMembers.rend(); ++pMember)
+	{
+		pGameServer->m_apPlayers[pMember->m_ClientId]->ForceSpawn(pMember->m_Run.m_Start.m_Pos);
+		pGameServer->m_pController->Teams().SetForceCharacterTeam(pMember->m_ClientId, Run.m_Team);
+	}
+	for(const CGTrainTeamRun::CMember &Member : Run.m_vMembers)
+		Member.m_Run.m_Start.Load(pGameServer->GetPlayerChar(Member.m_ClientId));
+	for(const CGTrainTeamRun::CMember &Member : Run.m_vMembers)
+		if(Member.m_HookedPlayer >= 0 && Member.m_HookedPlayer < MAX_CLIENTS)
+			CGTrainRunState::LoadHookedPlayer(pGameServer->GetPlayerChar(Member.m_ClientId), Member.m_HookedPlayer);
+
+	// Each member's random choices come from their run, in their order.
+	CWorldCore &WorldCore = pGameServer->m_World.m_Core;
+	const auto RandomHook = std::move(WorldCore.m_RandomHook);
+	std::vector<size_t> vNextRandom(Run.m_vMembers.size(), 0);
+	WorldCore.m_RandomHook = [&](int RandomClientId, int Value) {
+		for(size_t i = 0; i < Run.m_vMembers.size(); ++i)
+		{
+			const std::vector<CGTrainRun::CRandom> &vRandom = Run.m_vMembers[i].m_Run.m_vRandom;
+			if(Run.m_vMembers[i].m_ClientId == RandomClientId && vNextRandom[i] < vRandom.size())
+				return vRandom[vNextRandom[i]++].m_Value;
+		}
+		return Value;
+	};
+	// The server applies inputs by client id.
+	std::vector<size_t> vByClientId(Run.m_vMembers.size());
+	for(size_t i = 0; i < vByClientId.size(); ++i)
+		vByClientId[i] = i;
+	std::sort(vByClientId.begin(), vByClientId.end(), [&](size_t A, size_t B) { return Run.m_vMembers[A].m_ClientId < Run.m_vMembers[B].m_ClientId; });
+	bool Alive = true;
+	const size_t NumTicks = Run.m_vMembers.front().m_Run.m_vInputs.size();
+	for(size_t Tick = 0; Tick < NumTicks && Alive; ++Tick)
+	{
+		for(const size_t Member : vByClientId)
+			pGameServer->OnClientPredictedEarlyInput(Run.m_vMembers[Member].m_ClientId, &Run.m_vMembers[Member].m_Run.m_vInputs[Tick]);
+		AdvanceTick();
+		for(const size_t Member : vByClientId)
+			pGameServer->OnClientPredictedInput(Run.m_vMembers[Member].m_ClientId, &Run.m_vMembers[Member].m_Run.m_vInputs[Tick]);
+		pGameServer->OnTick();
+		for(size_t i = 0; i < Run.m_vMembers.size(); ++i)
+		{
+			CCharacter *pChr = pGameServer->GetPlayerChar(Run.m_vMembers[i].m_ClientId);
+			if(!pChr)
+			{
+				Alive = false;
+				continue;
+			}
+			KeepGTrainWeapons(pChr, Run.m_vMembers[i].m_Run.m_KeptWeapons);
+			if(AfterTick)
+				AfterTick(i, pChr);
+		}
+	}
+	WorldCore.m_RandomHook = RandomHook;
+	if(!Alive)
+		return false;
+	for(size_t i = 0; i < Run.m_vMembers.size(); ++i)
+	{
+		const CGTrainRun &MemberRun = Run.m_vMembers[i].m_Run;
+		const CCharacter *pChr = pGameServer->GetPlayerChar(Run.m_vMembers[i].m_ClientId);
+		if(pChr->Core()->m_Pos != MemberRun.m_EndPos || pChr->Core()->m_Vel != MemberRun.m_EndVel || vNextRandom[i] != MemberRun.m_vRandom.size())
+			return false;
+	}
+	return true;
 }

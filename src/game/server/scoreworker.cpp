@@ -1831,7 +1831,7 @@ bool CScoreWorker::SaveGTrainRun(IDbConnection *pSqlServer, const ISqlData *pGam
 	}
 
 	// Compressing happens here, off the game thread.
-	std::vector<unsigned char> vRun = pData->m_Run.Encode();
+	std::vector<unsigned char> vRun = pData->m_pTeamRun ? pData->m_pTeamRun->Encode() : pData->m_Run.Encode();
 	char aBuf[512];
 	str_format(aBuf, sizeof(aBuf),
 		"%s INTO %s_gtrain_runs(Map, MapSha256, Name, Timestamp, GameId, Revision, StartTick, Ticks, Distance, Elo, SpeedFactor, Run, Points) "
@@ -1847,8 +1847,9 @@ bool CScoreWorker::SaveGTrainRun(IDbConnection *pSqlServer, const ISqlData *pGam
 	pSqlServer->BindString(4, pData->m_aTimestamp);
 	pSqlServer->BindString(5, pData->m_aGameUuid);
 	pSqlServer->BindString(6, pData->m_aRevision);
-	pSqlServer->BindInt(7, pData->m_Run.m_Start.m_Tick);
-	pSqlServer->BindInt(8, pData->m_Run.m_vInputs.size());
+	const CGTrainRun &Start = pData->m_pTeamRun ? pData->m_pTeamRun->m_vMembers.front().m_Run : pData->m_Run;
+	pSqlServer->BindInt(7, Start.m_Start.m_Tick);
+	pSqlServer->BindInt(8, pData->m_pTeamRun ? pData->m_TeamTicks : (int)pData->m_Run.m_vInputs.size());
 	pSqlServer->BindInt(9, pData->m_Distance);
 	pSqlServer->BindFloat(10, pData->m_Elo);
 	pSqlServer->BindFloat(11, pData->m_SpeedFactor);

@@ -139,7 +139,11 @@ struct CSqlGTrainRunData : ISqlData
 	int64_t m_Points;
 	float m_Elo;
 	float m_SpeedFactor;
+	// A solo run, or a team run shared by the rows of its members, with the
+	// member's ticks until their flag.
 	CGTrainRun m_Run;
+	std::shared_ptr<const CGTrainTeamRun> m_pTeamRun;
+	int m_TeamTicks = 0;
 };
 
 // Shadow-bans the stored runs of a map or a player, or both, or lifts the ban.

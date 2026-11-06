@@ -76,7 +76,7 @@ Every capture earns points, and your ELO shows them on a scale from 0 to 9999. B
 - The capture message shows the ELO you gained, your speed factor and the mean difficulty of its tiles, e.g. `(2 fails, +0.42 ELO, 1.3x speed, Hard ★★☆)`.
 - Reaching the flag frozen still captures it and scores in fights, but earns no ELO: `(0 fails, +0 ELO (frozen))`.
 - Neither do attempts with kept weapons, also when the weapons were on for only part of the attempt: `(0 fails, +0 ELO (kept weapons))`. Weapons turned off again before the release don't count.
-- In a fight, only the player capturing the flag earns ELO. Teams, freeplay and servers where rcon cheats were used never do.
+- In a fight, only the player capturing the flag earns ELO. [Teams](#teams) share theirs. Freeplay and servers where rcon cheats were used never earn any.
 - Outside fights, the scoreboard and the server browser show each player's ELO as their score.
 
 ## Stats
@@ -106,9 +106,10 @@ Freeplay has no attempts, and rcon cheats stop everything but the playtime from 
 Teams play together instead of solo: teammates collide, hook and hit each other, and share the map's switches, like a DDRace team.
 
 - `/team <player>` asks a player to team up, `/accept` or `/a` joins within a minute. Members can ask more players, who join the same team. The one who asked first leads it, shown as `*name*`, and chooses the [settings](#commands) everyone plays with.
-- The team trains with one flag. Everyone hovers at a spot of their own near the leader's, at least two tiles apart and no closer to the flag where the map allows, and returns there with `/r`. When any member reaches the flag, it counts for the whole team and everyone starts at a new spot together: `'name' captured the flag for their team in 3.20 seconds (0 fails, +0 ELO (team))`.
-- Any member's death, kill or `/r` acts for the whole team: a new spot after deaths, the same one after `/r`.
-- Teams earn no [ELO](#elo) for now. Captures, attempts and playtime still count in the [stats](#stats).
+- Everyone hovers at a spot of their own near the leader's, at least two tiles apart and no closer to the goal where the map allows, and returns there with `/r`. The goal has a flag for each member, spread around it the same way, all blue.
+- Each member takes one flag, any of them, and plays on to help the others: `'name' took a flag, 1 left.` Once every flag is taken, everyone earns their capture and the team starts at a new spot together: `'name' captured a flag for their team in 3.20 seconds (0 fails, +0.21 ELO, 1.3x speed, Hard ★★☆)`.
+- Each member earns [ELO](#elo) like a capture alone, by the tiles they went through unfrozen and their time, both until they took their flag, divided by the number of members: a team earns what one player would. Being carried frozen earns nothing for those tiles; being pulled along by a teammate's hook counts. A member taking their flag frozen earns nothing, but the flag still counts for the team.
+- Any member's death, kill or `/r` acts for the whole team, also after taking a flag: nobody earns anything from that attempt, and the team starts over at a new spot after deaths, at the same one after `/r`.
 - `/team` alone leaves it, and the others start over at a new spot. A team with one player left ends, so does a member's leaving for the spectators.
 - Teams and [fights](#fights) don't mix: fights race solo, so a team can't fight and a fight can't team up.
 
@@ -162,6 +163,10 @@ The tool changes maps in place and skips maps that have a switch layer already. 
 | `sv_gtrain_start_exclusion` | 50 | Path distance in tiles from the start line in which no spots or flags are placed; maps entirely within it keep all their spots. Applies on map change |
 | `sv_gtrain_tile_ratings` | 1 | Rate the spots of each map, see [tile ratings](#tile-ratings); with 0 the map's category and stars decide the ELO of its captures. Applies on map change |
 | `sv_require_chat_flag_to_chat` | 0 | Set to 1 so new players must show the chat bubble before chatting during their first 20 seconds; commands are unaffected (from [ddnet-insta](https://github.com/ddnet-insta/ddnet-insta/commit/9b7c415b19510dc04157dfaa05596c077ca02ec6)) |
+
+### Stored runs
+
+Each row of `record_gtrain_runs` is one player's capture, with the points, ELO and speed multiplier it earned, `Ticks` from the release until the flag and the encoded run in `Run`: a format version, the raw size and the zlib-compressed data. Solo runs (version 1) are the tee's state at the release and the input applied in every tick until the capture. A team's run (version 2, `CGTrainTeamRun`) is stored whole in the row of every member who earned ELO with it: for each member their name, client id, ticks until their flag and a solo run's data from the shared release until the last flag, in the order the world moves the tees. Teammates collide, so replays put them in one DDRace team, spawn them in that order and apply the inputs by client id like the server does (`ReplayGTrainTeamRun`).
 
 ### Banning runs
 
