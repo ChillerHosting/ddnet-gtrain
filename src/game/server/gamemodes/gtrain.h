@@ -41,7 +41,8 @@ class CGameControllerGTrain : public CGameControllerDDNet
 		// Shorter attempts are no attempts, unless they capture the flag.
 		MIN_ATTEMPT_SECONDS = 2,
 		STATS_SAVE_SECONDS = 60,
-		TEAM_REQUEST_SECONDS = 60,
+		// /team requests and fight invites last this long.
+		REQUEST_SECONDS = 60,
 		TEAM_SPOT_RANGE = 8, // tiles from the team's start
 		TEAM_SPOT_SPACING = 2, // tiles between teammates
 		// Tiles earn by the mean difficulty of the rated tiles this close,
@@ -141,6 +142,13 @@ class CGameControllerGTrain : public CGameControllerDDNet
 	// respawning, so none gets a head start out of the break.
 	int m_aFightBreakEndTick[MAX_CLIENTS] = {};
 	int m_aFightWins[MAX_CLIENTS] = {};
+	// By group: only players its leader invites join a locked fight. Unlike
+	// the settings, leaving players don't keep it, promoted leaders do.
+	bool m_aFightLocked[MAX_CLIENTS] = {};
+	// The fight that invited each player last, and when, -1 for none. Invites
+	// belong to the group, so only group leaders have any.
+	int m_aFightInvite[MAX_CLIENTS];
+	int m_aFightInviteTick[MAX_CLIENTS] = {};
 	CSettings m_aSettings[MAX_CLIENTS];
 	// By group, empty for groups that are no team.
 	std::vector<CTeamFlag> m_avTeamFlags[MAX_CLIENTS];
@@ -192,6 +200,13 @@ class CGameControllerGTrain : public CGameControllerDDNet
 	void FinishTeamRun(int Group);
 	void SaveTeamRun(int Group, const std::vector<int> &vMembers);
 	bool LeaveFight(int ClientId, bool NewAttempt);
+	// Joins the fight of the target, if the player can and the fight takes them.
+	void JoinFight(int ClientId, int Target);
+	// Whether the players can be in one fight, tells the player why not.
+	bool CheckCanFight(int ClientId, int Target);
+	bool InvitedToFight(int ClientId, int Group) const;
+	// Before the group's leader joins another group.
+	void ForgetFightLock(int Group);
 	int FightSize(int Group) const;
 	bool InTeam(int ClientId) const { return m_aTeamGroup[m_aFightGroup[ClientId]]; }
 	const char *GroupName(int Group) const { return m_aTeamGroup[Group] ? "team" : "fight"; }
@@ -281,7 +296,11 @@ public:
 	std::optional<int> RaceTimerStartTick(class CCharacter *pChr) override;
 	void Fight(int ClientId, const char *pName);
 	void TeamUp(int ClientId, const char *pName);
-	void AcceptTeam(int ClientId);
+	// Accepts the latest /team request or fight invite.
+	void Accept(int ClientId);
+	// Toggles the lock of the player's fight without a value.
+	void Lock(int ClientId, std::optional<bool> Locked);
+	void Invite(int ClientId, const char *pName);
 	void Freeplay(int ClientId);
 	void Retry(int ClientId);
 	// Retries like the other practice binds, freeplay starts where the player

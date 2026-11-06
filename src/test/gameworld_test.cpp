@@ -1571,16 +1571,16 @@ TEST_F(GameWorld, GTrainTeamsPlayTogether)
 		CheckSolo(ClientId);
 
 	// Requests by name, accepted with /accept or /a within a minute.
-	EXPECT_EQ(Reply(Bob, "/accept"), "You have no team request. Requests last a minute.");
+	EXPECT_EQ(Reply(Bob, "/accept"), "You have no team request or fight invite. They last a minute.");
 	EXPECT_EQ(Reply(Anna, "/team Anna"), "You cannot team up with yourself.");
 	EXPECT_EQ(Reply(Anna, "/team Carl"), "You asked 'Carl' to team up. They can join with /accept or /a within a minute.");
 	m_pServer->AdvanceTicks((60 + 1) * m_pServer->TickSpeed());
-	EXPECT_EQ(Reply(Carl, "/a"), "You have no team request. Requests last a minute.");
+	EXPECT_EQ(Reply(Carl, "/a"), "You have no team request or fight invite. They last a minute.");
 	EXPECT_EQ(Reply(Anna, "/team Bob"), "You asked 'Bob' to team up. They can join with /accept or /a within a minute.");
 	EXPECT_EQ(LastMessage(Bob), "'Anna' wants to team up with you. Say /accept or /a within a minute to join.");
 	EXPECT_EQ(Reply(Bob, "/a"), "'Bob' joined the team of 'Anna'. /team alone leaves it.");
 	EXPECT_EQ(LastMessage(Anna), "'Bob' joined the team of 'Anna'. /team alone leaves it.");
-	EXPECT_EQ(Reply(Bob, "/a"), "You have no team request. Requests last a minute.");
+	EXPECT_EQ(Reply(Bob, "/a"), "You have no team request or fight invite. They last a minute.");
 	pController->Tick();
 	CheckTogether({Anna, Bob});
 	CheckSolo(Carl);
@@ -2408,6 +2408,101 @@ TEST_F(GameWorld, GTrainFightTeamsSwitchLeaveAndDisconnect)
 		EXPECT_EQ(GameServer()->GetPlayerChar(ClientId), nullptr);
 	pController->Tick();
 	EXPECT_EQ(TrainingGoal(Anna), TrainingGoal(Ed));
+}
+
+TEST_F(GameWorld, GTrainLockedFightsOnlyTakeInvitedPlayers)
+{
+	PrepareTrainingCorridor();
+	g_Config.m_SvSpamprotection = 0;
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob", "Carl", "Dee"});
+	const int Anna = vIds[0], Bob = vIds[1], Carl = vIds[2], Dee = vIds[3];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	const auto LastMessage = [&](int ClientId) {
+		return m_pServer->m_avChatMessages[ClientId].empty() ? std::string() : m_pServer->m_avChatMessages[ClientId].back();
+	};
+	const auto Reply = [&](int ClientId, const char *pText) {
+		m_pServer->m_avChatMessages[ClientId].clear();
+		Say(ClientId, pText);
+		return LastMessage(ClientId);
+	};
+	const auto SameFight = [&](int ClientId, int Other) {
+		pController->Tick();
+		const int Team = pController->Teams().ScoreboardTeam(ClientId);
+		return Team != 0 && Team == pController->Teams().ScoreboardTeam(Other);
+	};
+	const auto Joined = [](const char *pName, const char *pWith) {
+		return std::string("'") + pName + "' joined the fight with '" + pWith + "'. Use /fight to leave.";
+	};
+	const std::string NoInvite = "You have no team request or fight invite. They last a minute.";
+
+	// Only the leader locks the fight, for everyone in it.
+	EXPECT_EQ(Reply(Bob, "/fight Anna"), Joined("Bob", "Anna"));
+	EXPECT_EQ(Reply(Bob, "/lock"), "Only the fight leader can lock or unlock the fight.");
+	const std::string Locked = "The fight is locked, players only join it when its leader invites them with /invite <player>.";
+	EXPECT_EQ(Reply(Anna, "/lock"), Locked);
+	EXPECT_EQ(LastMessage(Bob), Locked);
+	EXPECT_NE(Reply(Bob, "/settings").find(", /lock on,"), std::string::npos);
+
+	// Nobody else joins, through any member.
+	const std::string AskAnna = "The fight of 'Anna' is locked, ask them for an /invite.";
+	EXPECT_EQ(Reply(Carl, "/fight Anna"), AskAnna);
+	EXPECT_EQ(Reply(Carl, "/fight Bob"), AskAnna);
+	EXPECT_FALSE(SameFight(Carl, Anna));
+
+	// The leader invites, the invited player accepts, once.
+	EXPECT_EQ(Reply(Bob, "/invite Carl"), "Only the fight leader can invite players.");
+	EXPECT_EQ(Reply(Anna, "/invite Anna"), "You cannot invite yourself.");
+	EXPECT_EQ(Reply(Anna, "/invite Bob"), "'Bob' is already in your fight.");
+	EXPECT_EQ(Reply(Anna, "/invite Nobody"), "Player not found. Use their full name.");
+	EXPECT_EQ(Reply(Anna, "/invite Carl"), "You invited 'Carl' to your fight. They can join with /accept or /a within a minute.");
+	EXPECT_EQ(LastMessage(Carl), "'Anna' invites you to their fight. Say /accept or /a within a minute to join.");
+	EXPECT_EQ(Reply(Carl, "/a"), Joined("Carl", "Anna"));
+	EXPECT_TRUE(SameFight(Carl, Anna));
+	EXPECT_EQ(Reply(Carl, "/fight"), "You left fight mode.");
+	EXPECT_EQ(Reply(Carl, "/fight Anna"), AskAnna);
+	EXPECT_EQ(Reply(Carl, "/a"), NoInvite);
+
+	// Invites also let players in with /fight, for a minute.
+	Say(Anna, "/invite Dee");
+	m_pServer->AdvanceTicks((60 + 1) * m_pServer->TickSpeed());
+	EXPECT_EQ(Reply(Dee, "/fight Bob"), AskAnna);
+	EXPECT_EQ(Reply(Dee, "/a"), NoInvite);
+	Say(Anna, "/invite Dee");
+	EXPECT_EQ(Reply(Dee, "/fight Bob"), Joined("Dee", "Bob"));
+	EXPECT_TRUE(SameFight(Dee, Anna));
+	EXPECT_EQ(Reply(Dee, "/fight"), "You left fight mode.");
+
+	// The fight and its invites stay locked when its leader leaves, the
+	// leader's new fight isn't.
+	Say(Anna, "/invite Carl");
+	EXPECT_EQ(Reply(Anna, "/fight"), "You left fight mode.");
+	EXPECT_EQ(Reply(Anna, "/fight Bob"), "The fight of 'Bob' is locked, ask them for an /invite.");
+	EXPECT_EQ(Reply(Carl, "/accept"), Joined("Carl", "Bob"));
+	EXPECT_TRUE(SameFight(Carl, Bob));
+	EXPECT_NE(Reply(Anna, "/settings").find(", /lock off,"), std::string::npos);
+	EXPECT_EQ(Reply(Dee, "/fight Anna"), Joined("Dee", "Anna"));
+
+	// Unlocked fights take anyone again.
+	EXPECT_EQ(Reply(Bob, "/lock 0"), "The fight is unlocked, anyone can join it with /fight.");
+	EXPECT_EQ(Reply(Bob, "/lock 0"), "The fight is unlocked, anyone can join it with /fight.");
+	EXPECT_EQ(Reply(Dee, "/fight Carl"), Joined("Dee", "Carl"));
+	EXPECT_TRUE(SameFight(Dee, Bob));
+
+	// Teams only take players who accept anyway. Every member invites, like
+	// with /team.
+	EXPECT_EQ(Reply(Dee, "/fight"), "You left fight mode.");
+	Say(Anna, "/team Dee");
+	EXPECT_EQ(Reply(Dee, "/a"), "'Dee' joined the team of 'Anna'. /team alone leaves it.");
+	EXPECT_EQ(Reply(Anna, "/lock"), "Teams are always locked, players only join them by accepting an /invite.");
+	EXPECT_EQ(Reply(Anna, "/invite Carl"), "'Carl' is in a fight, which can't team up.");
+	EXPECT_EQ(Reply(Bob, "/invite Anna"), "'Anna' is in a team, which can't fight.");
+	EXPECT_EQ(Reply(Carl, "/fight"), "You left fight mode.");
+	EXPECT_EQ(Reply(Dee, "/invite Carl"), "You asked 'Carl' to team up. They can join with /accept or /a within a minute.");
+	EXPECT_EQ(LastMessage(Carl), "'Dee' wants to add you to their team. Say /accept or /a within a minute to join.");
+	EXPECT_EQ(Reply(Carl, "/a"), "'Carl' joined the team of 'Anna'. /team alone leaves it.");
+	pController->Tick();
+	EXPECT_EQ(pController->Teams().ScoreboardTeam(Carl), pController->Teams().ScoreboardTeam(Anna));
+	EXPECT_NE(pController->Teams().ScoreboardTeam(Carl), 0);
 }
 
 TEST_F(GameWorld, ChatFlagFilterCountsLiveChatTicksAndMessageCharacters)
@@ -3341,17 +3436,18 @@ TEST_F(GameWorld, GTrainChatOnlyHasGTrainCommands)
 	ASSERT_TRUE(IsChatCommand("solo"));
 	PrepareTrainingCorridor();
 	// Races, DDRace teams and practice have no use in GTrain.
-	for(const char *pName : {"practice", "save", "load", "kill", "times", "swap", "solo", "weapons", "unlaser", "tpxy", "invite", "join", "lock"})
+	for(const char *pName : {"practice", "save", "load", "kill", "times", "swap", "solo", "weapons", "unlaser", "tpxy", "join", "unlock"})
 		EXPECT_FALSE(IsChatCommand(pName)) << pName;
-	for(const char *pName : {"r", "retry", "fight", "team", "accept", "a", "distance", "forwards", "trail", "settings", "laser", "rifle", "top5", "rank", "profile", "top5playtime", "spec", "pause", "w", "help", "cmdlist", "map", "timeout"})
+	for(const char *pName : {"r", "retry", "fight", "lock", "invite", "team", "accept", "a", "distance", "forwards", "trail", "settings", "laser", "rifle", "top5", "rank", "profile", "top5playtime", "spec", "pause", "w", "help", "cmdlist", "map", "timeout"})
 		EXPECT_TRUE(IsChatCommand(pName)) << pName;
 	// Practice binds stay, they retry.
 	for(const char *pName : {"invincible", "tc", "telecursor", "rescue", "back", "tp", "teleport", "lasttp"})
 		EXPECT_TRUE(IsChatCommand(pName)) << pName;
 	// Rcon keeps them.
 	EXPECT_NE(pConsole->GetCommandInfo("practice", CFGFLAG_SERVER, false), nullptr);
-	// GTrain's /team takes player names.
+	// GTrain's /team and /invite take player names.
 	EXPECT_STREQ(pConsole->GetCommandInfo("team", CFGFLAG_CHAT, false)->Params(), "?r[player name]");
+	EXPECT_STREQ(pConsole->GetCommandInfo("invite", CFGFLAG_CHAT, false)->Params(), "r[player name]");
 }
 
 TEST_F(GameWorld, GTrainSettingsShowsThoseOfPlayersAndFights)
@@ -3367,10 +3463,10 @@ TEST_F(GameWorld, GTrainSettingsShowsThoseOfPlayersAndFights)
 		return m_pServer->m_avChatMessages[ClientId].empty() ? std::string() : m_pServer->m_avChatMessages[ClientId].back();
 	};
 
-	EXPECT_EQ(Settings(Anna, "/settings"), "Your settings: /trail on, /distance 3 (server default), /nodj off, /forwards off, /freeplay off, /scorelimit 10, kept weapons: none");
+	EXPECT_EQ(Settings(Anna, "/settings"), "Your settings: /trail on, /distance 3 (server default), /nodj off, /forwards off, /freeplay off, /scorelimit 10, /lock off, kept weapons: none");
 	for(const char *pCommand : {"/distance 120", "/nodj", "/forwards", "/ninja", "/shotgun", "/scorelimit 0", "/trail"})
 		Say(Anna, pCommand);
-	const std::string AnnaSettings = "/distance 120, /nodj on, /forwards on, /freeplay off, /scorelimit off, kept weapons: shotgun, ninja";
+	const std::string AnnaSettings = "/distance 120, /nodj on, /forwards on, /freeplay off, /scorelimit off, /lock off, kept weapons: shotgun, ninja";
 	EXPECT_EQ(Settings(Anna, "/settings"), "Your settings: /trail off, " + AnnaSettings);
 	EXPECT_EQ(Settings(Runner, "/settings Anna"), "Settings of 'Anna': /trail off, " + AnnaSettings);
 	EXPECT_EQ(Settings(Runner, "/settings Nobody"), "Player not found. Use their full name.");
@@ -4115,7 +4211,7 @@ TEST_F(GameWorld, GTrainHelpListsOnlyGTrainCommands)
 	m_pServer->m_avChatMessages[Runner].clear();
 	Say(Runner, "/help");
 	const auto &vMessages = m_pServer->m_avChatMessages[Runner];
-	ASSERT_EQ(vMessages.size(), 20);
+	ASSERT_EQ(vMessages.size(), 21);
 	EXPECT_EQ(vMessages.front(), "GTrain commands:");
 	EXPECT_EQ(vMessages.back(), "Captures on this map earn no ELO.");
 	std::string Help;

@@ -38,6 +38,7 @@ CGameControllerGTrain::CGameControllerGTrain(class CGameContext *pGameServer) :
 	for(int ClientId = 0; ClientId < MAX_CLIENTS; ++ClientId)
 		m_aFightGroup[ClientId] = ClientId;
 	std::fill(std::begin(m_aTeamRequest), std::end(m_aTeamRequest), -1);
+	std::fill(std::begin(m_aFightInvite), std::end(m_aFightInvite), -1);
 	for(auto &SnapId : m_aFlagSnapIds)
 		SnapId = Server()->SnapNewId();
 	for(auto &SnapId : m_aDirectionSnapIds)
@@ -116,7 +117,7 @@ bool CGameControllerGTrain::AddSwitchLayer(IStorage *pStorage, const char *pPath
 // practice, and only clutter the chat's command completion.
 static const char *const s_apChatCommands[] = {
 	"help", "cmdlist", "info", "rules", "list",
-	"r", "retry", "fight", "team", "accept", "a", "distance", "nodj", "forwards", "trail", "scorelimit", "freeplay", "settings",
+	"r", "retry", "fight", "lock", "invite", "team", "accept", "a", "distance", "nodj", "forwards", "trail", "scorelimit", "freeplay", "settings",
 	// practice binds, they retry
 	"invincible", "tc", "telecursor", "rescue", "back", "tp", "teleport", "lasttp",
 	"shotgun", "grenade", "laser", "rifle", "ninja",
@@ -133,11 +134,28 @@ static void ConTeamUp(IConsole::IResult *pResult, void *pUserData)
 		pController->TeamUp(pResult->m_ClientId, pResult->NumArguments() ? pResult->GetString(0) : "");
 }
 
+static void ConLockFight(IConsole::IResult *pResult, void *pUserData)
+{
+	auto *pController = dynamic_cast<CGameControllerGTrain *>(((CGameContext *)pUserData)->m_pController);
+	if(pController && pResult->m_ClientId >= 0 && pResult->m_ClientId < MAX_CLIENTS)
+		pController->Lock(pResult->m_ClientId, pResult->NumArguments() ? std::optional<bool>(pResult->GetInteger(0) != 0) : std::nullopt);
+}
+
+static void ConInviteToFight(IConsole::IResult *pResult, void *pUserData)
+{
+	auto *pController = dynamic_cast<CGameControllerGTrain *>(((CGameContext *)pUserData)->m_pController);
+	if(pController && pResult->m_ClientId >= 0 && pResult->m_ClientId < MAX_CLIENTS)
+		pController->Invite(pResult->m_ClientId, pResult->GetString(0));
+}
+
 void CGameControllerGTrain::HideUnrelatedChatCommands()
 {
-	// /team asks players by name instead of joining DDRace team numbers.
-	// CGameContext::OnInit registers DDNet's /team again before every map.
+	// /team asks players by name instead of joining DDRace team numbers, /lock
+	// and /invite are about fights instead of DDRace teams.
+	// CGameContext::OnInit registers DDNet's commands again before every map.
 	GameServer()->Console()->Register("team", "?r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTeamUp, GameServer(), "Ask a player to play together in a team (no name to leave)");
+	GameServer()->Console()->Register("lock", "?i['0'|'1']", CFGFLAG_CHAT | CFGFLAG_SERVER, ConLockFight, GameServer(), "Toggle locking your fight, so only players you /invite can join (fight leader only). /lock 0 to unlock, /lock 1 to lock");
+	GameServer()->Console()->Register("invite", "r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConInviteToFight, GameServer(), "Invite a player to your fight (fight leader only), also a locked one, or to your team, to join with /accept within a minute");
 
 	// Without the chat flag, they neither run from chat nor get sent to
 	// clients. Rcon keeps the commands it has access to.
@@ -1114,6 +1132,7 @@ bool CGameControllerGTrain::LeaveFight(int ClientId, bool NewAttempt)
 	const bool Restart = m_aFightRestart[Group];
 	const int BreakEndTick = m_aFightBreakEndTick[Group];
 	const CSettings Settings = m_aSettings[Group];
+	const bool Locked = m_aFightLocked[Group];
 	const int ScoreboardTeam = m_aFightTeam[Group];
 	m_aFightRestart[Group] = false;
 	m_aFightBreakEndTick[Group] = 0;
@@ -1135,12 +1154,17 @@ bool CGameControllerGTrain::LeaveFight(int ClientId, bool NewAttempt)
 		m_aFightBreakEndTick[RemainingGroup] = BreakEndTick;
 		m_aFightTeam[RemainingGroup] = ScoreboardTeam;
 		m_aSettings[RemainingGroup] = Settings;
+		m_aFightLocked[RemainingGroup] = Locked;
+		for(int &Invite : m_aFightInvite)
+			if(Invite == Group)
+				Invite = RemainingGroup;
 	}
 	m_aFightGroup[ClientId] = ClientId;
 	m_aFightRestart[ClientId] = false;
 	m_aFightBreakEndTick[ClientId] = 0;
 	m_aFightWins[ClientId] = 0;
 	m_aSettings[ClientId] = Settings;
+	ForgetFightLock(ClientId);
 	// A fight ends when only one player is left, so does their score.
 	if(RemainingGroup >= 0 && FightSize(RemainingGroup) <= 1)
 		m_aFightWins[RemainingGroup] = 0;
@@ -1182,40 +1206,83 @@ void CGameControllerGTrain::Fight(int ClientId, const char *pName)
 		GameServer()->SendChatTarget(ClientId, "Player not found. Use their full name.");
 		return;
 	}
+	JoinFight(ClientId, Target);
+}
+
+bool CGameControllerGTrain::CheckCanFight(int ClientId, int Target)
+{
+	char aMessage[128];
+	// Teams play together and fights race solo, so they don't mix.
+	if(InTeam(ClientId))
+	{
+		GameServer()->SendChatTarget(ClientId, "You are in a team, which can't fight. /team alone leaves it.");
+		return false;
+	}
+	if(InTeam(Target))
+	{
+		str_format(aMessage, sizeof(aMessage), "'%s' is in a team, which can't fight.", Server()->ClientName(Target));
+		GameServer()->SendChatTarget(ClientId, aMessage);
+		return false;
+	}
+	// Paused and /spec players keep their characters and can fight.
+	if(GameServer()->m_apPlayers[ClientId]->GetTeam() == TEAM_SPECTATORS || GameServer()->m_apPlayers[Target]->GetTeam() == TEAM_SPECTATORS)
+	{
+		GameServer()->SendChatTarget(ClientId, "Spectators cannot join a fight.");
+		return false;
+	}
+	if(m_Map.m_vTrainPositions.empty())
+	{
+		GameServer()->SendChatTarget(ClientId, "Training is disabled on this map.");
+		return false;
+	}
+	return true;
+}
+
+bool CGameControllerGTrain::InvitedToFight(int ClientId, int Group) const
+{
+	return Group >= 0 && m_aFightInvite[ClientId] == Group &&
+	       Server()->Tick() - m_aFightInviteTick[ClientId] <= REQUEST_SECONDS * Server()->TickSpeed();
+}
+
+void CGameControllerGTrain::ForgetFightLock(int Group)
+{
+	m_aFightLocked[Group] = false;
+	for(int &Invite : m_aFightInvite)
+		if(Invite == Group)
+			Invite = -1;
+}
+
+void CGameControllerGTrain::JoinFight(int ClientId, int Target)
+{
+	CPlayer *pPlayer = GameServer()->m_apPlayers[ClientId];
 	if(Target == ClientId)
 	{
 		GameServer()->SendChatTarget(ClientId, "You cannot fight yourself.");
 		return;
 	}
-	if(InTeam(Target))
-	{
-		char aMessage[128];
-		str_format(aMessage, sizeof(aMessage), "'%s' is in a team, which can't fight.", Server()->ClientName(Target));
-		GameServer()->SendChatTarget(ClientId, aMessage);
+	if(!CheckCanFight(ClientId, Target))
 		return;
-	}
-	CPlayer *pTarget = GameServer()->m_apPlayers[Target];
-	// Paused and /spec players keep their characters and can fight.
-	if(pPlayer->GetTeam() == TEAM_SPECTATORS || pTarget->GetTeam() == TEAM_SPECTATORS)
-	{
-		GameServer()->SendChatTarget(ClientId, "Spectators cannot join a fight.");
-		return;
-	}
-	if(m_Map.m_vTrainPositions.empty())
-	{
-		GameServer()->SendChatTarget(ClientId, "Training is disabled on this map.");
-		return;
-	}
 	const int SourceGroup = m_aFightGroup[ClientId];
 	const int TargetGroup = m_aFightGroup[Target];
+	char aMessage[160];
 	if(SourceGroup == TargetGroup)
 	{
 		GameServer()->SendChatTarget(ClientId, "You are already in the same fight.");
 		return;
 	}
+	if(m_aFightLocked[TargetGroup] && !InvitedToFight(ClientId, TargetGroup))
+	{
+		str_format(aMessage, sizeof(aMessage), "The fight of '%s' is locked, ask them for an /invite.", Server()->ClientName(TargetGroup));
+		GameServer()->SendChatTarget(ClientId, aMessage);
+		return;
+	}
+	// Invites let players in once.
+	if(m_aFightInvite[ClientId] == TargetGroup)
+		m_aFightInvite[ClientId] = -1;
 	// Only the player switches fights, the rest of their fight goes on
 	// without them, like after /fight alone.
 	LeaveFight(ClientId, false);
+	ForgetFightLock(ClientId);
 	// Joining players enter the target group's current attempt, so the target
 	// group keeps its positions. Dead joiners are placed there on respawn.
 	const CAttempt &TargetAttempt = m_aAttempts[TargetGroup];
@@ -1232,7 +1299,6 @@ void CGameControllerGTrain::Fight(int ClientId, const char *pName)
 	if(!JoinAttempt)
 		m_aFightRestart[TargetGroup] = true;
 	UpdateFightTeams();
-	char aMessage[160];
 	str_format(aMessage, sizeof(aMessage), "'%s' joined the fight with '%s'. Use /fight to leave.",
 		Server()->ClientName(ClientId), Server()->ClientName(Target));
 	SendFightChat(TargetGroup, aMessage);
@@ -1304,24 +1370,30 @@ void CGameControllerGTrain::TeamUp(int ClientId, const char *pName)
 	GameServer()->SendChatTarget(ClientId, aMessage);
 }
 
-void CGameControllerGTrain::AcceptTeam(int ClientId)
+void CGameControllerGTrain::Accept(int ClientId)
 {
 	CPlayer *pPlayer = GameServer()->m_apPlayers[ClientId];
 	if(!pPlayer)
 		return;
-	// The latest request counts.
+	// The latest request counts, of a team or a fight.
 	int Inviter = -1;
 	for(int Other = 0; Other < MAX_CLIENTS; ++Other)
 	{
 		if(m_aTeamRequest[Other] != ClientId || !GameServer()->m_apPlayers[Other] ||
-			Server()->Tick() - m_aTeamRequestTick[Other] > TEAM_REQUEST_SECONDS * Server()->TickSpeed())
+			Server()->Tick() - m_aTeamRequestTick[Other] > REQUEST_SECONDS * Server()->TickSpeed())
 			continue;
 		if(Inviter < 0 || m_aTeamRequestTick[Other] > m_aTeamRequestTick[Inviter])
 			Inviter = Other;
 	}
+	const int FightInvite = m_aFightInvite[ClientId];
+	if(InvitedToFight(ClientId, FightInvite) && (Inviter < 0 || m_aFightInviteTick[ClientId] > m_aTeamRequestTick[Inviter]))
+	{
+		JoinFight(ClientId, FightInvite);
+		return;
+	}
 	if(Inviter < 0)
 	{
-		GameServer()->SendChatTarget(ClientId, "You have no team request. Requests last a minute.");
+		GameServer()->SendChatTarget(ClientId, "You have no team request or fight invite. They last a minute.");
 		return;
 	}
 	char aMessage[160];
@@ -1350,6 +1422,7 @@ void CGameControllerGTrain::AcceptTeam(int ClientId)
 	}
 	// Leaving another team restarts it without this player.
 	LeaveFight(ClientId, false);
+	ForgetFightLock(ClientId);
 	m_aFightGroup[ClientId] = Group;
 	m_aTeamGroup[Group] = true;
 	// Everyone starts over together, at a new spot.
@@ -1357,6 +1430,63 @@ void CGameControllerGTrain::AcceptTeam(int ClientId)
 	UpdateFightTeams();
 	str_format(aMessage, sizeof(aMessage), "'%s' joined the team of '%s'. /team alone leaves it.", Server()->ClientName(ClientId), Server()->ClientName(Group));
 	SendFightChat(Group, aMessage);
+}
+
+void CGameControllerGTrain::Lock(int ClientId, std::optional<bool> Locked)
+{
+	if(!GameServer()->m_apPlayers[ClientId])
+		return;
+	if(InTeam(ClientId))
+	{
+		GameServer()->SendChatTarget(ClientId, "Teams are always locked, players only join them by accepting an /invite.");
+		return;
+	}
+	if(!CheckFightLeader(ClientId, "lock or unlock the fight"))
+		return;
+	bool &FightLocked = m_aFightLocked[ClientId];
+	FightLocked = Locked.value_or(!FightLocked);
+	SendFightChat(ClientId, FightLocked ? "The fight is locked, players only join it when its leader invites them with /invite <player>." : "The fight is unlocked, anyone can join it with /fight.");
+}
+
+void CGameControllerGTrain::Invite(int ClientId, const char *pName)
+{
+	if(!GameServer()->m_apPlayers[ClientId])
+		return;
+	// Teams take players who accept anyway, every member asks like with /team.
+	if(InTeam(ClientId))
+	{
+		TeamUp(ClientId, pName);
+		return;
+	}
+	if(!CheckFightLeader(ClientId, "invite players"))
+		return;
+	const int Target = GameServer()->FindClientIdByName(pName).value_or(-1);
+	if(Target < 0 || !GameServer()->m_apPlayers[Target])
+	{
+		GameServer()->SendChatTarget(ClientId, "Player not found. Use their full name.");
+		return;
+	}
+	if(Target == ClientId)
+	{
+		GameServer()->SendChatTarget(ClientId, "You cannot invite yourself.");
+		return;
+	}
+	if(!CheckCanFight(ClientId, Target))
+		return;
+	char aMessage[160];
+	if(m_aFightGroup[Target] == ClientId)
+	{
+		str_format(aMessage, sizeof(aMessage), "'%s' is already in your fight.", Server()->ClientName(Target));
+		GameServer()->SendChatTarget(ClientId, aMessage);
+		return;
+	}
+	// A new invite replaces the player's previous one.
+	m_aFightInvite[Target] = ClientId;
+	m_aFightInviteTick[Target] = Server()->Tick();
+	str_format(aMessage, sizeof(aMessage), "'%s' invites you to their fight. Say /accept or /a within a minute to join.", Server()->ClientName(ClientId));
+	GameServer()->SendChatTarget(Target, aMessage);
+	str_format(aMessage, sizeof(aMessage), "You invited '%s' to your fight. They can join with /accept or /a within a minute.", Server()->ClientName(Target));
+	GameServer()->SendChatTarget(ClientId, aMessage);
 }
 
 void CGameControllerGTrain::Freeplay(int ClientId)
@@ -1642,9 +1772,9 @@ void CGameControllerGTrain::ShowSettings(int ClientId, const char *pName)
 	if(Settings.m_ScoreLimit > 0)
 		str_format(aScoreLimit, sizeof(aScoreLimit), "%d", Settings.m_ScoreLimit);
 	char aMessage[256];
-	str_format(aMessage, sizeof(aMessage), "%s: /trail %s, %s/distance %d%s, /nodj %s, /forwards %s, /freeplay %s, /scorelimit %s, kept weapons: %s",
+	str_format(aMessage, sizeof(aMessage), "%s: /trail %s, %s/distance %d%s, /nodj %s, /forwards %s, /freeplay %s, /scorelimit %s, /lock %s, kept weapons: %s",
 		aWhose, m_aHideTrail[Target] ? "off" : "on", aFromLeader, GoalDistance(Group), Settings.m_GoalDistance ? "" : " (server default)", Settings.m_NoDoubleJump ? "on" : "off",
-		Settings.m_Forwards ? "on" : "off", Settings.m_Freeplay ? "on" : "off", aScoreLimit, aWeapons[0] ? aWeapons : "none");
+		Settings.m_Forwards ? "on" : "off", Settings.m_Freeplay ? "on" : "off", aScoreLimit, m_aFightLocked[Group] ? "on" : "off", aWeapons[0] ? aWeapons : "none");
 	GameServer()->SendChatTarget(ClientId, aMessage);
 }
 
@@ -1656,6 +1786,7 @@ void CGameControllerGTrain::Help()
 	log_info("chatresp", "/tp, /teleport, /lasttp, /back, /rescue, /invincible: retry like /r, for practice binds");
 	log_info("chatresp", "/tc or /telecursor: retry like /r, in freeplay start where you aim, or in /spec at the middle of your view");
 	log_info("chatresp", "/fight <player>: join a player's fight, /fight alone leaves it");
+	log_info("chatresp", "/lock: toggle letting only players you /invite <player> join your fight, they join with /accept, /a or /fight. In a team, /invite asks like /team <player>.");
 	log_info("chatresp", "/team <player>: ask a player to play together, /accept or /a joins, /team alone leaves; each member takes a flag and earns a share of ELO");
 	log_info("chatresp", "/distance <%d-%d>: goal distance in tiles, 0 for the server default", MinGoalDistance(), (int)MAX_GOAL_DISTANCE);
 	log_info("chatresp", "/nodj: toggle starting attempts without double jump");
@@ -1910,6 +2041,8 @@ void CGameControllerGTrain::OnPlayerDisconnect(CPlayer *pPlayer, const char *pRe
 	for(int &Target : m_aTeamRequest)
 		if(Target == ClientId)
 			Target = -1;
+	ForgetFightLock(ClientId);
+	m_aFightInvite[ClientId] = -1;
 	EndAttempt(ClientId, false);
 	SaveStats(ClientId);
 	m_aPendingPlace[ClientId] = false;

@@ -1146,10 +1146,10 @@ void CGameContext::ConAcceptTeam(IConsole::IResult *pResult, void *pUserData)
 	auto *pController = dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController);
 	if(!pController)
 	{
-		pSelf->SendChatTarget(pResult->m_ClientId, "Team requests are only available in GTrain.");
+		pSelf->SendChatTarget(pResult->m_ClientId, "Team requests and fight invites are only available in GTrain.");
 		return;
 	}
-	pController->AcceptTeam(pResult->m_ClientId);
+	pController->Accept(pResult->m_ClientId);
 }
 
 void CGameContext::ConFight(IConsole::IResult *pResult, void *pUserData)
