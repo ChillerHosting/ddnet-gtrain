@@ -1779,9 +1779,10 @@ bool CGameControllerGTrain::AnnounceFightScore(int Winner, const std::optional<C
 	Server()->SetClientScore(Winner, SnapPlayerScore(Winner, GameServer()->m_apPlayers[Winner]));
 	char aScore[64] = "Fight score:";
 	if(ScoreLimit > 0)
-		str_format(aScore, sizeof(aScore), "Fight score (first to %d):", ScoreLimit);
-	char aResult[64];
+		str_format(aScore, sizeof(aScore), "First to %d:", ScoreLimit);
+	char aResult[128];
 	FormatCaptureResult(aResult, sizeof(aResult), m_aAttempts[Winner].m_Fails, Gain);
+	AppendCaptureStep(aResult, sizeof(aResult), m_aAttempts[Winner]);
 	char aMessage[MAX_CHAT_LENGTH];
 	str_format(aMessage, sizeof(aMessage), "'%s' captured the flag (%s). %s", Server()->ClientName(Winner), aResult, aScore);
 	bool First = true;

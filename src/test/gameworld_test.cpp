@@ -2046,7 +2046,7 @@ TEST_F(GameWorld, GTrainFightChainingDeathAndCapture)
 		pController->Tick();
 	}
 	const std::string Messages = CaptureLogger.ConcatenatedLines();
-	EXPECT_NE(Messages.find("'Wilson' captured the flag (0 fails). Fight score (first to 10):"), std::string::npos);
+	EXPECT_NE(Messages.find("'Wilson' captured the flag (0 fails). First to 10:"), std::string::npos);
 	EXPECT_NE(Messages.find("'Wilson': 1"), std::string::npos);
 	EXPECT_NE(Messages.find("'Anna': 0"), std::string::npos);
 	EXPECT_NE(Messages.find("'Bob': 0"), std::string::npos);
@@ -2066,7 +2066,7 @@ TEST_F(GameWorld, GTrainFightChainingDeathAndCapture)
 		CLogScope Scope(&NextLogger);
 		pController->Tick();
 	}
-	EXPECT_NE(NextLogger.ConcatenatedLines().find("'Anna' captured the flag (0 fails). Fight score (first to 10):"), std::string::npos);
+	EXPECT_NE(NextLogger.ConcatenatedLines().find("'Anna' captured the flag (0 fails). First to 10:"), std::string::npos);
 	EXPECT_NE(NextLogger.ConcatenatedLines().find("'Anna': 1"), std::string::npos);
 	EXPECT_NE(NextLogger.ConcatenatedLines().find("'Wilson': 1"), std::string::npos);
 	EXPECT_EQ(NextLogger.ConcatenatedLines().find("seconds"), std::string::npos);
@@ -2772,7 +2772,7 @@ TEST_F(GameWorld, GTrainCaptureCountsFailsAtTheSamePosition)
 	GameServer()->m_apPlayers[Bob]->ForceSpawn(vec2(80, 80));
 	pController->Tick();
 	m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, Bob);
-	EXPECT_NE(Capture(Bob).find("'Bob' captured the flag (2 fails). Fight score (first to 10): 'Anna': 0, 'Bob': 1"), std::string::npos);
+	EXPECT_NE(Capture(Bob).find("'Bob' captured the flag (2 fails). First to 10: 'Anna': 0, 'Bob': 1"), std::string::npos);
 	EXPECT_NE(Capture(Anna).find("'Anna' captured the flag (0 fails)."), std::string::npos);
 }
 
@@ -3031,11 +3031,11 @@ TEST_F(GameWorld, GTrainCapturesEarnEloByDifficultySpeedAndGoalDistance)
 	pController->Tick();
 	Tiles = GoalTiles(Bob);
 	Messages = Capture(Bob);
-	EXPECT_NE(Messages.find("'Bob' captured the flag (0 fails, " + Gain(Bob, 14, Tiles, 0) + "). Fight score (first to 10): 'Anna': 0, 'Bob': 1"), std::string::npos);
+	EXPECT_NE(Messages.find("'Bob' captured the flag (0 fails, " + Gain(Bob, 14, Tiles, 0) + "). First to 10: 'Anna': 0, 'Bob': 1"), std::string::npos);
 	EXPECT_EQ(Messages.find("'Anna' captured"), std::string::npos);
 	// Frozen fight captures score too.
 	Messages = Capture(Bob, 0, true);
-	EXPECT_NE(Messages.find("'Bob' captured the flag (0 fails, +0 ELO (frozen)). Fight score (first to 10): 'Anna': 0, 'Bob': 2"), std::string::npos);
+	EXPECT_NE(Messages.find("'Bob' captured the flag (0 fails, +0 ELO (frozen)). First to 10: 'Anna': 0, 'Bob': 2"), std::string::npos);
 	EXPECT_EQ(pController->Stats(Bob).m_Points, aPoints[Bob]);
 
 	// Deranged maps have no stars and are worth what Extreme ★★★★★ would be.
@@ -3666,6 +3666,41 @@ TEST_F(GameWorld, GTrainCapturesEarnByTheirTiles)
 	EXPECT_TRUE(str_find(Messages.c_str(), aExpected)) << Messages << "\nexpected " << aExpected;
 }
 
+TEST_F(GameWorld, GTrainFightCapturesShowTheirDifficulty)
+{
+	// Like solo captures, fight captures tell how hard their part was.
+	PrepareTrainingCorridor();
+	g_Config.m_SvSpamprotection = 0;
+	g_Config.m_SvGtrainGoalDistance = 6;
+	CCollision *pCollision = GameServer()->Collision();
+	const int Width = pCollision->GetWidth();
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob"});
+	const int Anna = vIds[0], Bob = vIds[1];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	pController->SetMapDifficulty("Easy", 1);
+	std::vector<float> vDifficulties((size_t)Width * pCollision->GetHeight(), CGTrainTileRatings::UNRATED);
+	for(int x = 1; x < Width - 1; ++x)
+		vDifficulties[pCollision->GetPureMapIndex(vec2(x * 32 + 16, 80))] = GTrainElo::TILE_STEP_DIFFICULTIES[3];
+	pController->SetTileDifficulties(vDifficulties);
+	pController->Fight(Bob, "Anna");
+	pController->Tick();
+	GameServer()->GetPlayerChar(Anna)->Unfreeze();
+	GameServer()->GetPlayerChar(Bob)->Unfreeze();
+	pController->Tick();
+
+	CCharacter *pChr = GameServer()->GetPlayerChar(Bob);
+	pChr->m_Pos = pChr->m_PrevPos = TrainingGoal(Bob);
+	pChr->SetPosition(pChr->m_Pos);
+	CMemoryLogger Logger;
+	{
+		CLogScope Scope(&Logger);
+		pController->Tick();
+	}
+	const std::string Messages = Logger.ConcatenatedLines();
+	EXPECT_TRUE(str_find(Messages.c_str(), "'Bob' captured the flag (0 fails, +")) << Messages;
+	EXPECT_TRUE(str_find(Messages.c_str(), "x speed, Main ★☆☆). First to 10: 'Anna': 0, 'Bob': 1")) << Messages;
+}
+
 TEST_F(GameWorld, GTrainTeamMembersEarnUntilTheirFlag)
 {
 	// Members play on after taking their flag, but what they earn ends there:
@@ -4031,7 +4066,7 @@ TEST_F(GameWorld, GTrainScoreLimitEndsTheFight)
 	EXPECT_EQ(Capture(Bob).find("won the fight"), std::string::npos);
 	EXPECT_EQ(Capture(Anna).find("won the fight"), std::string::npos);
 	const std::string Messages = Capture(Bob);
-	EXPECT_NE(Messages.find("'Bob' captured the flag (0 fails). Fight score (first to 2): 'Anna': 1, 'Bob': 2"), std::string::npos);
+	EXPECT_NE(Messages.find("'Bob' captured the flag (0 fails). First to 2: 'Anna': 1, 'Bob': 2"), std::string::npos);
 	EXPECT_NE(Messages.find("'Bob' won the fight with 2 points! The fight score starts over."), std::string::npos);
 	const int BreakTicks = 10 * m_pServer->TickSpeed();
 	for(int ClientId : vIds)
