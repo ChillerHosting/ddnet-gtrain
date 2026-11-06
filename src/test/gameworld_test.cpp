@@ -1658,8 +1658,8 @@ TEST_F(GameWorld, GTrainTeamsPlayTogether)
 	EXPECT_LT(Captured("Bob", BobBefore, BobPoints, 2.0), Captured("Anna", AnnaBefore, AnnaPoints, 3.0));
 	CheckTogether({Anna, Bob});
 
-	// A death before the last flag starts over, nobody earns. So does taking
-	// it frozen, which still ends the run for the team.
+	// A death before the last flag starts over, nobody earns. Frozen tees
+	// don't take flags, only once they are in control again.
 	Release();
 	MoveTo(Bob, TrainingFlags(Bob)[0]);
 	pController->Tick();
@@ -1677,12 +1677,17 @@ TEST_F(GameWorld, GTrainTeamsPlayTogether)
 	MoveTo(Anna, vNewFlags[1]);
 	Chr(Anna)->Freeze();
 	const CGTrainStats AnnaFrozen = pController->Stats(Anna);
+	pController->Tick();
+	EXPECT_EQ(TrainingFlags(Anna), std::vector<vec2>{vNewFlags[1]});
+	EXPECT_EQ(pController->Stats(Anna).m_Captures, AnnaFrozen.m_Captures);
+	EXPECT_EQ(pController->Stats(Bob).m_Points, BobFirst.m_Points);
+	Chr(Anna)->Unfreeze();
 	{
 		CLogScope Scope(&Logger);
 		pController->Tick();
 	}
-	EXPECT_NE(Logger.ConcatenatedLines().find("'Anna' captured a flag for their team in 0.00 seconds (0 fails, +0 ELO (frozen))."), std::string::npos) << Logger.ConcatenatedLines();
-	EXPECT_EQ(pController->Stats(Anna).m_Points, AnnaFrozen.m_Points);
+	EXPECT_NE(Logger.ConcatenatedLines().find("'Anna' captured a flag for their team in 0.00 seconds (0 fails, +"), std::string::npos) << Logger.ConcatenatedLines();
+	EXPECT_GT(pController->Stats(Anna).m_Points, AnnaFrozen.m_Points);
 	EXPECT_GT(pController->Stats(Bob).m_Points, BobFirst.m_Points);
 	CheckTogether({Anna, Bob});
 

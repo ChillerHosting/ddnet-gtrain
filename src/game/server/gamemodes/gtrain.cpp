@@ -986,13 +986,13 @@ bool CGameControllerGTrain::ReachedFlag(CCharacter *pChr, vec2 Flag) const
 void CGameControllerGTrain::CollectTeamFlag(CCharacter *pChr, CTeamFlag &Flag)
 {
 	// The member keeps playing to help the others, their tiles and time end
-	// here. Frozen members take flags too, they only earn nothing.
+	// here. Only members in control take flags.
 	const int ClientId = pChr->GetPlayer()->GetCid();
 	const int Group = m_aFightGroup[ClientId];
 	CAttempt &Attempt = m_aAttempts[ClientId];
 	Flag.m_Collector = ClientId;
 	Attempt.m_CaptureTick = Server()->Tick();
-	Attempt.m_TeamGain = CaptureGain(ClientId, pChr->m_FreezeTime > 0 || pChr->Core()->m_DeepFrozen || pChr->Core()->m_LiveFrozen);
+	Attempt.m_TeamGain = CaptureGain(ClientId, false);
 	const std::vector<CTeamFlag> &vFlags = m_avTeamFlags[Group];
 	const int Left = std::count_if(vFlags.begin(), vFlags.end(), [](const CTeamFlag &Other) { return Other.m_Collector < 0; });
 	if(Left == 0)
@@ -1841,14 +1841,15 @@ void CGameControllerGTrain::CheckGoal(CCharacter *pChr)
 	CAttempt &Attempt = m_aAttempts[ClientId];
 	const CGTrainGoal &Target = *Attempt.m_pGoal;
 
-	// Teammates take one flag each, any of the team's.
+	// Teammates take one flag each, any of the team's. Frozen tees pass
+	// flags without taking them, being thrown onto one is no capture.
 	if(m_aTeamGroup[m_aFightGroup[ClientId]])
 	{
 		std::vector<CTeamFlag> &vFlags = m_avTeamFlags[m_aFightGroup[ClientId]];
 		if(vFlags.empty())
 			for(const int Node : TeamFlagNodes(Target.m_Goal, FightSize(m_aFightGroup[ClientId])))
 				vFlags.push_back({Node, -1});
-		if(Attempt.m_CaptureTick >= 0)
+		if(Attempt.m_CaptureTick >= 0 || pChr->m_FreezeTime > 0 || pChr->Core()->m_DeepFrozen || pChr->Core()->m_LiveFrozen)
 			return;
 		for(CTeamFlag &Flag : vFlags)
 			if(Flag.m_Collector < 0 && ReachedFlag(pChr, m_Map.m_PathGraph.m_vNodes[Flag.m_Node].m_Pos))
