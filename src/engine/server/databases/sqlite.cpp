@@ -142,8 +142,10 @@ bool CSqliteConnection::ConnectImpl(char *pError, int ErrorSize)
 		return false;
 	}
 
-	// wait for database to unlock so we don't have to handle SQLITE_BUSY errors
-	sqlite3_busy_timeout(m_pDb, -1);
+	// Wait for the database to unlock, so other servers sharing the file
+	// don't make writes fail with SQLITE_BUSY. Zero or less would turn
+	// waiting off, failing at once.
+	sqlite3_busy_timeout(m_pDb, 60 * 1000);
 
 	if(m_Setup)
 	{
@@ -163,6 +165,12 @@ bool CSqliteConnection::ConnectImpl(char *pError, int ErrorSize)
 		if(!Execute(aBuf, pError, ErrorSize))
 			return false;
 		FormatCreatePoints(aBuf, sizeof(aBuf));
+		if(!Execute(aBuf, pError, ErrorSize))
+			return false;
+		FormatCreateGTrainStats(aBuf, sizeof(aBuf));
+		if(!Execute(aBuf, pError, ErrorSize))
+			return false;
+		FormatCreateGTrainRuns(aBuf, sizeof(aBuf), "BLOB");
 		if(!Execute(aBuf, pError, ErrorSize))
 			return false;
 

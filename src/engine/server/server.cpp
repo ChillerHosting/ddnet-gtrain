@@ -2581,7 +2581,11 @@ void CServer::CacheServerInfo(CCache *pCache, int Type, bool SendClients)
 			ADD_INT(q, m_aClients[i].m_Country); // client country (ISO 3166-1 numeric)
 
 			int Score;
-			if(m_aClients[i].m_Score.has_value())
+			if(!GameServer()->HasTimeScore())
+			{
+				Score = m_aClients[i].m_Score.value_or(0);
+			}
+			else if(m_aClients[i].m_Score.has_value())
 			{
 				Score = m_aClients[i].m_Score.value();
 				if(Score == -FinishTime::NOT_FINISHED_TIMESCORE)
@@ -2898,8 +2902,9 @@ void CServer::UpdateRegisterServerInfo()
 	JsonWriter.WriteAttribute("version");
 	JsonWriter.WriteStrValue(GameServer()->Version());
 
+	const bool TimeScore = GameServer()->HasTimeScore();
 	JsonWriter.WriteAttribute("client_score_kind");
-	JsonWriter.WriteStrValue("time"); // "points" or "time"
+	JsonWriter.WriteStrValue(TimeScore ? "time" : "points");
 
 	JsonWriter.WriteAttribute("requires_login");
 	JsonWriter.WriteBoolValue(false);
@@ -2952,7 +2957,7 @@ void CServer::UpdateRegisterServerInfo()
 			JsonWriter.WriteIntValue(m_aClients[i].m_Country); // ISO 3166-1 numeric
 
 			JsonWriter.WriteAttribute("score");
-			JsonWriter.WriteIntValue(m_aClients[i].m_Score.value_or(FinishTime::NOT_FINISHED_TIMESCORE));
+			JsonWriter.WriteIntValue(m_aClients[i].m_Score.value_or(TimeScore ? FinishTime::NOT_FINISHED_TIMESCORE : 0));
 
 			JsonWriter.WriteAttribute("is_player");
 			JsonWriter.WriteBoolValue(GameServer()->IsClientPlayer(i));

@@ -123,6 +123,9 @@ public:
 	virtual void RegisterTemp(const char *pName, const char *pParams, int Flags, const char *pHelp) = 0;
 	virtual void DeregisterTemp(const char *pName) = 0;
 	virtual void DeregisterTempAll() = 0;
+	// Removes the flags from every command with this name, like the chat flag
+	// of chat commands a gametype has no use for.
+	virtual void RemoveCommandFlags(const char *pName, int Flags) = 0;
 	virtual void Chain(const char *pName, FChainCommandCallback pfnChainFunc, void *pUser) = 0;
 	virtual void StoreCommands(bool Store) = 0;
 

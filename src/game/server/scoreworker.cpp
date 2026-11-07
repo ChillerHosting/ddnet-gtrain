@@ -11,6 +11,9 @@
 #include <engine/server/sql_string_helpers.h>
 #include <engine/shared/config.h>
 
+#include <game/server/gamemodes/gtrain_elo.h>
+
+#include <cinttypes>
 #include <cmath>
 
 // "6b407e81-8b77-3e04-a207-8da17f37d000"
@@ -1586,6 +1589,423 @@ bool CScoreWorker::ShowTopPoints(IDbConnection *pSqlServer, const ISqlData *pGam
 	str_copy(paMessages[Line], "-------------------------------");
 
 	return true;
+}
+
+bool CScoreWorker::LoadMapDifficulty(IDbConnection *pSqlServer, const ISqlData *pGameData, char *pError, int ErrorSize)
+{
+	const auto *pData = dynamic_cast<const CSqlMapDifficultyRequest *>(pGameData);
+	auto *pResult = dynamic_cast<CScoreMapDifficultyResult *>(pGameData->m_pResult.get());
+
+	char aBuf[256];
+	str_format(aBuf, sizeof(aBuf), "SELECT Server, Stars FROM %s_maps WHERE Map = ?", pSqlServer->GetPrefix());
+	if(!pSqlServer->PrepareStatement(aBuf, pError, ErrorSize))
+	{
+		return false;
+	}
+	pSqlServer->BindString(1, pData->m_aMap);
+
+	bool End;
+	if(!pSqlServer->Step(&End, pError, ErrorSize))
+	{
+		return false;
+	}
+	if(!End)
+	{
+		pSqlServer->GetString(1, pResult->m_aServer, sizeof(pResult->m_aServer));
+		pResult->m_Stars = pSqlServer->GetInt(2);
+	}
+	return true;
+}
+
+bool CScoreWorker::LoadGTrainStats(IDbConnection *pSqlServer, const ISqlData *pGameData, char *pError, int ErrorSize)
+{
+	const auto *pData = dynamic_cast<const CSqlGTrainStatsData *>(pGameData);
+	auto *pResult = dynamic_cast<CScoreGTrainStatsResult *>(pGameData->m_pResult.get());
+
+	char aBuf[256];
+	str_format(aBuf, sizeof(aBuf),
+		"SELECT Points, Captures, Attempts, Respawns, Playtime FROM %s_gtrain_stats WHERE Name = ?",
+		pSqlServer->GetPrefix());
+	if(!pSqlServer->PrepareStatement(aBuf, pError, ErrorSize))
+	{
+		return false;
+	}
+	pSqlServer->BindString(1, pData->m_aName);
+
+	bool End;
+	if(!pSqlServer->Step(&End, pError, ErrorSize))
+	{
+		return false;
+	}
+	if(!End)
+	{
+		pResult->m_Stats.m_Points = pSqlServer->GetInt64(1);
+		pResult->m_Stats.m_Captures = pSqlServer->GetInt(2);
+		pResult->m_Stats.m_Attempts = pSqlServer->GetInt(3);
+		pResult->m_Stats.m_Respawns = pSqlServer->GetInt(4);
+		pResult->m_Stats.m_Playtime = pSqlServer->GetInt(5);
+	}
+	return true;
+}
+
+static void FormatPlaytime(int Seconds, char *pBuf, int BufSize)
+{
+	str_format(pBuf, BufSize, "%dh %02dm", Seconds / 3600, Seconds / 60 % 60);
+}
+
+bool CScoreWorker::ShowElo(IDbConnection *pSqlServer, const ISqlData *pGameData, char *pError, int ErrorSize)
+{
+	const auto *pData = dynamic_cast<const CSqlPlayerRequest *>(pGameData);
+	auto *pResult = dynamic_cast<CScorePlayerResult *>(pGameData->m_pResult.get());
+	auto *paMessages = pResult->m_Data.m_aaMessages;
+
+	char aBuf[512];
+	str_format(aBuf, sizeof(aBuf),
+		"SELECT ("
+		"  SELECT COUNT(Name) + 1 FROM %s_gtrain_stats WHERE Points > ("
+		"    SELECT Points FROM %s_gtrain_stats WHERE Name = ?"
+		")) as Ranking, Points, Name "
+		"FROM %s_gtrain_stats WHERE Name = ?",
+		pSqlServer->GetPrefix(), pSqlServer->GetPrefix(), pSqlServer->GetPrefix());
+	if(!pSqlServer->PrepareStatement(aBuf, pError, ErrorSize))
+	{
+		return false;
+	}
+	pSqlServer->BindString(1, pData->m_aName);
+	pSqlServer->BindString(2, pData->m_aName);
+
+	bool End;
+	if(!pSqlServer->Step(&End, pError, ErrorSize))
+	{
+		return false;
+	}
+	if(!End)
+	{
+		int Rank = pSqlServer->GetInt(1);
+		int64_t Points = pSqlServer->GetInt64(2);
+		char aName[MAX_NAME_LENGTH];
+		pSqlServer->GetString(3, aName, sizeof(aName));
+		pResult->m_MessageKind = CScorePlayerResult::ALL;
+		str_format(paMessages[0], sizeof(paMessages[0]),
+			"%d. %s ELO: %d, requested by %s",
+			Rank, aName, (int)GTrainElo::FromPoints(Points), pData->m_aRequestingPlayer);
+	}
+	else
+	{
+		str_format(paMessages[0], sizeof(paMessages[0]),
+			"%s has not gained any ELO so far", pData->m_aName);
+	}
+	return true;
+}
+
+bool CScoreWorker::ShowGTrainProfile(IDbConnection *pSqlServer, const ISqlData *pGameData, char *pError, int ErrorSize)
+{
+	const auto *pData = dynamic_cast<const CSqlPlayerRequest *>(pGameData);
+	auto *pResult = dynamic_cast<CScorePlayerResult *>(pGameData->m_pResult.get());
+	auto *paMessages = pResult->m_Data.m_aaMessages;
+
+	char aBuf[512];
+	str_format(aBuf, sizeof(aBuf),
+		"SELECT ("
+		"  SELECT COUNT(Name) + 1 FROM %s_gtrain_stats WHERE Points > ("
+		"    SELECT Points FROM %s_gtrain_stats WHERE Name = ?"
+		")) as Ranking, Points, Captures, Attempts, Respawns, Playtime, Name "
+		"FROM %s_gtrain_stats WHERE Name = ?",
+		pSqlServer->GetPrefix(), pSqlServer->GetPrefix(), pSqlServer->GetPrefix());
+	if(!pSqlServer->PrepareStatement(aBuf, pError, ErrorSize))
+	{
+		return false;
+	}
+	pSqlServer->BindString(1, pData->m_aName);
+	pSqlServer->BindString(2, pData->m_aName);
+
+	bool End;
+	if(!pSqlServer->Step(&End, pError, ErrorSize))
+	{
+		return false;
+	}
+	if(!End)
+	{
+		int Rank = pSqlServer->GetInt(1);
+		int64_t Points = pSqlServer->GetInt64(2);
+		int Captures = pSqlServer->GetInt(3);
+		int Attempts = pSqlServer->GetInt(4);
+		int Respawns = pSqlServer->GetInt(5);
+		char aPlaytime[32];
+		FormatPlaytime(pSqlServer->GetInt(6), aPlaytime, sizeof(aPlaytime));
+		char aName[MAX_NAME_LENGTH];
+		pSqlServer->GetString(7, aName, sizeof(aName));
+		pResult->m_MessageKind = CScorePlayerResult::ALL;
+		str_format(paMessages[0], sizeof(paMessages[0]),
+			"%d. %s ELO: %d, %d %s, %d %s, %d %s, %s played, requested by %s",
+			Rank, aName, (int)GTrainElo::FromPoints(Points),
+			Captures, Captures == 1 ? "capture" : "captures",
+			Attempts, Attempts == 1 ? "attempt" : "attempts",
+			Respawns, Respawns == 1 ? "respawn" : "respawns",
+			aPlaytime, pData->m_aRequestingPlayer);
+	}
+	else
+	{
+		str_format(paMessages[0], sizeof(paMessages[0]),
+			"%s has not played GTrain so far", pData->m_aName);
+	}
+	return true;
+}
+
+bool CScoreWorker::ShowGTrainTop(IDbConnection *pSqlServer, const ISqlData *pGameData, char *pError, int ErrorSize)
+{
+	const auto *pData = dynamic_cast<const CSqlGTrainTopRequest *>(pGameData);
+	auto *pResult = dynamic_cast<CScorePlayerResult *>(pGameData->m_pResult.get());
+	auto *paMessages = pResult->m_Data.m_aaMessages;
+
+	const char *pColumn = "Points";
+	const char *pTitle = "ELO";
+	switch(pData->m_Stat)
+	{
+	case EGTrainStat::POINTS: break;
+	case EGTrainStat::CAPTURES: pColumn = pTitle = "Captures"; break;
+	case EGTrainStat::ATTEMPTS: pColumn = pTitle = "Attempts"; break;
+	case EGTrainStat::RESPAWNS: pColumn = pTitle = "Respawns"; break;
+	case EGTrainStat::PLAYTIME: pColumn = pTitle = "Playtime"; break;
+	}
+
+	int LimitStart = std::max(pData->m_Offset - 1, 0);
+
+	// Players who have none of the stat are left out.
+	char aBuf[512];
+	str_format(aBuf, sizeof(aBuf),
+		"SELECT RANK() OVER (ORDER BY a.%s DESC) as Ranking, %s, Name "
+		"FROM ("
+		"  SELECT %s, Name "
+		"  FROM %s_gtrain_stats "
+		"  WHERE %s > 0 "
+		"  ORDER BY %s DESC LIMIT ?"
+		") as a "
+		"ORDER BY Ranking ASC, Name ASC LIMIT ?, 5",
+		pColumn, pColumn, pColumn, pSqlServer->GetPrefix(), pColumn, pColumn);
+	if(!pSqlServer->PrepareStatement(aBuf, pError, ErrorSize))
+	{
+		return false;
+	}
+	pSqlServer->BindInt(1, LimitStart + 5);
+	pSqlServer->BindInt(2, LimitStart);
+
+	str_format(paMessages[0], sizeof(paMessages[0]), "-------- Top %s --------", pTitle);
+
+	bool End = false;
+	int Line = 1;
+	while(pSqlServer->Step(&End, pError, ErrorSize) && !End)
+	{
+		int Rank = pSqlServer->GetInt(1);
+		int64_t Value = pSqlServer->GetInt64(2);
+		char aName[MAX_NAME_LENGTH];
+		pSqlServer->GetString(3, aName, sizeof(aName));
+		char aValue[32];
+		if(pData->m_Stat == EGTrainStat::POINTS)
+			str_format(aValue, sizeof(aValue), "%d", (int)GTrainElo::FromPoints(Value));
+		else if(pData->m_Stat == EGTrainStat::PLAYTIME)
+			FormatPlaytime((int)Value, aValue, sizeof(aValue));
+		else
+			str_format(aValue, sizeof(aValue), "%" PRId64, Value);
+		str_format(paMessages[Line], sizeof(paMessages[Line]),
+			"%d. %s %s: %s", Rank, aName, pTitle, aValue);
+		Line++;
+	}
+	if(!End)
+	{
+		return false;
+	}
+	str_copy(paMessages[Line], "-------------------------------");
+
+	return true;
+}
+
+bool CScoreWorker::SaveGTrainRun(IDbConnection *pSqlServer, const ISqlData *pGameData, Write w, char *pError, int ErrorSize)
+{
+	const auto *pData = dynamic_cast<const CSqlGTrainRunData *>(pGameData);
+
+	// Like the stats, runs only go to the main database.
+	if(w != Write::NORMAL)
+	{
+		return true;
+	}
+
+	// Compressing happens here, off the game thread.
+	std::vector<unsigned char> vRun = pData->m_pTeamRun ? pData->m_pTeamRun->Encode() : pData->m_Run.Encode();
+	char aBuf[512];
+	str_format(aBuf, sizeof(aBuf),
+		"%s INTO %s_gtrain_runs(Map, MapSha256, Name, Timestamp, GameId, Revision, StartTick, Ticks, Distance, Elo, SpeedFactor, Run, Points) "
+		"VALUES (?, ?, ?, %s, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		pSqlServer->InsertIgnore(), pSqlServer->GetPrefix(), pSqlServer->InsertTimestampAsUtc());
+	if(!pSqlServer->PrepareStatement(aBuf, pError, ErrorSize))
+	{
+		return false;
+	}
+	pSqlServer->BindString(1, pData->m_aMap);
+	pSqlServer->BindString(2, pData->m_aMapSha256);
+	pSqlServer->BindString(3, pData->m_aName);
+	pSqlServer->BindString(4, pData->m_aTimestamp);
+	pSqlServer->BindString(5, pData->m_aGameUuid);
+	pSqlServer->BindString(6, pData->m_aRevision);
+	const CGTrainRun &Start = pData->m_pTeamRun ? pData->m_pTeamRun->m_vMembers.front().m_Run : pData->m_Run;
+	pSqlServer->BindInt(7, Start.m_Start.m_Tick);
+	pSqlServer->BindInt(8, pData->m_pTeamRun ? pData->m_TeamTicks : (int)pData->m_Run.m_vInputs.size());
+	pSqlServer->BindInt(9, pData->m_Distance);
+	pSqlServer->BindFloat(10, pData->m_Elo);
+	pSqlServer->BindFloat(11, pData->m_SpeedFactor);
+	pSqlServer->BindBlob(12, vRun.data(), vRun.size());
+	pSqlServer->BindInt64(13, pData->m_Points);
+	int NumInserted;
+	return pSqlServer->ExecuteUpdate(&NumInserted, pError, ErrorSize);
+}
+
+bool CScoreWorker::BanGTrainRuns(IDbConnection *pSqlServer, const ISqlData *pGameData, Write w, char *pError, int ErrorSize)
+{
+	const auto *pData = dynamic_cast<const CSqlGTrainBanRunsData *>(pGameData);
+
+	// Runs and stats are only in the main database.
+	if(w != Write::NORMAL)
+	{
+		return true;
+	}
+
+	// The runs to change, the same in every statement. There are no
+	// transactions, so a run of the player stored by another server between
+	// the statements would be marked without its points changing. Banning
+	// maps after removing them, or players while they are offline, avoids
+	// that.
+	char aFilter[256];
+	str_format(aFilter, sizeof(aFilter), "r.Banned = %s%s%s",
+		pData->m_Ban ? pSqlServer->False() : pSqlServer->True(),
+		pData->m_aMap[0] ? " AND r.Map = ?" : "",
+		pData->m_aName[0] ? " AND r.Name = ?" : "");
+	// Binds the filter's values from Index on, returns the next index.
+	auto BindFilter = [&](int Index) {
+		if(pData->m_aMap[0])
+			pSqlServer->BindString(Index++, pData->m_aMap);
+		if(pData->m_aName[0])
+			pSqlServer->BindString(Index++, pData->m_aName);
+		return Index;
+	};
+	const char *pPrefix = pSqlServer->GetPrefix();
+	const char *pWhat = pData->m_aMap[0] ? pData->m_aMap : "every map";
+	const char *pWho = pData->m_aName[0] ? pData->m_aName : "every player";
+
+	char aBuf[1024];
+	str_format(aBuf, sizeof(aBuf),
+		"SELECT COUNT(*), COUNT(DISTINCT r.Name), COALESCE(SUM(r.Points), 0), "
+		"  COALESCE(SUM(CASE WHEN r.Points IS NULL THEN 1 ELSE 0 END), 0) "
+		"FROM %s_gtrain_runs r WHERE %s",
+		pPrefix, aFilter);
+	if(!pSqlServer->PrepareStatement(aBuf, pError, ErrorSize))
+	{
+		return false;
+	}
+	BindFilter(1);
+	bool End;
+	if(!pSqlServer->Step(&End, pError, ErrorSize))
+	{
+		return false;
+	}
+	const int NumRuns = End ? 0 : pSqlServer->GetInt(1);
+	const int NumPlayers = End ? 0 : pSqlServer->GetInt(2);
+	const int64_t Points = End ? 0 : pSqlServer->GetInt64(3);
+	const int NumWithoutPoints = End ? 0 : pSqlServer->GetInt(4);
+	if(NumRuns == 0)
+	{
+		log_info("gtrain", "no %s runs of %s on %s", pData->m_Ban ? "unbanned" : "banned", pWho, pWhat);
+		return true;
+	}
+
+	// Banning takes what the runs earned off the stats, lifting the ban adds
+	// it again. Runs stored before their points were keep theirs.
+	str_format(aBuf, sizeof(aBuf),
+		"UPDATE %s_gtrain_stats SET "
+		"  Points = Points %c (SELECT COALESCE(SUM(r.Points), 0) FROM %s_gtrain_runs r WHERE r.Name = %s_gtrain_stats.Name AND %s), "
+		"  Captures = Captures %c (SELECT COUNT(*) FROM %s_gtrain_runs r WHERE r.Name = %s_gtrain_stats.Name AND %s) "
+		"WHERE Name IN (SELECT r.Name FROM %s_gtrain_runs r WHERE %s)",
+		pPrefix,
+		pData->m_Ban ? '-' : '+', pPrefix, pPrefix, aFilter,
+		pData->m_Ban ? '-' : '+', pPrefix, pPrefix, aFilter,
+		pPrefix, aFilter);
+	if(!pSqlServer->PrepareStatement(aBuf, pError, ErrorSize))
+	{
+		return false;
+	}
+	BindFilter(BindFilter(BindFilter(1)));
+	int NumUpdated;
+	if(!pSqlServer->ExecuteUpdate(&NumUpdated, pError, ErrorSize))
+	{
+		return false;
+	}
+
+	str_format(aBuf, sizeof(aBuf),
+		"UPDATE %s_gtrain_runs AS r SET Banned = %s WHERE %s",
+		pPrefix, pData->m_Ban ? pSqlServer->True() : pSqlServer->False(), aFilter);
+	if(!pSqlServer->PrepareStatement(aBuf, pError, ErrorSize))
+	{
+		return false;
+	}
+	BindFilter(1);
+	if(!pSqlServer->ExecuteUpdate(&NumUpdated, pError, ErrorSize))
+	{
+		return false;
+	}
+
+	log_info("gtrain", "%s %d runs of %s on %s: %s %" PRId64 " points and %d captures of %d players",
+		pData->m_Ban ? "banned" : "unbanned", NumRuns, pWho, pWhat,
+		pData->m_Ban ? "took off" : "gave back", Points, NumRuns, NumPlayers);
+	if(NumWithoutPoints > 0)
+		log_warn("gtrain", "%d of the runs have no stored points, their points stay as they are", NumWithoutPoints);
+	return true;
+}
+
+bool CScoreWorker::AddGTrainStats(IDbConnection *pSqlServer, const ISqlData *pGameData, Write w, char *pError, int ErrorSize)
+{
+	const auto *pData = dynamic_cast<const CSqlGTrainStatsData *>(pGameData);
+	const CGTrainStats &Stats = pData->m_Stats;
+
+	// Like DDNet points, GTrain stats have no backup table and only go to
+	// the main database.
+	if(w != Write::NORMAL)
+	{
+		return true;
+	}
+
+	// Create the row first, so concurrent servers never insert it twice.
+	char aBuf[512];
+	str_format(aBuf, sizeof(aBuf),
+		"%s INTO %s_gtrain_stats(Name) VALUES (?)",
+		pSqlServer->InsertIgnore(), pSqlServer->GetPrefix());
+	if(!pSqlServer->PrepareStatement(aBuf, pError, ErrorSize))
+	{
+		return false;
+	}
+	pSqlServer->BindString(1, pData->m_aName);
+	int NumInserted;
+	if(!pSqlServer->ExecuteUpdate(&NumInserted, pError, ErrorSize))
+	{
+		return false;
+	}
+
+	str_format(aBuf, sizeof(aBuf),
+		"UPDATE %s_gtrain_stats SET "
+		"  Points = Points + ?, Captures = Captures + ?, Attempts = Attempts + ?, "
+		"  Respawns = Respawns + ?, Playtime = Playtime + ? "
+		"WHERE Name = ?",
+		pSqlServer->GetPrefix());
+	if(!pSqlServer->PrepareStatement(aBuf, pError, ErrorSize))
+	{
+		return false;
+	}
+	pSqlServer->BindInt64(1, Stats.m_Points);
+	pSqlServer->BindInt(2, Stats.m_Captures);
+	pSqlServer->BindInt(3, Stats.m_Attempts);
+	pSqlServer->BindInt(4, Stats.m_Respawns);
+	pSqlServer->BindInt(5, Stats.m_Playtime);
+	pSqlServer->BindString(6, pData->m_aName);
+	int NumUpdated;
+	return pSqlServer->ExecuteUpdate(&NumUpdated, pError, ErrorSize);
 }
 
 bool CScoreWorker::RandomMap(IDbConnection *pSqlServer, const ISqlData *pGameData, char *pError, int ErrorSize)

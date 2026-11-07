@@ -1,13 +1,17 @@
 #ifndef GAME_SERVER_SCOREWORKER_H
 #define GAME_SERVER_SCOREWORKER_H
 
+#include <base/hash.h>
 #include <base/str.h>
+#include <base/time.h>
 
 #include <engine/map.h>
 #include <engine/server/databases/connection_pool.h>
 #include <engine/shared/protocol.h>
 #include <engine/shared/uuid_manager.h>
 
+#include <game/server/gamemodes/gtrain_elo.h>
+#include <game/server/gamemodes/gtrain_run.h>
 #include <game/server/save.h>
 #include <game/voting.h>
 
@@ -84,6 +88,77 @@ struct CSqlLoadBestTimeRequest : ISqlData
 	char m_aMap[MAX_MAP_LENGTH];
 };
 
+struct CScoreMapDifficultyResult : ISqlResult
+{
+	// empty if the map is missing from the maps table
+	char m_aServer[32] = "";
+	int m_Stars = 0;
+};
+
+struct CSqlMapDifficultyRequest : ISqlData
+{
+	CSqlMapDifficultyRequest(std::shared_ptr<CScoreMapDifficultyResult> pResult) :
+		ISqlData(std::move(pResult))
+	{
+	}
+
+	char m_aMap[MAX_MAP_LENGTH];
+};
+
+struct CScoreGTrainStatsResult : ISqlResult
+{
+	CGTrainStats m_Stats;
+};
+
+struct CSqlGTrainStatsData : ISqlData
+{
+	// Loading stats has a result, adding to them has none.
+	CSqlGTrainStatsData(std::shared_ptr<CScoreGTrainStatsResult> pResult = nullptr) :
+		ISqlData(std::move(pResult))
+	{
+	}
+
+	char m_aName[MAX_NAME_LENGTH];
+	CGTrainStats m_Stats; // to add
+};
+
+struct CSqlGTrainRunData : ISqlData
+{
+	CSqlGTrainRunData() :
+		ISqlData(nullptr)
+	{
+	}
+
+	char m_aMap[MAX_MAP_LENGTH];
+	char m_aMapSha256[SHA256_MAXSTRSIZE];
+	char m_aName[MAX_NAME_LENGTH];
+	char m_aTimestamp[TIMESTAMP_STR_LENGTH];
+	char m_aGameUuid[UUID_MAXSTRSIZE];
+	char m_aRevision[64];
+	int m_Distance;
+	int64_t m_Points;
+	float m_Elo;
+	float m_SpeedFactor;
+	// A solo run, or a team run shared by the rows of its members, with the
+	// member's ticks until their flag.
+	CGTrainRun m_Run;
+	std::shared_ptr<const CGTrainTeamRun> m_pTeamRun;
+	int m_TeamTicks = 0;
+};
+
+// Shadow-bans the stored runs of a map or a player, or both, or lifts the ban.
+struct CSqlGTrainBanRunsData : ISqlData
+{
+	CSqlGTrainBanRunsData() :
+		ISqlData(nullptr)
+	{
+	}
+
+	char m_aMap[MAX_MAP_LENGTH]; // empty for every map
+	char m_aName[MAX_NAME_LENGTH]; // empty for every player
+	bool m_Ban;
+};
+
 struct CSqlPlayerRequest : ISqlData
 {
 	CSqlPlayerRequest(std::shared_ptr<CScorePlayerResult> pResult) :
@@ -99,6 +174,13 @@ struct CSqlPlayerRequest : ISqlData
 	// relevant for /top5 kind of requests
 	int m_Offset;
 	char m_aServer[5];
+};
+
+struct CSqlGTrainTopRequest : CSqlPlayerRequest
+{
+	using CSqlPlayerRequest::CSqlPlayerRequest;
+
+	EGTrainStat m_Stat;
 };
 
 struct CScoreRandomMapResult : ISqlResult
@@ -314,6 +396,11 @@ struct CScoreWorker
 	static bool ShowTimes(IDbConnection *pSqlServer, const ISqlData *pGameData, char *pError, int ErrorSize);
 	static bool ShowPoints(IDbConnection *pSqlServer, const ISqlData *pGameData, char *pError, int ErrorSize);
 	static bool ShowTopPoints(IDbConnection *pSqlServer, const ISqlData *pGameData, char *pError, int ErrorSize);
+	static bool LoadMapDifficulty(IDbConnection *pSqlServer, const ISqlData *pGameData, char *pError, int ErrorSize);
+	static bool LoadGTrainStats(IDbConnection *pSqlServer, const ISqlData *pGameData, char *pError, int ErrorSize);
+	static bool ShowElo(IDbConnection *pSqlServer, const ISqlData *pGameData, char *pError, int ErrorSize);
+	static bool ShowGTrainProfile(IDbConnection *pSqlServer, const ISqlData *pGameData, char *pError, int ErrorSize);
+	static bool ShowGTrainTop(IDbConnection *pSqlServer, const ISqlData *pGameData, char *pError, int ErrorSize);
 	static bool GetSaves(IDbConnection *pSqlServer, const ISqlData *pGameData, char *pError, int ErrorSize);
 
 	static bool SaveTeam(IDbConnection *pSqlServer, const ISqlData *pGameData, Write w, char *pError, int ErrorSize);
@@ -321,6 +408,9 @@ struct CScoreWorker
 
 	static bool SaveScore(IDbConnection *pSqlServer, const ISqlData *pGameData, Write w, char *pError, int ErrorSize);
 	static bool SaveTeamScore(IDbConnection *pSqlServer, const ISqlData *pGameData, Write w, char *pError, int ErrorSize);
+	static bool AddGTrainStats(IDbConnection *pSqlServer, const ISqlData *pGameData, Write w, char *pError, int ErrorSize);
+	static bool SaveGTrainRun(IDbConnection *pSqlServer, const ISqlData *pGameData, Write w, char *pError, int ErrorSize);
+	static bool BanGTrainRuns(IDbConnection *pSqlServer, const ISqlData *pGameData, Write w, char *pError, int ErrorSize);
 };
 
 #endif // GAME_SERVER_SCOREWORKER_H

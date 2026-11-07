@@ -13,6 +13,8 @@
 
 #include <game/teamscore.h>
 
+#include <algorithm>
+#include <functional>
 #include <limits>
 #include <set>
 #include <vector>
@@ -157,7 +159,8 @@ public:
 		m_pPrng = nullptr;
 	}
 
-	int RandomOr0(int BelowThis) // NOLINT(readability-make-member-function-const)
+	// ClientId is the player whose tee, hook or weapon the choice is for.
+	int RandomOr0(int BelowThis, int ClientId = -1) // NOLINT(readability-make-member-function-const)
 	{
 		if(BelowThis <= 1 || !m_pPrng)
 		{
@@ -166,8 +169,13 @@ public:
 		// This makes the random number slightly biased if `BelowThis`
 		// is not a power of two, but we have decided that this is not
 		// significant for DDNet and favored the simple implementation.
-		return m_pPrng->RandomBits() % BelowThis;
+		const int Value = m_pPrng->RandomBits() % BelowThis;
+		if(!m_RandomHook)
+			return Value;
+		return std::clamp(m_RandomHook(ClientId, Value), 0, BelowThis - 1);
 	}
+	// Records or replaces random choices, to replay what players did.
+	std::function<int(int ClientId, int Value)> m_RandomHook;
 
 	class CCharacterCore *m_apCharacters[MAX_CLIENTS];
 	CPrng *m_pPrng;

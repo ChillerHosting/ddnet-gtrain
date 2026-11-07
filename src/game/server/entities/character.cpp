@@ -1015,7 +1015,7 @@ void CCharacter::StopRecording()
 	}
 }
 
-void CCharacter::Die(int Killer, int Weapon, bool SendKillMsg)
+void CCharacter::Die(int Killer, int Weapon, bool SendKillMsg, bool Effects)
 {
 	if(Killer != WEAPON_GAME && m_aSetSavePos[RESCUEMODE_AUTO])
 		GetPlayer()->m_LastDeath = m_aRescueTee[RESCUEMODE_AUTO];
@@ -1028,8 +1028,11 @@ void CCharacter::Die(int Killer, int Weapon, bool SendKillMsg)
 	}
 
 	// a nice sound, and bursting tee death effect
-	GameServer()->CreateSound(m_Pos, SOUND_PLAYER_DIE, TeamMask());
-	GameServer()->CreateDeath(m_Pos, m_pPlayer->GetCid(), TeamMask());
+	if(Effects)
+	{
+		GameServer()->CreateSound(m_Pos, SOUND_PLAYER_DIE, TeamMask());
+		GameServer()->CreateDeath(m_Pos, m_pPlayer->GetCid(), TeamMask());
+	}
 
 	// this is to rate limit respawning to 3 secs
 	m_pPlayer->m_PreviousDieTick = m_pPlayer->m_DieTick;
@@ -1456,10 +1459,13 @@ void CCharacter::HandleBroadcast()
 		m_LastTimeCpBroadcasted = m_LastTimeCp;
 		m_LastBroadcast = Server()->Tick();
 	}
-	else if((m_pPlayer->m_TimerType == CPlayer::TIMERTYPE_BROADCAST || m_pPlayer->m_TimerType == CPlayer::TIMERTYPE_GAMETIMER_AND_BROADCAST) && m_DDRaceState == ERaceState::STARTED && m_LastBroadcast + Server()->TickSpeed() * g_Config.m_SvTimeInBroadcastInterval <= Server()->Tick())
+	else if((m_pPlayer->m_TimerType == CPlayer::TIMERTYPE_BROADCAST || m_pPlayer->m_TimerType == CPlayer::TIMERTYPE_GAMETIMER_AND_BROADCAST) && m_LastBroadcast + Server()->TickSpeed() * g_Config.m_SvTimeInBroadcastInterval <= Server()->Tick())
 	{
+		const std::optional<int> RaceStartTick = GameServer()->m_pController->RaceTimerStartTick(this);
+		if(!RaceStartTick)
+			return;
 		char aBuf[32];
-		int Time = (int64_t)100 * ((float)(Server()->Tick() - m_StartTime) / ((float)Server()->TickSpeed()));
+		int Time = (int64_t)100 * ((float)(Server()->Tick() - *RaceStartTick) / ((float)Server()->TickSpeed()));
 		str_time(Time, ETimeFormat::HOURS, aBuf, sizeof(aBuf));
 		GameServer()->SendBroadcast(aBuf, m_pPlayer->GetCid(), false);
 		m_LastTimeCpBroadcasted = m_LastTimeCp;
@@ -2012,7 +2018,7 @@ void CCharacter::HandleTiles(int Index)
 	{
 		if(m_Core.m_Super || m_Core.m_Invincible)
 			return;
-		int TeleOut = GameWorld()->m_Core.RandomOr0(Collision()->TeleOuts(z - 1).size());
+		int TeleOut = GameWorld()->m_Core.RandomOr0(Collision()->TeleOuts(z - 1).size(), m_pPlayer->GetCid());
 		m_Core.m_Pos = Collision()->TeleOuts(z - 1)[TeleOut];
 		if(!g_Config.m_SvTeleportHoldHook)
 		{
@@ -2027,7 +2033,7 @@ void CCharacter::HandleTiles(int Index)
 	{
 		if(m_Core.m_Super || m_Core.m_Invincible)
 			return;
-		int TeleOut = GameWorld()->m_Core.RandomOr0(Collision()->TeleOuts(EvilTeleport - 1).size());
+		int TeleOut = GameWorld()->m_Core.RandomOr0(Collision()->TeleOuts(EvilTeleport - 1).size(), m_pPlayer->GetCid());
 		m_Core.m_Pos = Collision()->TeleOuts(EvilTeleport - 1)[TeleOut];
 		if(!g_Config.m_SvOldTeleportHook && !g_Config.m_SvOldTeleportWeapons)
 		{
@@ -2054,7 +2060,7 @@ void CCharacter::HandleTiles(int Index)
 		{
 			if(!Collision()->TeleCheckOuts(k).empty())
 			{
-				int TeleOut = GameWorld()->m_Core.RandomOr0(Collision()->TeleCheckOuts(k).size());
+				int TeleOut = GameWorld()->m_Core.RandomOr0(Collision()->TeleCheckOuts(k).size(), m_pPlayer->GetCid());
 				m_Core.m_Pos = Collision()->TeleCheckOuts(k)[TeleOut];
 				m_Core.m_Vel = vec2(0, 0);
 
@@ -2091,7 +2097,7 @@ void CCharacter::HandleTiles(int Index)
 		{
 			if(!Collision()->TeleCheckOuts(k).empty())
 			{
-				int TeleOut = GameWorld()->m_Core.RandomOr0(Collision()->TeleCheckOuts(k).size());
+				int TeleOut = GameWorld()->m_Core.RandomOr0(Collision()->TeleCheckOuts(k).size(), m_pPlayer->GetCid());
 				m_Core.m_Pos = Collision()->TeleCheckOuts(k)[TeleOut];
 
 				if(!g_Config.m_SvTeleportHoldHook)
@@ -2417,6 +2423,13 @@ void CCharacter::ResetJumps()
 {
 	m_Core.m_JumpedTotal = 0;
 	m_Core.m_Jumped = 0;
+}
+
+void CCharacter::UseUpAirJumps()
+{
+	// Dark feet until the ground or a refill tile restores the jumps.
+	m_Core.m_JumpedTotal = std::max(0, m_Core.m_Jumps - 1);
+	m_Core.m_Jumped = 2;
 }
 
 void CCharacter::GiveWeapon(int Weapon, bool Remove)

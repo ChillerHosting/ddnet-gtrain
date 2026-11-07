@@ -2,3 +2,6 @@
 	path = ddnet-libs
 	url = https://github.com/ddnet/ddnet-libs
 	shallow = true
+[submodule "src/engine/external/ddnet_physics"]
+	path = src/engine/external/ddnet_physics
+	url = https://github.com/Teero888/ddnet_physics.git

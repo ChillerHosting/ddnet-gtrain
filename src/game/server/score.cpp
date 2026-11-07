@@ -21,6 +21,7 @@
 #include <game/server/gamecontext.h>
 #include <game/server/gamemodes/ddnet.h>
 #include <game/team_state.h>
+#include <game/version.h>
 
 #include <memory>
 
@@ -279,6 +280,103 @@ void CScore::ShowTopPoints(int ClientId, int Offset)
 	if(RateLimitPlayer(ClientId))
 		return;
 	ExecPlayerThread(CScoreWorker::ShowTopPoints, "show top points", ClientId, "", Offset);
+}
+
+void CScore::LoadMapDifficulty(const std::shared_ptr<CScoreMapDifficultyResult> &pResult)
+{
+	auto Tmp = std::make_unique<CSqlMapDifficultyRequest>(pResult);
+	str_copy(Tmp->m_aMap, GameServer()->Map()->BaseName());
+	m_pPool->Execute(CScoreWorker::LoadMapDifficulty, std::move(Tmp), "load map difficulty");
+}
+
+void CScore::LoadGTrainStats(const char *pName, const std::shared_ptr<CScoreGTrainStatsResult> &pResult)
+{
+	auto Tmp = std::make_unique<CSqlGTrainStatsData>(pResult);
+	str_copy(Tmp->m_aName, pName);
+	m_pPool->Execute(CScoreWorker::LoadGTrainStats, std::move(Tmp), "load gtrain stats");
+}
+
+void CScore::AddGTrainStats(const char *pName, const CGTrainStats &Stats)
+{
+	auto Tmp = std::make_unique<CSqlGTrainStatsData>();
+	str_copy(Tmp->m_aName, pName);
+	Tmp->m_Stats = Stats;
+	m_pPool->ExecuteWrite(CScoreWorker::AddGTrainStats, std::move(Tmp), "add gtrain stats");
+}
+
+void CScore::SaveGTrainRun(const char *pName, int Distance, int64_t Points, float Elo, float SpeedFactor, CGTrainRun &&Run)
+{
+	auto Tmp = std::make_unique<CSqlGTrainRunData>();
+	str_copy(Tmp->m_aMap, GameServer()->Map()->BaseName());
+	sha256_str(GameServer()->Map()->Sha256(), Tmp->m_aMapSha256, sizeof(Tmp->m_aMapSha256));
+	str_copy(Tmp->m_aName, pName);
+	str_timestamp_format(Tmp->m_aTimestamp, sizeof(Tmp->m_aTimestamp), TimestampFormat::SPACE);
+	FormatUuid(GameServer()->GameUuid(), Tmp->m_aGameUuid, sizeof(Tmp->m_aGameUuid));
+	str_copy(Tmp->m_aRevision, GIT_SHORTREV_HASH ? GIT_SHORTREV_HASH : "");
+	Tmp->m_Distance = Distance;
+	Tmp->m_Points = Points;
+	Tmp->m_Elo = Elo;
+	Tmp->m_SpeedFactor = SpeedFactor;
+	Tmp->m_Run = std::move(Run);
+	m_pPool->ExecuteWrite(CScoreWorker::SaveGTrainRun, std::move(Tmp), "save gtrain run");
+}
+
+void CScore::SaveGTrainTeamRun(const char *pName, int Distance, int64_t Points, float Elo, float SpeedFactor, int Ticks, const std::shared_ptr<const CGTrainTeamRun> &pRun)
+{
+	auto Tmp = std::make_unique<CSqlGTrainRunData>();
+	str_copy(Tmp->m_aMap, GameServer()->Map()->BaseName());
+	sha256_str(GameServer()->Map()->Sha256(), Tmp->m_aMapSha256, sizeof(Tmp->m_aMapSha256));
+	str_copy(Tmp->m_aName, pName);
+	str_timestamp_format(Tmp->m_aTimestamp, sizeof(Tmp->m_aTimestamp), TimestampFormat::SPACE);
+	FormatUuid(GameServer()->GameUuid(), Tmp->m_aGameUuid, sizeof(Tmp->m_aGameUuid));
+	str_copy(Tmp->m_aRevision, GIT_SHORTREV_HASH ? GIT_SHORTREV_HASH : "");
+	Tmp->m_Distance = Distance;
+	Tmp->m_Points = Points;
+	Tmp->m_Elo = Elo;
+	Tmp->m_SpeedFactor = SpeedFactor;
+	Tmp->m_pTeamRun = pRun;
+	Tmp->m_TeamTicks = Ticks;
+	m_pPool->ExecuteWrite(CScoreWorker::SaveGTrainRun, std::move(Tmp), "save gtrain team run");
+}
+
+void CScore::BanGTrainRuns(const char *pMap, const char *pName, bool Ban)
+{
+	auto Tmp = std::make_unique<CSqlGTrainBanRunsData>();
+	str_copy(Tmp->m_aMap, pMap);
+	str_copy(Tmp->m_aName, pName);
+	Tmp->m_Ban = Ban;
+	m_pPool->ExecuteWrite(CScoreWorker::BanGTrainRuns, std::move(Tmp), Ban ? "ban gtrain runs" : "unban gtrain runs");
+}
+
+void CScore::ShowElo(int ClientId, const char *pName)
+{
+	if(RateLimitPlayer(ClientId))
+		return;
+	ExecPlayerThread(CScoreWorker::ShowElo, "show elo", ClientId, pName, 0);
+}
+
+void CScore::ShowGTrainProfile(int ClientId, const char *pName)
+{
+	if(RateLimitPlayer(ClientId))
+		return;
+	ExecPlayerThread(CScoreWorker::ShowGTrainProfile, "show gtrain profile", ClientId, pName, 0);
+}
+
+void CScore::ShowGTrainTop(int ClientId, EGTrainStat Stat, int Offset)
+{
+	if(RateLimitPlayer(ClientId))
+		return;
+	auto pResult = NewSqlPlayerResult(ClientId);
+	if(pResult == nullptr)
+		return;
+	auto Tmp = std::make_unique<CSqlGTrainTopRequest>(pResult);
+	Tmp->m_aName[0] = '\0';
+	str_copy(Tmp->m_aMap, GameServer()->Map()->BaseName());
+	str_copy(Tmp->m_aServer, g_Config.m_SvSqlServerName);
+	str_copy(Tmp->m_aRequestingPlayer, Server()->ClientName(ClientId));
+	Tmp->m_Offset = Offset;
+	Tmp->m_Stat = Stat;
+	m_pPool->Execute(CScoreWorker::ShowGTrainTop, std::move(Tmp), "show gtrain top");
 }
 
 void CScore::RandomMap(int ClientId, int MinStars, int MaxStars)

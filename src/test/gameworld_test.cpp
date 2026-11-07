@@ -1,11 +1,14 @@
 #include "test.h"
 
+#include <base/fs.h>
+#include <base/hash.h>
 #include <base/logger.h>
 #include <base/types.h>
 
 #include <engine/engine.h>
 #include <engine/http.h>
 #include <engine/kernel.h>
+#include <engine/map.h>
 #include <engine/server/databases/connection.h>
 #include <engine/server/databases/connection_pool.h>
 #include <engine/server/register.h>
@@ -13,27 +16,39 @@
 #include <engine/server/server_logger.h>
 #include <engine/shared/assertion_logger.h>
 #include <engine/shared/config.h>
+#include <engine/shared/datafile.h>
 #include <engine/shared/masterserver.h>
 
 #include <generated/protocol.h>
 #include <generated/server_data.h>
 
+#include <game/layers.h>
 #include <game/mapitems.h>
+#include <game/mapitems_ex.h>
 #include <game/server/entities/character.h>
 #include <game/server/entities/laser.h>
+#include <game/server/entities/projectile.h>
 #include <game/server/gamecontext.h>
 #include <game/server/gamecontroller.h>
 #include <game/server/gamemodes/gtrain.h>
+#include <game/server/gamemodes/gtrain_elo.h>
 #include <game/server/gameworld.h>
 #include <game/server/player.h>
+#include <game/server/score.h>
+#include <game/switch_layer.h>
 #include <game/version.h>
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string>
 #include <thread>
+#include <vector>
 
 bool IsInterrupted()
 {
@@ -58,6 +73,7 @@ public:
 	};
 	std::optional<CTuningParams> m_aLastTuning[MAX_CLIENTS];
 	std::vector<std::string> m_avChatMessages[MAX_CLIENTS];
+	std::vector<std::string> m_avBroadcasts[MAX_CLIENTS];
 	std::vector<CClientIdentity> m_avClientIdentities[MAX_CLIENTS];
 
 	void AdvanceTicks(int Ticks) { m_CurrentGameTick += Ticks; }
@@ -81,6 +97,13 @@ public:
 			Unpacker.GetInt(); // team
 			Unpacker.GetInt(); // sender
 			m_avChatMessages[ClientId].emplace_back(Unpacker.GetString());
+			EXPECT_FALSE(Unpacker.Error());
+		}
+		if(pMsg->m_MsgId == NETMSGTYPE_SV_BROADCAST && ClientId >= 0 && !IsSixup(ClientId))
+		{
+			CUnpacker Unpacker;
+			Unpacker.Reset(pMsg->Data(), pMsg->Size());
+			m_avBroadcasts[ClientId].emplace_back(Unpacker.GetString());
 			EXPECT_FALSE(Unpacker.Error());
 		}
 		if(pMsg->m_MsgId == NETMSGTYPE_SV_TUNEPARAMS && ClientId >= 0)
@@ -191,6 +214,10 @@ public:
 		GameServer()->OnInit(nullptr);
 		pServer->ReadAnnouncementsFile();
 		pServer->InitMaplist();
+		// Rating the spots simulates the map file, which tests change in
+		// memory. Tests of the ratings turn them on. (The config manager
+		// reset the config to its defaults above.)
+		g_Config.m_SvGtrainTileRatings = 0;
 	}
 
 	void PrepareTrainingCorridor()
@@ -217,7 +244,12 @@ public:
 		pCollision->SetCollisionAt(48, 80, TILE_START);
 		pCollision->SetCollisionAt((Width - 2) * 32 + 16, 80, TILE_FINISH);
 		g_Config.m_SvGtrainGoalDistance = 3;
+		// Most tests check the zero gravity hover, hover doors have their own.
+		g_Config.m_SvGtrainHoverDoor = 0;
+		// The corridor is short, skipping its start has its own test.
+		g_Config.m_SvGtrainStartExclusion = 0;
 		g_Config.m_SvSoloServer = 1;
+		g_Config.m_SvNoWeakHook = 1;
 		g_Config.m_SvTeam = SV_TEAM_FORCED_SOLO;
 		GameServer()->GlobalTuning()->Set("player_collision", 0);
 		GameServer()->GlobalTuning()->Set("player_hooking", 0);
@@ -245,6 +277,26 @@ public:
 			}
 		ADD_FAILURE() << "No training flag for client " << ClientId;
 		return vec2(0, 0);
+	}
+
+	// Every flag the player sees, left to right.
+	std::vector<vec2> TrainingFlags(int ClientId)
+	{
+		CSnapshotBuffer Buffer;
+		m_pServer->m_SnapshotBuilder.Init(m_pServer->IsSixup(ClientId));
+		GameServer()->m_pController->Snap(ClientId);
+		m_pServer->m_SnapshotBuilder.Finish(&Buffer);
+		const CSnapshot *pSnap = Buffer.AsSnapshot();
+		std::vector<vec2> vFlags;
+		for(int i = 0; i < pSnap->NumItems(); ++i)
+			if(pSnap->GetItemType(i) == NETOBJTYPE_FLAG)
+			{
+				const auto *pFlag = (const CNetObj_Flag *)pSnap->GetItem(i)->Data();
+				EXPECT_EQ(pFlag->m_Team, TEAM_BLUE);
+				vFlags.emplace_back(pFlag->m_X, pFlag->m_Y);
+			}
+		std::sort(vFlags.begin(), vFlags.end(), [](vec2 A, vec2 B) { return A.x != B.x ? A.x < B.x : A.y < B.y; });
+		return vFlags;
 	}
 
 	void Say(int ClientId, const char *pText, bool Team = false)
@@ -287,6 +339,123 @@ public:
 		return vIds;
 	}
 
+	void ClearMapExtras()
+	{
+		// The test map's speedups, switches, tunes, doors, draggers and turrets would interfere.
+		CCollision *pCollision = GameServer()->Collision();
+		CLayers *pLayers = GameServer()->Layers();
+		for(CMapItemLayerTilemap *pLayer : {pLayers->SpeedupLayer(), pLayers->SwitchLayer(), pLayers->TuneLayer()})
+		{
+			ASSERT_NE(pLayer, nullptr);
+			const int Data = pLayer == pLayers->SpeedupLayer() ? pLayer->m_Speedup : pLayer == pLayers->SwitchLayer() ? pLayer->m_Switch :
+																    pLayer->m_Tune;
+			mem_zero(pLayers->Map()->GetData(Data), pLayers->Map()->GetDataSize(Data));
+		}
+		for(int y = 0; y < pCollision->GetHeight(); ++y)
+			for(int x = 0; x < pCollision->GetWidth(); ++x)
+				pCollision->SetDoorCollisionAt(x * 32 + 16, y * 32 + 16, 0, 0, 0);
+		for(CEntity *pEntity = GameServer()->m_World.FindFirst(CGameWorld::ENTTYPE_LASER); pEntity; pEntity = pEntity->TypeNext())
+			pEntity->Reset();
+	}
+
+	// One server tick with these inputs, applied like CServer::Run does: by
+	// client id, the early ones before the tick.
+	void TickWithInputs(std::vector<std::pair<int, CNetObj_PlayerInput>> vInputs)
+	{
+		std::sort(vInputs.begin(), vInputs.end(), [](const auto &A, const auto &B) { return A.first < B.first; });
+		for(const auto &[ClientId, Input] : vInputs)
+			GameServer()->OnClientPredictedEarlyInput(ClientId, &Input);
+		m_pServer->AdvanceTicks(1);
+		for(const auto &[ClientId, Input] : vInputs)
+			GameServer()->OnClientPredictedInput(ClientId, &Input);
+		GameServer()->OnTick();
+	}
+
+	// One server tick with this input, applied like CServer::Run does.
+	void TickWithInput(int ClientId, const CNetObj_PlayerInput &Input)
+	{
+		GameServer()->OnClientPredictedEarlyInput(ClientId, &Input);
+		m_pServer->AdvanceTicks(1);
+		GameServer()->OnClientPredictedInput(ClientId, &Input);
+		GameServer()->OnTick();
+	}
+
+	// The database runs jobs in order on its own thread, so this waits for
+	// all earlier ones. It fails until the database is registered.
+	bool WaitForDatabase()
+	{
+		auto pLast = std::make_shared<CScoreGTrainStatsResult>();
+		GameServer()->Score()->LoadGTrainStats("", pLast);
+		for(int i = 0; i < 1000 && !pLast->m_Completed; ++i)
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		EXPECT_TRUE(pLast->m_Completed);
+		return pLast->m_Success;
+	}
+
+	void UseTestDatabase(const char *pName, char *pPath, int PathSize)
+	{
+		str_format(pPath, PathSize, "%s/%s", m_TestInfo.m_aFilename, pName);
+		// The pool keeps no more of the path.
+		ASSERT_LT(str_length(pPath), 64);
+		m_pServer->DbPool()->RegisterSqliteDatabase(CDbConnectionPool::READ, pPath);
+		m_pServer->DbPool()->RegisterSqliteDatabase(CDbConnectionPool::WRITE, pPath);
+		bool Ready = false;
+		for(int i = 0; i < 100 && !Ready; ++i)
+			Ready = WaitForDatabase();
+		ASSERT_TRUE(Ready);
+	}
+
+	struct CStoredRun
+	{
+		std::string m_Map;
+		std::string m_MapSha256;
+		std::string m_Name;
+		int m_Ticks;
+		int m_Distance;
+		float m_Elo;
+		float m_SpeedFactor;
+		int64_t m_Points;
+		// a solo run, or the team's whole run for each member's row
+		CGTrainRun m_Run;
+		std::optional<CGTrainTeamRun> m_TeamRun;
+	};
+
+	std::vector<CStoredRun> StoredRuns(const char *pDatabase)
+	{
+		EXPECT_TRUE(WaitForDatabase());
+		std::vector<CStoredRun> vRuns;
+		std::unique_ptr<IDbConnection> pConnection = CreateSqliteConnection(pDatabase, false);
+		char aError[256];
+		EXPECT_TRUE(pConnection->Connect(aError, sizeof(aError))) << aError;
+		EXPECT_TRUE(pConnection->PrepareStatement("SELECT Map, MapSha256, Name, Ticks, Distance, Elo, SpeedFactor, Run, Points FROM record_gtrain_runs ORDER BY rowid", aError, sizeof(aError))) << aError;
+		bool End = false;
+		while(pConnection->Step(&End, aError, sizeof(aError)) && !End)
+		{
+			CStoredRun &Stored = vRuns.emplace_back();
+			char aBuf[128];
+			pConnection->GetString(1, aBuf, sizeof(aBuf));
+			Stored.m_Map = aBuf;
+			pConnection->GetString(2, aBuf, sizeof(aBuf));
+			Stored.m_MapSha256 = aBuf;
+			pConnection->GetString(3, aBuf, sizeof(aBuf));
+			Stored.m_Name = aBuf;
+			Stored.m_Ticks = pConnection->GetInt(4);
+			Stored.m_Distance = pConnection->GetInt(5);
+			Stored.m_Elo = pConnection->GetFloat(6);
+			Stored.m_SpeedFactor = pConnection->GetFloat(7);
+			std::vector<unsigned char> vData(1 << 20);
+			vData.resize(pConnection->GetBlob(8, vData.data(), vData.size()));
+			if(GTrainRunVersion(vData.data(), vData.size()) == CGTrainTeamRun::FORMAT_VERSION)
+				EXPECT_TRUE(Stored.m_TeamRun.emplace().Decode(vData.data(), vData.size()));
+			else
+				EXPECT_TRUE(Stored.m_Run.Decode(vData.data(), vData.size()));
+			Stored.m_Points = pConnection->GetInt64(9);
+		}
+		EXPECT_TRUE(End) << aError;
+		pConnection->Disconnect();
+		return vRuns;
+	}
+
 	~GameWorld() override
 	{
 		m_pServer->m_Econ.Shutdown();
@@ -313,6 +482,349 @@ TEST_F(GameWorld, DebugDummiesConnectAndDrop)
 
 	EXPECT_TRUE(m_pServer->ClientIngame(FirstDummy));
 	EXPECT_FALSE(m_pServer->ClientIngame(SecondDummy));
+}
+
+TEST_F(GameWorld, GTrainSwitchLayerKeepsUuidItems)
+{
+	// A map with two UUID item types, written in the order that gives them
+	// colliding type ids when copied naively.
+	ASSERT_TRUE(m_pStorage->CreateFolder("maps", IStorage::TYPE_SAVE));
+	{
+		CDataFileWriter Writer;
+		ASSERT_TRUE(Writer.Open(m_pStorage.get(), "maps/uuid_items.map"));
+		CMapItemVersion Version = {};
+		Version.m_Version = 1;
+		Writer.AddItem(MAPITEMTYPE_VERSION, 0, sizeof(Version), &Version);
+		const std::vector<CTile> vTiles(4 * 3, CTile{});
+		CMapItemLayerTilemap Game = {};
+		Game.m_Layer.m_Type = LAYERTYPE_TILES;
+		Game.m_Version = 3;
+		Game.m_Width = 4;
+		Game.m_Height = 3;
+		Game.m_Flags = TILESLAYERFLAG_GAME;
+		Game.m_Image = Game.m_ColorEnv = -1;
+		Game.m_Tele = Game.m_Speedup = Game.m_Front = Game.m_Switch = Game.m_Tune = -1;
+		Game.m_Data = Writer.AddData(vTiles.size() * sizeof(CTile), vTiles.data());
+		Writer.AddItem(MAPITEMTYPE_LAYER, 0, sizeof(Game), &Game);
+		CMapItemGroup Group = {};
+		Group.m_Version = 3;
+		Group.m_NumLayers = 1;
+		Writer.AddItem(MAPITEMTYPE_GROUP, 0, sizeof(Group), &Group);
+		const int aAutomapper[] = {11, 12};
+		const int aBezier[] = {21, 22, 23};
+		Writer.AddItem(MAPITEMTYPE_AUTOMAPPER_CONFIG, 0, sizeof(aAutomapper), aAutomapper);
+		Writer.AddItem(MAPITEMTYPE_ENVPOINTS_BEZIER, 0, sizeof(aBezier), aBezier);
+		Writer.Finish();
+	}
+
+	char aPath[IO_MAX_PATH_LENGTH];
+	ASSERT_TRUE(CGameControllerGTrain::AddSwitchLayer(m_pStorage.get(), "maps/uuid_items.map", aPath, sizeof(aPath)));
+	ASSERT_STRNE(aPath, "");
+	CDataFileReader Reader;
+	ASSERT_TRUE(Reader.Open(m_pStorage.get(), aPath, IStorage::TYPE_ALL));
+	const auto ItemData = [&](int Type) {
+		int Start, Num;
+		Reader.GetType(Type, &Start, &Num);
+		std::vector<int> vData;
+		if(Num == 1)
+		{
+			const int *pData = static_cast<const int *>(Reader.GetItem(Start));
+			vData.assign(pData, pData + Reader.GetItemSize(Start) / sizeof(int));
+		}
+		return vData;
+	};
+	EXPECT_EQ(ItemData(MAPITEMTYPE_AUTOMAPPER_CONFIG), (std::vector<int>{11, 12}));
+	EXPECT_EQ(ItemData(MAPITEMTYPE_ENVPOINTS_BEZIER), (std::vector<int>{21, 22, 23}));
+	// Every type id maps to one UUID.
+	int Start, Num;
+	Reader.GetType(ITEMTYPE_EX, &Start, &Num);
+	EXPECT_EQ(Num, 2);
+	Reader.Close();
+	EXPECT_TRUE(m_pStorage->RemoveFile(aPath, IStorage::TYPE_SAVE));
+}
+
+TEST_F(GameWorld, GTrainAddsSwitchLayerToServedMaps)
+{
+	char aPath[IO_MAX_PATH_LENGTH];
+	// Maps with a switch layer are served as they are.
+	ASSERT_TRUE(CGameControllerGTrain::AddSwitchLayer(m_pStorage.get(), "maps/coverage.map", aPath, sizeof(aPath)));
+	EXPECT_STREQ(aPath, "");
+
+	// Others get an empty one at the end of the game group, which the editor
+	// requires. The rest stays.
+	ASSERT_TRUE(CGameControllerGTrain::AddSwitchLayer(m_pStorage.get(), "maps/ctf1.map", aPath, sizeof(aPath)));
+	ASSERT_STRNE(aPath, "");
+	CDataFileReader Original, Modified;
+	ASSERT_TRUE(Original.Open(m_pStorage.get(), "maps/ctf1.map", IStorage::TYPE_ALL));
+	ASSERT_TRUE(Modified.Open(m_pStorage.get(), aPath, IStorage::TYPE_ALL));
+	EXPECT_EQ(Modified.NumItems(), Original.NumItems() + 1);
+	ASSERT_EQ(Modified.NumData(), Original.NumData() + 2);
+	for(int i = 0; i < Original.NumData(); ++i)
+	{
+		ASSERT_EQ(Modified.GetDataSize(i), Original.GetDataSize(i));
+		EXPECT_EQ(mem_comp(Modified.GetData(i), Original.GetData(i), Original.GetDataSize(i)), 0);
+	}
+	// The layer items of every group, as bytes.
+	const auto GroupLayers = [](CDataFileReader &Reader) {
+		int GroupsStart, NumGroups, LayersStart, NumLayers;
+		Reader.GetType(MAPITEMTYPE_GROUP, &GroupsStart, &NumGroups);
+		Reader.GetType(MAPITEMTYPE_LAYER, &LayersStart, &NumLayers);
+		std::vector<std::vector<std::vector<char>>> vvvLayers(NumGroups);
+		for(int g = 0; g < NumGroups; ++g)
+		{
+			const auto *pGroup = static_cast<const CMapItemGroup_v1 *>(Reader.GetItem(GroupsStart + g));
+			for(int l = pGroup->m_StartLayer; l < pGroup->m_StartLayer + pGroup->m_NumLayers; ++l)
+			{
+				const char *pLayer = static_cast<const char *>(Reader.GetItem(LayersStart + l));
+				vvvLayers[g].emplace_back(pLayer, pLayer + Reader.GetItemSize(LayersStart + l));
+			}
+		}
+		return vvvLayers;
+	};
+	const auto vvvOriginal = GroupLayers(Original);
+	auto vvvModified = GroupLayers(Modified);
+	ASSERT_EQ(vvvModified.size(), vvvOriginal.size());
+	int NumChanged = 0;
+	for(size_t g = 0; g < vvvOriginal.size(); ++g)
+	{
+		if(vvvModified[g] == vvvOriginal[g])
+			continue;
+		++NumChanged;
+		ASSERT_EQ(vvvModified[g].size(), vvvOriginal[g].size() + 1);
+		const auto *pSwitch = reinterpret_cast<const CMapItemLayerTilemap *>(vvvModified[g].back().data());
+		EXPECT_EQ(pSwitch->m_Flags, TILESLAYERFLAG_SWITCH);
+		vvvModified[g].pop_back();
+		EXPECT_EQ(vvvModified[g], vvvOriginal[g]);
+		EXPECT_TRUE(std::any_of(vvvOriginal[g].begin(), vvvOriginal[g].end(), [](const std::vector<char> &vLayer) {
+			return reinterpret_cast<const CMapItemLayerTilemap *>(vLayer.data())->m_Flags & TILESLAYERFLAG_GAME;
+		}));
+	}
+	EXPECT_EQ(NumChanged, 1);
+	Original.Close();
+	Modified.Close();
+
+	std::unique_ptr<IMap> pMap = CreateMap();
+	ASSERT_TRUE(pMap->Load(m_pStorage.get(), aPath, IStorage::TYPE_ALL));
+	CLayers Layers;
+	Layers.Init(pMap.get(), false, false);
+	ASSERT_NE(Layers.GameLayer(), nullptr);
+	ASSERT_NE(Layers.SwitchLayer(), nullptr);
+	EXPECT_EQ(Layers.SwitchLayer()->m_Width, Layers.GameLayer()->m_Width);
+	EXPECT_EQ(Layers.SwitchLayer()->m_Height, Layers.GameLayer()->m_Height);
+	const int NumTiles = Layers.GameLayer()->m_Width * Layers.GameLayer()->m_Height;
+	ASSERT_EQ(pMap->GetDataSize(Layers.SwitchLayer()->m_Switch), NumTiles * (int)sizeof(CSwitchTile));
+	const auto *pSwitchTiles = static_cast<const CSwitchTile *>(pMap->GetData(Layers.SwitchLayer()->m_Switch));
+	for(int i = 0; i < NumTiles; ++i)
+		ASSERT_EQ(pSwitchTiles[i].m_Type, 0);
+	pMap->Unload();
+	EXPECT_TRUE(m_pStorage->RemoveFile(aPath, IStorage::TYPE_SAVE));
+}
+
+TEST_F(GameWorld, GTrainMovesSwitchLayersIntoTheGameGroup)
+{
+	// The editor refuses switch layers in other groups, like the group of
+	// their own that switch layers used to be added in.
+	ASSERT_TRUE(m_pStorage->CreateFolder("maps", IStorage::TYPE_SAVE));
+	const auto WriteMap = [&](const char *pPath, const std::vector<std::vector<int>> &vvFlags, CMapItemAutomapperConfig Config) {
+		CDataFileWriter Writer;
+		ASSERT_TRUE(Writer.Open(m_pStorage.get(), pPath));
+		CMapItemVersion Version = {};
+		Version.m_Version = 1;
+		Writer.AddItem(MAPITEMTYPE_VERSION, 0, sizeof(Version), &Version);
+		const std::vector<CTile> vTiles(4 * 3, CTile{});
+		const std::vector<CSwitchTile> vSwitchTiles(4 * 3, CSwitchTile{});
+		int NumLayers = 0;
+		for(size_t g = 0; g < vvFlags.size(); ++g)
+		{
+			CMapItemGroup Group = {};
+			Group.m_Version = 3;
+			Group.m_StartLayer = NumLayers;
+			Group.m_NumLayers = vvFlags[g].size();
+			StrToInts(Group.m_aName, std::size(Group.m_aName), "Group");
+			Writer.AddItem(MAPITEMTYPE_GROUP, g, sizeof(Group), &Group);
+			for(const int Flags : vvFlags[g])
+			{
+				CMapItemLayerTilemap Layer = {};
+				Layer.m_Layer.m_Type = LAYERTYPE_TILES;
+				Layer.m_Version = 3;
+				Layer.m_Width = 4;
+				Layer.m_Height = 3;
+				Layer.m_Flags = Flags;
+				Layer.m_Image = Layer.m_ColorEnv = -1;
+				Layer.m_Tele = Layer.m_Speedup = Layer.m_Front = Layer.m_Switch = Layer.m_Tune = -1;
+				StrToInts(Layer.m_aName, std::size(Layer.m_aName), "Tiles");
+				Layer.m_Data = Writer.AddData(vTiles.size() * sizeof(CTile), vTiles.data());
+				if(Flags & TILESLAYERFLAG_SWITCH)
+					Layer.m_Switch = Writer.AddData(vSwitchTiles.size() * sizeof(CSwitchTile), vSwitchTiles.data());
+				Writer.AddItem(MAPITEMTYPE_LAYER, NumLayers++, sizeof(Layer), &Layer);
+			}
+		}
+		Writer.AddItem(MAPITEMTYPE_AUTOMAPPER_CONFIG, 0, sizeof(Config), &Config);
+		Writer.Finish();
+	};
+	const auto ReadMap = [&](const char *pPath, CMapItemAutomapperConfig &Config) {
+		std::vector<std::vector<int>> vvFlags;
+		CDataFileReader Reader;
+		if(!Reader.Open(m_pStorage.get(), pPath, IStorage::TYPE_ALL))
+		{
+			ADD_FAILURE() << pPath;
+			return vvFlags;
+		}
+		int GroupsStart, NumGroups, LayersStart, NumLayers, ConfigStart, NumConfigs;
+		Reader.GetType(MAPITEMTYPE_GROUP, &GroupsStart, &NumGroups);
+		Reader.GetType(MAPITEMTYPE_LAYER, &LayersStart, &NumLayers);
+		for(int g = 0; g < NumGroups; ++g)
+		{
+			const auto *pGroup = static_cast<const CMapItemGroup *>(Reader.GetItem(GroupsStart + g));
+			vvFlags.emplace_back();
+			for(int l = pGroup->m_StartLayer; l < pGroup->m_StartLayer + pGroup->m_NumLayers; ++l)
+				vvFlags.back().push_back(static_cast<const CMapItemLayerTilemap *>(Reader.GetItem(LayersStart + l))->m_Flags);
+		}
+		Reader.GetType(MAPITEMTYPE_AUTOMAPPER_CONFIG, &ConfigStart, &NumConfigs);
+		EXPECT_EQ(NumConfigs, 1);
+		if(NumConfigs == 1)
+			Config = *static_cast<const CMapItemAutomapperConfig *>(Reader.GetItem(ConfigStart));
+		return vvFlags;
+	};
+	const int Game = TILESLAYERFLAG_GAME, Switch = TILESLAYERFLAG_SWITCH;
+	struct SCase
+	{
+		std::vector<std::vector<int>> m_vvBefore;
+		std::vector<std::vector<int>> m_vvAfter;
+		int m_aConfigBefore[2];
+		int m_aConfigAfter[2];
+	};
+	const SCase aCases[] = {
+		// A group of its own at the end goes away.
+		{{{Game}, {0}, {Switch}}, {{Game, Switch}, {0}}, {1, 0}, {1, 0}},
+		// Layers after it in its group move up, automapper configs follow.
+		{{{0}, {Game}, {Switch, 0}}, {{0}, {Game, Switch}, {0}}, {2, 1}, {2, 0}},
+		{{{Game, 0}, {Switch}, {0}}, {{Game, 0, Switch}, {}, {0}}, {2, 0}, {2, 0}},
+	};
+	for(const SCase &Case : aCases)
+	{
+		WriteMap("maps/switch_group.map", Case.m_vvBefore, {1, Case.m_aConfigBefore[0], Case.m_aConfigBefore[1], 3, 4, 0});
+		ASSERT_EQ(AddSwitchLayer(m_pStorage.get(), "maps/switch_group.map", IStorage::TYPE_SAVE, "maps/switch_moved.map", IStorage::TYPE_SAVE), EAddSwitchLayer::MOVED);
+		CMapItemAutomapperConfig Config = {};
+		EXPECT_EQ(ReadMap("maps/switch_moved.map", Config), Case.m_vvAfter);
+		EXPECT_EQ(Config.m_GroupId, Case.m_aConfigAfter[0]);
+		EXPECT_EQ(Config.m_LayerId, Case.m_aConfigAfter[1]);
+		EXPECT_EQ(Config.m_AutomapperConfig, 3);
+		EXPECT_EQ(AddSwitchLayer(m_pStorage.get(), "maps/switch_moved.map", IStorage::TYPE_SAVE, "maps/switch_again.map", IStorage::TYPE_SAVE), EAddSwitchLayer::PRESENT);
+
+		std::unique_ptr<IMap> pMap = CreateMap();
+		ASSERT_TRUE(pMap->Load(m_pStorage.get(), "maps/switch_moved.map", IStorage::TYPE_SAVE));
+		CLayers Layers;
+		Layers.Init(pMap.get(), false, false);
+		EXPECT_NE(Layers.SwitchLayer(), nullptr);
+		pMap->Unload();
+		EXPECT_TRUE(m_pStorage->RemoveFile("maps/switch_moved.map", IStorage::TYPE_SAVE));
+	}
+	EXPECT_TRUE(m_pStorage->RemoveFile("maps/switch_group.map", IStorage::TYPE_SAVE));
+}
+
+TEST_F(GameWorld, GTrainHoverDoorHoldsTheTeeUntilTheRelease)
+{
+	PrepareTrainingCorridor();
+	ClearMapExtras();
+	CCollision *pCollision = GameServer()->Collision();
+	CLayers *pLayers = GameServer()->Layers();
+	g_Config.m_SvGtrainHoverDoor = 1;
+	m_pServer->AdvanceTicks(10); // switch end ticks are only sent after tick 0
+	const auto vIds = SpawnTrainingPlayers({"Runner", "Observer"});
+	const int Runner = vIds[0], Observer = vIds[1];
+	CCharacter *pChr = GameServer()->GetPlayerChar(Runner);
+
+	const auto Doors = [&](int ClientId) {
+		CSnapshotBuffer Buffer;
+		m_pServer->m_SnapshotBuilder.Init();
+		GameServer()->m_pController->Snap(ClientId);
+		m_pServer->m_SnapshotBuilder.Finish(&Buffer);
+		std::vector<CNetObj_DDNetLaser> vDoors;
+		const CSnapshot *pSnap = Buffer.AsSnapshot();
+		for(int i = 0; i < pSnap->NumItems(); ++i)
+			if(pSnap->GetItemType(i) == NETOBJTYPE_DDNETLASER && ((const CNetObj_DDNetLaser *)pSnap->GetItem(i)->Data())->m_Type == LASERTYPE_DOOR)
+				vDoors.push_back(*(const CNetObj_DDNetLaser *)pSnap->GetItem(i)->Data());
+		return vDoors;
+	};
+	const auto Release = [&](CCharacter *pTee) {
+		// The door holds the tee in place under normal gravity until its release.
+		const vec2 Start = pTee->m_Pos;
+		const int PlacementTick = m_pServer->Tick();
+		for(int i = 0; i < 49; ++i)
+		{
+			m_pServer->AdvanceTicks(1);
+			GameServer()->OnTick();
+			EXPECT_EQ(pTee->m_Pos, Start);
+		}
+		EXPECT_EQ(pTee->m_FreezeTime, 0);
+		EXPECT_EQ(m_pServer->Tick(), PlacementTick + 49);
+		m_pServer->AdvanceTicks(1);
+		GameServer()->OnTick();
+		EXPECT_GT(pTee->m_Pos.y, Start.y); // falling freely
+	};
+
+	// No tuning changes, so clients predict the hover like everything else.
+	EXPECT_FALSE(pChr->m_ZeroGravity);
+	EXPECT_FLOAT_EQ(m_pServer->m_aLastTuning[Runner]->m_Gravity, 0.5f);
+	// Every player gets only their own door, on the tile below their tee.
+	for(int ClientId : vIds)
+	{
+		const auto vDoors = Doors(ClientId);
+		ASSERT_EQ(vDoors.size(), 1u);
+		EXPECT_EQ(vec2(vDoors[0].m_ToX, vDoors[0].m_ToY), GameServer()->GetPlayerChar(ClientId)->m_Pos + vec2(-12, 32));
+		EXPECT_EQ(vDoors[0].m_Owner, -1);
+	}
+	const int DoorSwitch = Doors(Runner)[0].m_SwitchNumber;
+	EXPECT_GT(DoorSwitch, 0);
+	// Its switch tells the client when the door opens: on the last frozen tick.
+	{
+		CSnapshotBuffer Buffer;
+		m_pServer->m_SnapshotBuilder.Init();
+		GameServer()->SnapSwitchers(Runner);
+		m_pServer->m_SnapshotBuilder.Finish(&Buffer);
+		const CSnapshot *pSnap = Buffer.AsSnapshot();
+		const CNetObj_SwitchState *pState = nullptr;
+		for(int i = 0; i < pSnap->NumItems(); ++i)
+			if(pSnap->GetItemType(i) == NETOBJTYPE_SWITCHSTATE)
+				pState = (const CNetObj_SwitchState *)pSnap->GetItem(i)->Data();
+		ASSERT_NE(pState, nullptr);
+		EXPECT_GE(pState->m_HighestSwitchNumber, DoorSwitch);
+		EXPECT_TRUE((pState->m_aStatus[DoorSwitch / 32] >> (DoorSwitch % 32)) & 1);
+		EXPECT_EQ(pState->m_aSwitchNumbers[0], DoorSwitch);
+		EXPECT_EQ(pState->m_aEndTicks[0], m_pServer->Tick() + 49);
+	}
+	Release(pChr);
+	EXPECT_TRUE(Doors(Runner).empty());
+	EXPECT_FALSE(GameServer()->Switchers()[DoorSwitch].m_aStatus[pChr->Team()]);
+	EXPECT_FLOAT_EQ(m_pServer->m_aLastTuning[Runner]->m_Gravity, 0.5f);
+
+	// The door gives back the double jump, /nodj takes it again.
+	m_pServer->Console()->ExecuteLineFlag("nodj", CFGFLAG_CHAT, Runner);
+	m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, Runner);
+	Release(pChr);
+	EXPECT_EQ(pChr->Core()->m_Jumped & 2, 2);
+
+	// Hovers ending early, like on an unfreeze tile, open the door at once.
+	m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, Runner);
+	pChr = GameServer()->GetPlayerChar(Runner);
+	ASSERT_EQ(Doors(Runner).size(), 1u);
+	pChr->Unfreeze();
+	m_pServer->AdvanceTicks(1);
+	GameServer()->OnTick();
+	EXPECT_FALSE(GameServer()->Switchers()[DoorSwitch].m_aStatus[pChr->Team()]);
+	EXPECT_TRUE(Doors(Runner).empty());
+	const float EarlyY = pChr->m_Pos.y;
+	m_pServer->AdvanceTicks(1);
+	GameServer()->OnTick();
+	EXPECT_GT(pChr->m_Pos.y, EarlyY); // falling freely
+
+	// Without room for a door the zero gravity hover remains.
+	auto *pFront = static_cast<CTile *>(pLayers->Map()->GetData(pLayers->FrontLayer()->m_Front));
+	pFront[pCollision->GetPureMapIndex(pChr->m_Pos) + pCollision->GetWidth()].m_Index = TILE_DEATH;
+	m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, Runner);
+	EXPECT_TRUE(pChr->m_ZeroGravity);
+	EXPECT_TRUE(Doors(Runner).empty());
 }
 
 TEST_F(GameWorld, GTrainPersonalGoalTrailAndCollection)
@@ -427,7 +939,7 @@ TEST_F(GameWorld, GTrainPersonalGoalTrailAndCollection)
 		CLogScope Scope(&CaptureLogger);
 		GameServer()->m_pController->Tick();
 	}
-	EXPECT_NE(CaptureLogger.ConcatenatedLines().find("captured the flag in 3.00 seconds."), std::string::npos);
+	EXPECT_NE(CaptureLogger.ConcatenatedLines().find("captured the flag in 3.00 seconds (0 fails)."), std::string::npos);
 	EXPECT_EQ(CaptureLogger.ConcatenatedLines().find("score"), std::string::npos);
 	EXPECT_TRUE(pFirst->m_ZeroGravity);
 	EXPECT_EQ(pFirst->m_FreezeTime, 50);
@@ -476,13 +988,14 @@ TEST_F(GameWorld, GTrainPersonalGoalTrailAndCollection)
 		CLogScope Scope(&NextCaptureLogger);
 		GameServer()->m_pController->Tick();
 	}
-	EXPECT_NE(NextCaptureLogger.ConcatenatedLines().find("captured the flag in 1.00 seconds."), std::string::npos);
+	EXPECT_NE(NextCaptureLogger.ConcatenatedLines().find("captured the flag in 1.00 seconds (0 fails)."), std::string::npos);
 }
 
 TEST_F(GameWorld, GTrainTeamAndPracticeCommandsPreserveFight)
 {
 	PrepareTrainingCorridor();
 	g_Config.m_SvPractice = 1;
+	g_Config.m_SvSpamprotection = 0;
 	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob"});
 	const int Anna = vIds[0], Bob = vIds[1];
 	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
@@ -496,12 +1009,17 @@ TEST_F(GameWorld, GTrainTeamAndPracticeCommandsPreserveFight)
 	{
 		const int PhysicalTeam = GameServer()->GetDDRaceTeam(ClientId);
 		m_pServer->m_avChatMessages[ClientId].clear();
-		for(const char *pCommand : {"team", "team 0", "team 1", "practice", "practice 1", "practice 0"})
-			m_pServer->Console()->ExecuteLineFlag(pCommand, CFGFLAG_CHAT, ClientId);
+		// /team asks players by name, fights can't. Practice is an unknown
+		// command in GTrain, chat replies to it.
+		const std::string Other = m_pServer->ClientName(ClientId == Anna ? Bob : Anna);
+		for(const std::string &Command : {std::string("/team"), std::string("/team 1"), "/team " + Other, std::string("/practice"), std::string("/practice 1"), std::string("/practice 0")})
+			Say(ClientId, Command.c_str());
 		const auto &vMessages = m_pServer->m_avChatMessages[ClientId];
 		ASSERT_EQ(vMessages.size(), 6);
-		EXPECT_EQ(vMessages[0], "/team is disabled in GTrain. Use /fight to join a fight group.");
-		EXPECT_EQ(vMessages[3], "/practice is disabled in GTrain.");
+		EXPECT_EQ(vMessages[0], "You are not in a team. /team <player> asks a player to team up.");
+		EXPECT_EQ(vMessages[1], "Player not found. Use their full name.");
+		EXPECT_EQ(vMessages[2], "You are in a fight, which can't team up. /fight alone leaves it.");
+		EXPECT_EQ(vMessages[3], "No such command: practice. Use /cmdlist for a list of all commands.");
 		pController->Tick();
 		ASSERT_NE(GameServer()->GetPlayerChar(ClientId), nullptr);
 		EXPECT_EQ(GameServer()->GetPlayerChar(ClientId)->m_Pos, Position);
@@ -699,6 +1217,38 @@ TEST_F(GameWorld, GTrainParticleSpacingAccumulatesAcrossTiles)
 	EXPECT_EQ(Particles(), (std::vector<vec2>{Goal}));
 }
 
+TEST_F(GameWorld, GTrainTrailIsEachViewersChoice)
+{
+	PrepareTrainingCorridor();
+	g_Config.m_SvGtrainGoalDistance = 12;
+	const auto vIds = SpawnTrainingPlayers({"Runner", "Viewer"});
+	const int Runner = vIds[0], Viewer = vIds[1];
+	for(const int ClientId : vIds)
+		GameServer()->m_apPlayers[ClientId]->m_ShowAll = true;
+	const auto Command = [&](int ClientId, const char *pCommand) {
+		m_pServer->m_avChatMessages[ClientId].clear();
+		m_pServer->Console()->ExecuteLineFlag(pCommand, CFGFLAG_CHAT, ClientId);
+		return m_pServer->m_avChatMessages[ClientId].empty() ? std::string() : m_pServer->m_avChatMessages[ClientId].back();
+	};
+
+	// Hiding the trail keeps the flag.
+	EXPECT_GT(TrainingMarkers(Runner), 1);
+	EXPECT_EQ(Command(Runner, "trail"), "The trail to the flag is hidden.");
+	EXPECT_EQ(TrainingMarkers(Runner), 1);
+	EXPECT_GT(TrainingMarkers(Viewer), 1);
+
+	// The viewer's choice also applies while watching someone else.
+	GameServer()->m_apPlayers[Viewer]->SetTeam(TEAM_SPECTATORS, false);
+	GameServer()->m_apPlayers[Viewer]->SetSpectatorId(Runner);
+	EXPECT_EQ(TrainingGoal(Viewer), TrainingGoal(Runner));
+	EXPECT_GT(TrainingMarkers(Viewer), 1);
+	EXPECT_EQ(Command(Viewer, "trail"), "The trail to the flag is hidden.");
+	EXPECT_EQ(TrainingMarkers(Viewer), 1);
+
+	EXPECT_EQ(Command(Runner, "trail"), "The trail to the flag is shown again.");
+	EXPECT_GT(TrainingMarkers(Runner), 1);
+}
+
 TEST_F(GameWorld, GTrainFreeplayHidesGoalsAndDisablesCaptures)
 {
 	PrepareTrainingCorridor();
@@ -805,6 +1355,406 @@ TEST_F(GameWorld, GTrainFreeplayFollowsFightLeaderAndMembership)
 	EXPECT_GT(TrainingMarkers(Observer), 0);
 }
 
+TEST_F(GameWorld, GTrainFreeplayTeleCursorChoosesTheStart)
+{
+	PrepareTrainingCorridor();
+	g_Config.m_SvSpamprotection = 0;
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob"});
+	const int Anna = vIds[0], Bob = vIds[1];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	const auto Tile = [](int x, int y) { return vec2(x * 32 + 16, y * 32 + 16); };
+	const auto AimAndSay = [&](int ClientId, vec2 Pos, const char *pCommand) {
+		CCharacter *pChr = GameServer()->GetPlayerChar(ClientId);
+		CCharacterCore Core = pChr->GetCore();
+		Core.m_Input.m_TargetX = round_to_int(Pos.x - pChr->m_Pos.x);
+		Core.m_Input.m_TargetY = round_to_int(Pos.y - pChr->m_Pos.y);
+		pChr->SetCore(Core);
+		m_pServer->m_avChatMessages[ClientId].clear();
+		Say(ClientId, pCommand);
+		return m_pServer->m_avChatMessages[ClientId].empty() ? std::string() : m_pServer->m_avChatMessages[ClientId].back();
+	};
+	const auto Pos = [&](int ClientId) { return GameServer()->GetPlayerChar(ClientId)->m_Pos; };
+
+	// Outside freeplay, it retries like the other practice binds.
+	const vec2 Start = Pos(Anna);
+	AimAndSay(Anna, Tile(3, 2), "/tc");
+	EXPECT_EQ(Pos(Anna), Start);
+
+	Say(Anna, "/freeplay");
+	for(const char *pCommand : {"/tc", "/telecursor"})
+	{
+		const vec2 Chosen = Tile(str_comp(pCommand, "/tc") == 0 ? 3 : 4, 2);
+		EXPECT_EQ(AimAndSay(Anna, Chosen, pCommand), "") << pCommand;
+		CCharacter *pChr = GameServer()->GetPlayerChar(Anna);
+		EXPECT_EQ(pChr->m_Pos, Chosen) << pCommand;
+		EXPECT_EQ(pChr->m_FreezeTime, 50) << pCommand;
+		EXPECT_TRUE(pChr->m_ZeroGravity) << pCommand;
+		EXPECT_EQ(TrainingMarkers(Anna), 0) << pCommand;
+		// Retries return to the chosen start.
+		pChr->Unfreeze();
+		pController->Tick();
+		pChr->SetPosition(Chosen + vec2(64, 0));
+		pChr->m_Pos = Chosen + vec2(64, 0);
+		Say(Anna, "/r");
+		EXPECT_EQ(Pos(Anna), Chosen) << pCommand;
+	}
+
+	// Walls, freeze and the race lines are no starts.
+	const int Width = GameServer()->Collision()->GetWidth();
+	for(vec2 Invalid : {Tile(3, 1), Tile(3, 3), Tile(1, 2), Tile(Width - 2, 2), vec2(-100, -100)})
+	{
+		EXPECT_EQ(AimAndSay(Anna, Invalid, "/tc"), "Aim at a free tile between the start and the finish line to start there.");
+		EXPECT_EQ(Pos(Anna), Tile(4, 2));
+	}
+
+	// In a fight, the leader chooses the start of everyone.
+	pController->Fight(Bob, "Anna");
+	pController->Tick();
+	EXPECT_EQ(AimAndSay(Bob, Tile(5, 2), "/tc"), "Only the fight leader can choose the start position.");
+	AimAndSay(Anna, Tile(6, 2), "/tc");
+	EXPECT_EQ(Pos(Anna), Tile(6, 2));
+	EXPECT_EQ(Pos(Bob), Tile(6, 2));
+	GameServer()->m_apPlayers[Bob]->KillCharacter(WEAPON_SELF);
+	GameServer()->m_apPlayers[Bob]->ForceSpawn(vec2(80, 80));
+	pController->Tick();
+	EXPECT_EQ(Pos(Bob), Tile(6, 2));
+
+	// In /spec or /pause, it is the middle of the view instead, which can be
+	// anywhere on the map, and the leader plays again.
+	CPlayer *pAnna = GameServer()->m_apPlayers[Anna];
+	const auto SpecAndSay = [&](int PauseType, vec2 View) {
+		pAnna->Pause(PauseType, true);
+		if(PauseType == CPlayer::PAUSE_SPEC)
+			GameServer()->GetPlayerChar(Anna)->Pause(true);
+		pAnna->m_ViewPos = View;
+		return AimAndSay(Anna, Tile(3, 2), "/tc");
+	};
+	const vec2 Far = Tile(Width - 3, 2);
+	EXPECT_EQ(SpecAndSay(CPlayer::PAUSE_SPEC, Far), "");
+	EXPECT_EQ(pAnna->IsPaused(), 0);
+	EXPECT_FALSE(GameServer()->GetPlayerChar(Anna)->IsPaused());
+	EXPECT_EQ(Pos(Anna), Far);
+	EXPECT_EQ(Pos(Bob), Far);
+	EXPECT_EQ(SpecAndSay(CPlayer::PAUSE_PAUSED, Tile(5, 2)), "");
+	EXPECT_EQ(pAnna->IsPaused(), 0);
+	EXPECT_EQ(Pos(Anna), Tile(5, 2));
+	EXPECT_EQ(Pos(Bob), Tile(5, 2));
+	// Views off the path keep the pause.
+	EXPECT_EQ(SpecAndSay(CPlayer::PAUSE_SPEC, Tile(3, 1)), "Move the middle of your view to a free tile between the start and the finish line to start there.");
+	EXPECT_EQ(pAnna->IsPaused(), -CPlayer::PAUSE_SPEC);
+	EXPECT_EQ(Pos(Anna), Tile(5, 2));
+	pAnna->Pause(CPlayer::PAUSE_NONE, true);
+
+	// Spectators have no tee to start.
+	GameServer()->m_apPlayers[Bob]->SetTeam(TEAM_SPECTATORS, false);
+	pController->Tick();
+	EXPECT_EQ(AimAndSay(Anna, Tile(3, 2), "/tc"), "");
+	m_pServer->m_avChatMessages[Bob].clear();
+	Say(Bob, "/tc");
+	ASSERT_FALSE(m_pServer->m_avChatMessages[Bob].empty());
+	EXPECT_EQ(m_pServer->m_avChatMessages[Bob].back(), "You must be playing to choose a start position.");
+
+	// Outside freeplay, /tc in /spec can't retry.
+	Say(Anna, "/freeplay");
+	const vec2 Spot = Pos(Anna);
+	EXPECT_EQ(SpecAndSay(CPlayer::PAUSE_SPEC, Tile(6, 2)), "You must be playing and unpaused to retry. In /freeplay, /tc in /spec starts at the middle of your view.");
+	EXPECT_EQ(Pos(Anna), Spot);
+	pAnna->Pause(CPlayer::PAUSE_NONE, true);
+
+	// Admin force pauses can't be left with it.
+	Say(Anna, "/freeplay");
+	pAnna->ForcePause(10);
+	pAnna->m_ViewPos = Tile(6, 2);
+	EXPECT_EQ(AimAndSay(Anna, Tile(3, 2), "/tc"), "You are force-paused and can't choose a start position.");
+	EXPECT_GT(pAnna->IsPaused(), 0);
+}
+
+TEST_F(GameWorld, GTrainTeamsSeeTheDoorsHoldingTheirTeammates)
+{
+	// Clients predict teammates with their team's switch states, so they
+	// need the doors holding them too, or teammates would seem to fall.
+	PrepareTrainingCorridor();
+	ClearMapExtras();
+	g_Config.m_SvGtrainHoverDoor = 1;
+	g_Config.m_SvSpamprotection = 0;
+	g_Config.m_SvGtrainGoalDistance = 6;
+	m_pServer->AdvanceTicks(10); // switch end ticks are only sent after tick 0
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob", "Carl"});
+	const int Anna = vIds[0], Bob = vIds[1], Carl = vIds[2];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	const auto Doors = [&](int ClientId) {
+		CSnapshotBuffer Buffer;
+		m_pServer->m_SnapshotBuilder.Init();
+		GameServer()->m_pController->Snap(ClientId);
+		m_pServer->m_SnapshotBuilder.Finish(&Buffer);
+		std::vector<vec2> vDoors;
+		const CSnapshot *pSnap = Buffer.AsSnapshot();
+		for(int i = 0; i < pSnap->NumItems(); ++i)
+			if(pSnap->GetItemType(i) == NETOBJTYPE_DDNETLASER && ((const CNetObj_DDNetLaser *)pSnap->GetItem(i)->Data())->m_Type == LASERTYPE_DOOR)
+			{
+				const auto *pDoor = (const CNetObj_DDNetLaser *)pSnap->GetItem(i)->Data();
+				vDoors.emplace_back(pDoor->m_ToX, pDoor->m_ToY);
+			}
+		std::sort(vDoors.begin(), vDoors.end(), [](vec2 A, vec2 B) { return A.x < B.x; });
+		return vDoors;
+	};
+	const auto DoorUnder = [&](int ClientId) { return GameServer()->GetPlayerChar(ClientId)->m_Pos + vec2(-12, 32); };
+
+	Say(Anna, "/team Bob");
+	Say(Bob, "/a");
+	pController->Tick();
+	ASSERT_EQ(GameServer()->GetPlayerChar(Bob)->Team(), Anna);
+	ASSERT_NE(GameServer()->GetPlayerChar(Anna)->m_Pos, GameServer()->GetPlayerChar(Bob)->m_Pos);
+	std::vector<vec2> vTeam = {DoorUnder(Anna), DoorUnder(Bob)};
+	std::sort(vTeam.begin(), vTeam.end(), [](vec2 A, vec2 B) { return A.x < B.x; });
+	EXPECT_EQ(Doors(Anna), vTeam);
+	EXPECT_EQ(Doors(Bob), vTeam);
+	// Solo tees only see their own.
+	EXPECT_EQ(Doors(Carl), std::vector<vec2>{DoorUnder(Carl)});
+}
+
+TEST_F(GameWorld, GTrainTeamsPlayTogether)
+{
+	PrepareTrainingCorridor();
+	// GTrain keeps the map's player collision and hooking for teams.
+	for(int Zone = 0; Zone < TuneZone::NUM; ++Zone)
+	{
+		GameServer()->TuningList()[Zone].Set("player_collision", 1);
+		GameServer()->TuningList()[Zone].Set("player_hooking", 1);
+	}
+	g_Config.m_SvSpamprotection = 0;
+	g_Config.m_SvGtrainGoalDistance = 6;
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob", "Carl"});
+	const int Anna = vIds[0], Bob = vIds[1], Carl = vIds[2];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	CGameTeams &Teams = pController->Teams();
+	const auto LastMessage = [&](int ClientId) {
+		return m_pServer->m_avChatMessages[ClientId].empty() ? std::string() : m_pServer->m_avChatMessages[ClientId].back();
+	};
+	const auto Reply = [&](int ClientId, const char *pText) {
+		m_pServer->m_avChatMessages[ClientId].clear();
+		Say(ClientId, pText);
+		return LastMessage(ClientId);
+	};
+	const auto Chr = [&](int ClientId) { return GameServer()->GetPlayerChar(ClientId); };
+	// Members share a flag and a DDRace team, collide and hook each other,
+	// and show as a team. They hover at spots of their own, two tiles apart
+	// and close to the leader's. Everyone else stays solo.
+	const auto CheckTogether = [&](std::initializer_list<int> Members) {
+		const int Leader = *Members.begin();
+		ASSERT_NE(Chr(Leader), nullptr);
+		for(int ClientId : Members)
+		{
+			ASSERT_NE(Chr(ClientId), nullptr);
+			EXPECT_EQ(Chr(ClientId)->m_FreezeTime, 50);
+			EXPECT_LE(distance(Chr(ClientId)->m_Pos, Chr(Leader)->m_Pos), 8 * 32.0f);
+			for(int Other : Members)
+				if(Other != ClientId)
+					EXPECT_GE(distance(Chr(ClientId)->m_Pos, Chr(Other)->m_Pos), 2 * 32.0f);
+			EXPECT_EQ(TrainingGoal(ClientId), TrainingGoal(Leader));
+			EXPECT_EQ(Chr(ClientId)->Team(), Leader);
+			EXPECT_FALSE(Teams.m_Core.GetSolo(ClientId));
+			EXPECT_TRUE(Teams.m_Core.CanCollide(ClientId, Leader));
+			EXPECT_EQ(Teams.ScoreboardTeam(ClientId), Teams.ScoreboardTeam(Leader));
+			EXPECT_EQ(pController->SnapPlayerScore(ClientId, GameServer()->m_apPlayers[ClientId]), (int)GTrainElo::FromPoints(pController->Stats(ClientId).m_Points));
+		}
+		EXPECT_GT(Teams.ScoreboardTeam(Leader), 0);
+		EXPECT_TRUE(GameServer()->m_apPlayers[Leader]->IsNameMarked());
+	};
+	const auto CheckSolo = [&](int ClientId) {
+		ASSERT_NE(Chr(ClientId), nullptr);
+		EXPECT_TRUE(Teams.m_Core.GetSolo(ClientId));
+		EXPECT_EQ(Chr(ClientId)->Team(), ClientId);
+		EXPECT_EQ(Teams.ScoreboardTeam(ClientId), 0);
+	};
+	for(int ClientId : vIds)
+		CheckSolo(ClientId);
+
+	// Requests by name, accepted with /accept or /a within a minute.
+	EXPECT_EQ(Reply(Bob, "/accept"), "You have no team request or fight invite. They last a minute.");
+	EXPECT_EQ(Reply(Anna, "/team Anna"), "You cannot team up with yourself.");
+	EXPECT_EQ(Reply(Anna, "/team Carl"), "You asked 'Carl' to team up. They can join with /accept or /a within a minute.");
+	m_pServer->AdvanceTicks((60 + 1) * m_pServer->TickSpeed());
+	EXPECT_EQ(Reply(Carl, "/a"), "You have no team request or fight invite. They last a minute.");
+	EXPECT_EQ(Reply(Anna, "/team Bob"), "You asked 'Bob' to team up. They can join with /accept or /a within a minute.");
+	EXPECT_EQ(LastMessage(Bob), "'Anna' wants to team up with you. Say /accept or /a within a minute to join.");
+	EXPECT_EQ(Reply(Bob, "/a"), "'Bob' joined the team of 'Anna'. /team alone leaves it.");
+	EXPECT_EQ(LastMessage(Anna), "'Bob' joined the team of 'Anna'. /team alone leaves it.");
+	EXPECT_EQ(Reply(Bob, "/a"), "You have no team request or fight invite. They last a minute.");
+	pController->Tick();
+	CheckTogether({Anna, Bob});
+	CheckSolo(Carl);
+	EXPECT_FALSE(Teams.m_Core.CanCollide(Anna, Carl));
+	EXPECT_EQ(Reply(Anna, "/team Bob"), "'Bob' is already in your team.");
+
+	// Teams and fights don't mix.
+	EXPECT_EQ(Reply(Bob, "/fight Carl"), "You are in a team, which can't fight. /team alone leaves it.");
+	EXPECT_EQ(Reply(Bob, "/fight"), "You are in a team, which can't fight. /team alone leaves it.");
+	EXPECT_EQ(Reply(Carl, "/fight Anna"), "'Anna' is in a team, which can't fight.");
+	CheckTogether({Anna, Bob});
+	CheckSolo(Carl);
+
+	// The leader chooses the settings.
+	EXPECT_EQ(Reply(Bob, "/distance 60"), "Only the team leader can change the goal distance.");
+
+	// The team has a flag for each member around its goal, spread like the
+	// spots, and each member takes one of them. Once all are taken, everyone
+	// earns their own capture, shared by the team, and it starts over.
+	pController->SetMapDifficulty("Hard", 2);
+	// The corridor is one tile high, the leader starts at the goal's start.
+	const int Tiles = (int)std::abs(TrainingGoal(Anna).x - Chr(Anna)->m_Pos.x) / 32;
+	const std::vector<vec2> vFlags = TrainingFlags(Bob);
+	ASSERT_EQ(vFlags.size(), 2u);
+	EXPECT_EQ(TrainingFlags(Anna), vFlags);
+	EXPECT_GE(distance(vFlags[0], vFlags[1]), 2 * 32.0f);
+	EXPECT_LE(distance(vFlags[0], vFlags[1]), 8 * 32.0f);
+	const auto MoveTo = [&](int ClientId, vec2 Pos) {
+		Chr(ClientId)->SetPosition(Pos);
+		Chr(ClientId)->m_Pos = Chr(ClientId)->m_PrevPos = Pos;
+		Chr(ClientId)->ResetVelocity();
+	};
+	const auto Release = [&]() {
+		Chr(Anna)->Unfreeze();
+		Chr(Bob)->Unfreeze();
+		pController->Tick();
+	};
+	Release();
+	m_pServer->AdvanceTicks(2 * m_pServer->TickSpeed());
+	const CGTrainStats AnnaBefore = pController->Stats(Anna), BobBefore = pController->Stats(Bob);
+	MoveTo(Bob, vFlags[0]);
+	pController->Tick();
+	EXPECT_EQ(LastMessage(Anna), "'Bob' took a flag, 1 left.");
+	EXPECT_EQ(TrainingFlags(Anna), std::vector<vec2>{vFlags[1]});
+	EXPECT_EQ(TrainingFlags(Bob), std::vector<vec2>{vFlags[1]});
+	EXPECT_EQ(pController->Stats(Bob).m_Points, BobBefore.m_Points);
+	// One each: Bob plays on, but the other flag is Anna's to take.
+	MoveTo(Bob, vFlags[1]);
+	pController->Tick();
+	EXPECT_EQ(TrainingFlags(Anna), std::vector<vec2>{vFlags[1]});
+	MoveTo(Bob, vFlags[0]);
+	m_pServer->AdvanceTicks(m_pServer->TickSpeed());
+	MoveTo(Anna, vFlags[1]);
+	CMemoryLogger Logger;
+	{
+		CLogScope Scope(&Logger);
+		pController->Tick();
+	}
+	// Each earns half of what a capture alone would, by their own time.
+	const int64_t BobPoints = std::llround(GTrainElo::CapturePoints(7, Tiles, 2.0) / 2.0);
+	const int64_t AnnaPoints = std::llround(GTrainElo::CapturePoints(7, Tiles, 3.0) / 2.0);
+	EXPECT_EQ(pController->Stats(Bob).m_Points, BobBefore.m_Points + BobPoints);
+	EXPECT_EQ(pController->Stats(Anna).m_Points, AnnaBefore.m_Points + AnnaPoints);
+	EXPECT_EQ(pController->Stats(Bob).m_Captures, BobBefore.m_Captures + 1);
+	EXPECT_EQ(pController->Stats(Anna).m_Captures, AnnaBefore.m_Captures + 1);
+	const auto Captured = [&](const char *pName, const CGTrainStats &Before, int64_t Points, double Seconds) {
+		char aMessage[256];
+		str_format(aMessage, sizeof(aMessage), "'%s' captured a flag for their team in %.2f seconds (0 fails, +%.2f ELO, %.1fx speed).", pName, Seconds,
+			GTrainElo::FromPoints(Before.m_Points + Points) - GTrainElo::FromPoints(Before.m_Points), GTrainElo::SpeedFactor(7, Tiles, Seconds));
+		return Logger.ConcatenatedLines().find(aMessage);
+	};
+	// In the order they took their flags.
+	ASSERT_NE(Captured("Bob", BobBefore, BobPoints, 2.0), std::string::npos) << Logger.ConcatenatedLines();
+	ASSERT_NE(Captured("Anna", AnnaBefore, AnnaPoints, 3.0), std::string::npos) << Logger.ConcatenatedLines();
+	EXPECT_LT(Captured("Bob", BobBefore, BobPoints, 2.0), Captured("Anna", AnnaBefore, AnnaPoints, 3.0));
+	CheckTogether({Anna, Bob});
+
+	// A death before the last flag starts over, nobody earns. Frozen tees
+	// don't take flags, only once they are in control again.
+	Release();
+	MoveTo(Bob, TrainingFlags(Bob)[0]);
+	pController->Tick();
+	const CGTrainStats BobFirst = pController->Stats(Bob);
+	GameServer()->m_apPlayers[Anna]->KillCharacter(WEAPON_SELF);
+	pController->Tick();
+	CheckTogether({Anna, Bob});
+	EXPECT_EQ(TrainingFlags(Bob).size(), 2u);
+	EXPECT_EQ(pController->Stats(Bob).m_Points, BobFirst.m_Points);
+	EXPECT_EQ(pController->Stats(Bob).m_Captures, BobFirst.m_Captures);
+	Release();
+	const std::vector<vec2> vNewFlags = TrainingFlags(Bob);
+	MoveTo(Bob, vNewFlags[0]);
+	pController->Tick();
+	MoveTo(Anna, vNewFlags[1]);
+	Chr(Anna)->Freeze();
+	const CGTrainStats AnnaFrozen = pController->Stats(Anna);
+	pController->Tick();
+	EXPECT_EQ(TrainingFlags(Anna), std::vector<vec2>{vNewFlags[1]});
+	EXPECT_EQ(pController->Stats(Anna).m_Captures, AnnaFrozen.m_Captures);
+	EXPECT_EQ(pController->Stats(Bob).m_Points, BobFirst.m_Points);
+	Chr(Anna)->Unfreeze();
+	{
+		CLogScope Scope(&Logger);
+		pController->Tick();
+	}
+	EXPECT_NE(Logger.ConcatenatedLines().find("'Anna' captured a flag for their team in 0.00 seconds (0 fails, +"), std::string::npos) << Logger.ConcatenatedLines();
+	EXPECT_GT(pController->Stats(Anna).m_Points, AnnaFrozen.m_Points);
+	EXPECT_GT(pController->Stats(Bob).m_Points, BobFirst.m_Points);
+	CheckTogether({Anna, Bob});
+
+	// Any member's /r retries the whole team, everyone at their spot.
+	const vec2 AnnaSpot = Chr(Anna)->m_Pos, BobSpot = Chr(Bob)->m_Pos;
+	Chr(Anna)->Unfreeze();
+	Chr(Bob)->Unfreeze();
+	pController->Tick();
+	for(int ClientId : {Anna, Bob})
+	{
+		Chr(ClientId)->SetPosition(AnnaSpot + vec2(32, 0));
+		Chr(ClientId)->m_Pos = Chr(ClientId)->m_PrevPos = AnnaSpot + vec2(32, 0);
+	}
+	Say(Bob, "/r");
+	CheckTogether({Anna, Bob});
+	EXPECT_EQ(Chr(Anna)->m_Pos, AnnaSpot);
+	EXPECT_EQ(Chr(Bob)->m_Pos, BobSpot);
+
+	// Any member's death starts the team over.
+	GameServer()->m_apPlayers[Bob]->KillCharacter(WEAPON_SELF);
+	EXPECT_EQ(Chr(Anna), nullptr);
+	ASSERT_NE(Chr(Carl), nullptr);
+	pController->Tick();
+	CheckTogether({Anna, Bob});
+
+	// Members can add players too, who join everyone.
+	EXPECT_EQ(Reply(Bob, "/team Carl"), "You asked 'Carl' to team up. They can join with /accept or /a within a minute.");
+	EXPECT_EQ(LastMessage(Carl), "'Bob' wants to add you to their team. Say /accept or /a within a minute to join.");
+	Say(Carl, "/accept");
+	pController->Tick();
+	CheckTogether({Anna, Bob, Carl});
+
+	// Leaving starts the others over, the last one alone.
+	EXPECT_EQ(Reply(Anna, "/team"), "You left the team.");
+	EXPECT_EQ(LastMessage(Bob), "'Anna' left the team.");
+	pController->Tick();
+	CheckSolo(Anna);
+	CheckTogether({Carl, Bob});
+	Say(Bob, "/team");
+	EXPECT_EQ(LastMessage(Carl), "'Bob' left the team, you train alone again.");
+	pController->Tick();
+	for(int ClientId : vIds)
+		CheckSolo(ClientId);
+	EXPECT_EQ(Reply(Carl, "/team"), "You are not in a team. /team <player> asks a player to team up.");
+
+	// Fights can't team up.
+	pController->Fight(Bob, "Anna");
+	pController->Tick();
+	EXPECT_EQ(Reply(Bob, "/team Carl"), "You are in a fight, which can't team up. /fight alone leaves it.");
+	EXPECT_EQ(Reply(Carl, "/team Anna"), "'Anna' is in a fight, which can't team up.");
+	for(int ClientId : vIds)
+		EXPECT_TRUE(Teams.m_Core.GetSolo(ClientId));
+
+	// Spectators leave their team.
+	pController->Fight(Bob, "");
+	pController->Tick();
+	Say(Carl, "/team Anna");
+	Say(Anna, "/a");
+	pController->Tick();
+	CheckTogether({Carl, Anna});
+	GameServer()->m_apPlayers[Anna]->SetTeam(TEAM_SPECTATORS, false);
+	pController->Tick();
+	EXPECT_EQ(LastMessage(Carl), "'Anna' left the team, you train alone again.");
+	pController->Tick();
+	CheckSolo(Carl);
+}
+
 TEST_F(GameWorld, GTrainRetryPreservesGoalAndRestartsTimer)
 {
 	PrepareTrainingCorridor();
@@ -853,7 +1803,7 @@ TEST_F(GameWorld, GTrainRetryPreservesGoalAndRestartsTimer)
 		CLogScope Scope(&CaptureLogger);
 		GameServer()->m_pController->Tick();
 	}
-	EXPECT_NE(CaptureLogger.ConcatenatedLines().find("'Runner' captured the flag in 1.00 seconds."), std::string::npos);
+	EXPECT_NE(CaptureLogger.ConcatenatedLines().find("'Runner' captured the flag in 1.00 seconds (2 fails)."), std::string::npos);
 }
 
 TEST_F(GameWorld, GTrainRetryOnlyResetsRequestingFightMember)
@@ -1096,7 +2046,7 @@ TEST_F(GameWorld, GTrainFightChainingDeathAndCapture)
 		pController->Tick();
 	}
 	const std::string Messages = CaptureLogger.ConcatenatedLines();
-	EXPECT_NE(Messages.find("'Wilson' wins! Fight score:"), std::string::npos);
+	EXPECT_NE(Messages.find("'Wilson' captured the flag (0 fails). First to 10:"), std::string::npos);
 	EXPECT_NE(Messages.find("'Wilson': 1"), std::string::npos);
 	EXPECT_NE(Messages.find("'Anna': 0"), std::string::npos);
 	EXPECT_NE(Messages.find("'Bob': 0"), std::string::npos);
@@ -1116,7 +2066,7 @@ TEST_F(GameWorld, GTrainFightChainingDeathAndCapture)
 		CLogScope Scope(&NextLogger);
 		pController->Tick();
 	}
-	EXPECT_NE(NextLogger.ConcatenatedLines().find("'Anna' wins! Fight score:"), std::string::npos);
+	EXPECT_NE(NextLogger.ConcatenatedLines().find("'Anna' captured the flag (0 fails). First to 10:"), std::string::npos);
 	EXPECT_NE(NextLogger.ConcatenatedLines().find("'Anna': 1"), std::string::npos);
 	EXPECT_NE(NextLogger.ConcatenatedLines().find("'Wilson': 1"), std::string::npos);
 	EXPECT_EQ(NextLogger.ConcatenatedLines().find("seconds"), std::string::npos);
@@ -1160,7 +2110,7 @@ TEST_F(GameWorld, GTrainFightChainingDeathAndCapture)
 	EXPECT_NE(RejoinLogger.ConcatenatedLines().find("'Wilson': 0"), std::string::npos);
 	CheckSharedAttempt();
 
-	// Even if everyone else leaves, the remaining player's wins persist.
+	// Once everyone else leaves, the fight is over and its last score too.
 	pController->Fight(Bob, "");
 	pController->Fight(Wilson, "");
 	pController->Fight(Bob, "Anna");
@@ -1176,12 +2126,164 @@ TEST_F(GameWorld, GTrainFightChainingDeathAndCapture)
 		CLogScope Scope(&RemainingLogger);
 		pController->Tick();
 	}
-	EXPECT_NE(RemainingLogger.ConcatenatedLines().find("'Anna': 2"), std::string::npos);
+	EXPECT_NE(RemainingLogger.ConcatenatedLines().find("'Anna': 0"), std::string::npos);
 	EXPECT_NE(RemainingLogger.ConcatenatedLines().find("'Bob': 1"), std::string::npos);
 	EXPECT_EQ(RemainingLogger.ConcatenatedLines().find("'Wilson':"), std::string::npos);
 }
 
-TEST_F(GameWorld, GTrainFightTeamsMergeLeaveAndDisconnect)
+TEST_F(GameWorld, GTrainFightJoinKeepsTargetAttempt)
+{
+	PrepareTrainingCorridor();
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob", "Wilson", "Observer"});
+	const int Anna = vIds[0], Bob = vIds[1], Wilson = vIds[2], Observer = vIds[3];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	CCharacter *pTarget = GameServer()->GetPlayerChar(Anna);
+	CCharacter *pJoiner = GameServer()->GetPlayerChar(Bob);
+	const vec2 Start = pTarget->m_Pos;
+	const vec2 Goal = TrainingGoal(Anna);
+	const vec2 ObserverPosition = GameServer()->GetPlayerChar(Observer)->m_Pos;
+	const vec2 ObserverGoal = TrainingGoal(Observer);
+	for(CCharacter *pChr : {pTarget, pJoiner})
+		pChr->Unfreeze();
+	pController->Tick();
+	const vec2 TargetPosition = Start + normalize(Goal - Start) * 32.0f;
+	pTarget->m_Pos = pTarget->m_PrevPos = TargetPosition;
+	pTarget->SetPosition(TargetPosition);
+	pTarget->SetVelocity(vec2(3, 4));
+	const vec2 JoinerPosition = Start - normalize(Goal - Start) * 32.0f;
+	pJoiner->m_Pos = pJoiner->m_PrevPos = JoinerPosition;
+	pJoiner->SetPosition(JoinerPosition);
+	pJoiner->SetVelocity(vec2(5, 6));
+	const auto CheckTargetKept = [&] {
+		EXPECT_EQ(GameServer()->GetPlayerChar(Anna), pTarget);
+		EXPECT_EQ(pTarget->m_Pos, TargetPosition);
+		EXPECT_EQ(pTarget->Core()->m_Vel, vec2(3, 4));
+		EXPECT_FALSE(pTarget->m_ZeroGravity);
+		EXPECT_EQ(pTarget->m_FreezeTime, 0);
+		EXPECT_EQ(TrainingGoal(Anna), Goal);
+		EXPECT_EQ(GameServer()->GetPlayerChar(Observer)->m_Pos, ObserverPosition);
+		EXPECT_EQ(TrainingGoal(Observer), ObserverGoal);
+	};
+
+	// The joiner starts the target's current attempt; the target keeps playing.
+	m_pServer->m_avChatMessages[Anna].clear();
+	m_pServer->Console()->ExecuteLineFlag("fight Anna", CFGFLAG_CHAT, Bob);
+	pController->Tick();
+	CheckTargetKept();
+	EXPECT_EQ(GameServer()->GetPlayerChar(Bob), pJoiner);
+	EXPECT_EQ(pJoiner->m_Pos, Start);
+	EXPECT_EQ(pJoiner->Core()->m_Vel, vec2(0, 0));
+	EXPECT_TRUE(pJoiner->m_ZeroGravity);
+	EXPECT_EQ(pJoiner->m_FreezeTime, 50);
+	EXPECT_EQ(TrainingGoal(Bob), Goal);
+	EXPECT_GT(pController->Teams().ScoreboardTeam(Anna), 0);
+	EXPECT_EQ(pController->Teams().ScoreboardTeam(Bob), pController->Teams().ScoreboardTeam(Anna));
+	ASSERT_FALSE(m_pServer->m_avChatMessages[Anna].empty());
+	EXPECT_EQ(m_pServer->m_avChatMessages[Anna].back(), "'Bob' joined the fight with 'Anna'. Use /fight to leave.");
+
+	// A dead player joining through a member enters the same attempt on respawn.
+	GameServer()->m_apPlayers[Wilson]->KillCharacter(WEAPON_SELF);
+	pController->Fight(Wilson, "Bob");
+	pController->Tick();
+	CheckTargetKept();
+	EXPECT_EQ(GameServer()->GetPlayerChar(Bob), pJoiner);
+	EXPECT_EQ(pJoiner->m_Pos, Start);
+	CCharacter *pRespawned = GameServer()->m_apPlayers[Wilson]->ForceSpawn(vec2(80, 80));
+	pController->Tick();
+	CheckTargetKept();
+	EXPECT_EQ(pRespawned->m_Pos, Start);
+	EXPECT_TRUE(pRespawned->m_ZeroGravity);
+	EXPECT_EQ(TrainingGoal(Wilson), Goal);
+	EXPECT_EQ(pController->Teams().ScoreboardTeam(Wilson), pController->Teams().ScoreboardTeam(Anna));
+}
+
+TEST_F(GameWorld, GTrainFightAllowsPausedPlayersButNotSpectators)
+{
+	PrepareTrainingCorridor();
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob", "Wilson", "Viewer"});
+	const int Anna = vIds[0], Bob = vIds[1], Wilson = vIds[2], Viewer = vIds[3];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	CCharacter *pTarget = GameServer()->GetPlayerChar(Anna);
+	const vec2 Start = pTarget->m_Pos;
+	const vec2 Goal = TrainingGoal(Anna);
+
+	// A /spec target can be fought and stays paused in place.
+	GameServer()->m_apPlayers[Anna]->Pause(CPlayer::PAUSE_SPEC, true);
+	pTarget->Pause(true);
+	m_pServer->m_avChatMessages[Bob].clear();
+	m_pServer->Console()->ExecuteLineFlag("fight Anna", CFGFLAG_CHAT, Bob);
+	pController->Tick();
+	ASSERT_FALSE(m_pServer->m_avChatMessages[Bob].empty());
+	EXPECT_EQ(m_pServer->m_avChatMessages[Bob].back(), "'Bob' joined the fight with 'Anna'. Use /fight to leave.");
+	const int Team = pController->Teams().ScoreboardTeam(Anna);
+	EXPECT_GT(Team, 0);
+	EXPECT_EQ(pController->Teams().ScoreboardTeam(Bob), Team);
+	EXPECT_EQ(GameServer()->GetPlayerChar(Anna), pTarget);
+	EXPECT_TRUE(pTarget->IsPaused());
+	EXPECT_EQ(pTarget->m_Pos, Start);
+	EXPECT_EQ(TrainingGoal(Anna), Goal);
+	EXPECT_EQ(GameServer()->GetPlayerChar(Bob)->m_Pos, Start);
+	EXPECT_EQ(TrainingGoal(Bob), Goal);
+
+	// A paused player can join too and enters the current attempt.
+	GameServer()->m_apPlayers[Wilson]->Pause(CPlayer::PAUSE_PAUSED, true);
+	ASSERT_NE(GameServer()->m_apPlayers[Wilson]->IsPaused(), 0);
+	pController->Fight(Wilson, "Bob");
+	pController->Tick();
+	EXPECT_EQ(pController->Teams().ScoreboardTeam(Wilson), Team);
+	EXPECT_EQ(GameServer()->GetPlayerChar(Wilson)->m_Pos, Start);
+	EXPECT_EQ(TrainingGoal(Wilson), Goal);
+	EXPECT_EQ(pTarget->m_Pos, Start);
+
+	// Players in the spectator team can neither fight nor be fought.
+	GameServer()->m_apPlayers[Viewer]->SetTeam(TEAM_SPECTATORS, false);
+	for(const auto &[ClientId, Name] : {std::pair{Viewer, "Anna"}, {Bob, "Viewer"}})
+	{
+		m_pServer->m_avChatMessages[ClientId].clear();
+		pController->Fight(ClientId, Name);
+		ASSERT_FALSE(m_pServer->m_avChatMessages[ClientId].empty());
+		EXPECT_EQ(m_pServer->m_avChatMessages[ClientId].back(), "Spectators cannot join a fight.");
+	}
+	pController->Tick();
+	EXPECT_EQ(pController->Teams().ScoreboardTeam(Viewer), 0);
+	for(int ClientId : {Anna, Bob, Wilson})
+		EXPECT_EQ(pController->Teams().ScoreboardTeam(ClientId), Team);
+}
+
+TEST_F(GameWorld, GTrainFightGoesOnWhenSomeoneLeaves)
+{
+	// However players leave, the others keep their spot and flag. The leader
+	// joining the spectators is no death of the leader.
+	PrepareTrainingCorridor();
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob", "Wilson", "Dee"});
+	const int Anna = vIds[0], Bob = vIds[1], Wilson = vIds[2], Dee = vIds[3];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	for(int ClientId : {Bob, Wilson, Dee})
+		pController->Fight(ClientId, "Anna");
+	pController->Tick();
+	const vec2 Position = GameServer()->GetPlayerChar(Anna)->m_Pos;
+	const vec2 Goal = TrainingGoal(Anna);
+	const auto ExpectKept = [&](std::initializer_list<int> Ids, const char *pHow) {
+		for(int i = 0; i < 3; ++i)
+			pController->Tick();
+		for(int ClientId : Ids)
+		{
+			ASSERT_TRUE(GameServer()->GetPlayerChar(ClientId)) << pHow;
+			EXPECT_EQ(GameServer()->GetPlayerChar(ClientId)->m_Pos, Position) << pHow;
+			EXPECT_EQ(TrainingGoal(ClientId), Goal) << pHow;
+		}
+	};
+	pController->DoTeamChange(GameServer()->m_apPlayers[Anna], TEAM_SPECTATORS, false);
+	ExpectKept({Bob, Wilson, Dee}, "the leader spectating");
+	EXPECT_EQ(pController->Teams().ScoreboardTeam(Anna), 0);
+	EXPECT_NE(pController->Teams().ScoreboardTeam(Bob), 0);
+	m_pServer->Console()->ExecuteLineFlag("fight", CFGFLAG_CHAT, Bob);
+	ExpectKept({Wilson, Dee}, "the new leader using /fight");
+	pController->DoTeamChange(GameServer()->m_apPlayers[Dee], TEAM_SPECTATORS, false);
+	ExpectKept({Wilson}, "the last member spectating");
+}
+
+TEST_F(GameWorld, GTrainFightTeamsSwitchLeaveAndDisconnect)
 {
 	PrepareTrainingCorridor();
 	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob", "Wilson", "Dee", "Ed"});
@@ -1192,7 +2294,27 @@ TEST_F(GameWorld, GTrainFightTeamsMergeLeaveAndDisconnect)
 	pController->Tick();
 	EXPECT_NE(pController->Teams().ScoreboardTeam(Anna), pController->Teams().ScoreboardTeam(Dee));
 	const int Team = pController->Teams().ScoreboardTeam(Dee);
-	pController->Fight(Bob, "Ed"); // merges both groups; the target group's leader stays
+	const int OldTeam = pController->Teams().ScoreboardTeam(Anna);
+	const vec2 OldPosition = GameServer()->GetPlayerChar(Anna)->m_Pos;
+	const vec2 OldGoal = TrainingGoal(Anna);
+	// Only the player switches fights, the rest of theirs goes on.
+	pController->Fight(Bob, "Ed");
+	pController->Tick();
+	EXPECT_EQ(pController->Teams().ScoreboardTeam(Bob), Team);
+	EXPECT_EQ(TrainingGoal(Bob), TrainingGoal(Dee));
+	for(int ClientId : {Anna, Wilson})
+	{
+		EXPECT_EQ(pController->Teams().ScoreboardTeam(ClientId), OldTeam);
+		EXPECT_EQ(GameServer()->GetPlayerChar(ClientId)->m_Pos, OldPosition);
+		EXPECT_EQ(TrainingGoal(ClientId), OldGoal);
+	}
+	EXPECT_TRUE(GameServer()->m_apPlayers[Anna]->IsNameMarked());
+	// The leader switching leaves the rest to a promoted leader.
+	pController->Fight(Anna, "Dee");
+	pController->Tick();
+	EXPECT_EQ(pController->Teams().ScoreboardTeam(Anna), Team);
+	EXPECT_EQ(pController->Teams().ScoreboardTeam(Wilson), 0); // alone now
+	pController->Fight(Wilson, "Dee");
 	pController->Tick();
 	for(int ClientId : vIds)
 	{
@@ -1286,6 +2408,101 @@ TEST_F(GameWorld, GTrainFightTeamsMergeLeaveAndDisconnect)
 		EXPECT_EQ(GameServer()->GetPlayerChar(ClientId), nullptr);
 	pController->Tick();
 	EXPECT_EQ(TrainingGoal(Anna), TrainingGoal(Ed));
+}
+
+TEST_F(GameWorld, GTrainLockedFightsOnlyTakeInvitedPlayers)
+{
+	PrepareTrainingCorridor();
+	g_Config.m_SvSpamprotection = 0;
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob", "Carl", "Dee"});
+	const int Anna = vIds[0], Bob = vIds[1], Carl = vIds[2], Dee = vIds[3];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	const auto LastMessage = [&](int ClientId) {
+		return m_pServer->m_avChatMessages[ClientId].empty() ? std::string() : m_pServer->m_avChatMessages[ClientId].back();
+	};
+	const auto Reply = [&](int ClientId, const char *pText) {
+		m_pServer->m_avChatMessages[ClientId].clear();
+		Say(ClientId, pText);
+		return LastMessage(ClientId);
+	};
+	const auto SameFight = [&](int ClientId, int Other) {
+		pController->Tick();
+		const int Team = pController->Teams().ScoreboardTeam(ClientId);
+		return Team != 0 && Team == pController->Teams().ScoreboardTeam(Other);
+	};
+	const auto Joined = [](const char *pName, const char *pWith) {
+		return std::string("'") + pName + "' joined the fight with '" + pWith + "'. Use /fight to leave.";
+	};
+	const std::string NoInvite = "You have no team request or fight invite. They last a minute.";
+
+	// Only the leader locks the fight, for everyone in it.
+	EXPECT_EQ(Reply(Bob, "/fight Anna"), Joined("Bob", "Anna"));
+	EXPECT_EQ(Reply(Bob, "/lock"), "Only the fight leader can lock or unlock the fight.");
+	const std::string Locked = "The fight is locked, players only join it when its leader invites them with /invite <player>.";
+	EXPECT_EQ(Reply(Anna, "/lock"), Locked);
+	EXPECT_EQ(LastMessage(Bob), Locked);
+	EXPECT_NE(Reply(Bob, "/settings").find(", /lock on,"), std::string::npos);
+
+	// Nobody else joins, through any member.
+	const std::string AskAnna = "The fight of 'Anna' is locked, ask them for an /invite.";
+	EXPECT_EQ(Reply(Carl, "/fight Anna"), AskAnna);
+	EXPECT_EQ(Reply(Carl, "/fight Bob"), AskAnna);
+	EXPECT_FALSE(SameFight(Carl, Anna));
+
+	// The leader invites, the invited player accepts, once.
+	EXPECT_EQ(Reply(Bob, "/invite Carl"), "Only the fight leader can invite players.");
+	EXPECT_EQ(Reply(Anna, "/invite Anna"), "You cannot invite yourself.");
+	EXPECT_EQ(Reply(Anna, "/invite Bob"), "'Bob' is already in your fight.");
+	EXPECT_EQ(Reply(Anna, "/invite Nobody"), "Player not found. Use their full name.");
+	EXPECT_EQ(Reply(Anna, "/invite Carl"), "You invited 'Carl' to your fight. They can join with /accept or /a within a minute.");
+	EXPECT_EQ(LastMessage(Carl), "'Anna' invites you to their fight. Say /accept or /a within a minute to join.");
+	EXPECT_EQ(Reply(Carl, "/a"), Joined("Carl", "Anna"));
+	EXPECT_TRUE(SameFight(Carl, Anna));
+	EXPECT_EQ(Reply(Carl, "/fight"), "You left fight mode.");
+	EXPECT_EQ(Reply(Carl, "/fight Anna"), AskAnna);
+	EXPECT_EQ(Reply(Carl, "/a"), NoInvite);
+
+	// Invites also let players in with /fight, for a minute.
+	Say(Anna, "/invite Dee");
+	m_pServer->AdvanceTicks((60 + 1) * m_pServer->TickSpeed());
+	EXPECT_EQ(Reply(Dee, "/fight Bob"), AskAnna);
+	EXPECT_EQ(Reply(Dee, "/a"), NoInvite);
+	Say(Anna, "/invite Dee");
+	EXPECT_EQ(Reply(Dee, "/fight Bob"), Joined("Dee", "Bob"));
+	EXPECT_TRUE(SameFight(Dee, Anna));
+	EXPECT_EQ(Reply(Dee, "/fight"), "You left fight mode.");
+
+	// The fight and its invites stay locked when its leader leaves, the
+	// leader's new fight isn't.
+	Say(Anna, "/invite Carl");
+	EXPECT_EQ(Reply(Anna, "/fight"), "You left fight mode.");
+	EXPECT_EQ(Reply(Anna, "/fight Bob"), "The fight of 'Bob' is locked, ask them for an /invite.");
+	EXPECT_EQ(Reply(Carl, "/accept"), Joined("Carl", "Bob"));
+	EXPECT_TRUE(SameFight(Carl, Bob));
+	EXPECT_NE(Reply(Anna, "/settings").find(", /lock off,"), std::string::npos);
+	EXPECT_EQ(Reply(Dee, "/fight Anna"), Joined("Dee", "Anna"));
+
+	// Unlocked fights take anyone again.
+	EXPECT_EQ(Reply(Bob, "/lock 0"), "The fight is unlocked, anyone can join it with /fight.");
+	EXPECT_EQ(Reply(Bob, "/lock 0"), "The fight is unlocked, anyone can join it with /fight.");
+	EXPECT_EQ(Reply(Dee, "/fight Carl"), Joined("Dee", "Carl"));
+	EXPECT_TRUE(SameFight(Dee, Bob));
+
+	// Teams only take players who accept anyway. Every member invites, like
+	// with /team.
+	EXPECT_EQ(Reply(Dee, "/fight"), "You left fight mode.");
+	Say(Anna, "/team Dee");
+	EXPECT_EQ(Reply(Dee, "/a"), "'Dee' joined the team of 'Anna'. /team alone leaves it.");
+	EXPECT_EQ(Reply(Anna, "/lock"), "Teams are always locked, players only join them by accepting an /invite.");
+	EXPECT_EQ(Reply(Anna, "/invite Carl"), "'Carl' is in a fight, which can't team up.");
+	EXPECT_EQ(Reply(Bob, "/invite Anna"), "'Anna' is in a team, which can't fight.");
+	EXPECT_EQ(Reply(Carl, "/fight"), "You left fight mode.");
+	EXPECT_EQ(Reply(Dee, "/invite Carl"), "You asked 'Carl' to team up. They can join with /accept or /a within a minute.");
+	EXPECT_EQ(LastMessage(Carl), "'Dee' wants to add you to their team. Say /accept or /a within a minute to join.");
+	EXPECT_EQ(Reply(Carl, "/a"), "'Carl' joined the team of 'Anna'. /team alone leaves it.");
+	pController->Tick();
+	EXPECT_EQ(pController->Teams().ScoreboardTeam(Carl), pController->Teams().ScoreboardTeam(Anna));
+	EXPECT_NE(pController->Teams().ScoreboardTeam(Carl), 0);
 }
 
 TEST_F(GameWorld, ChatFlagFilterCountsLiveChatTicksAndMessageCharacters)
@@ -1491,6 +2708,2101 @@ TEST_F(GameWorld, GTrainScoreboardWinsAndLeaderNamesKeepCanonicalServerNames)
 	EXPECT_EQ(aName[0], '*');
 	EXPECT_EQ(aName[str_length(aName) - 1], '*');
 	EXPECT_STREQ(m_pServer->ClientName(Anna), "Anna");
+}
+
+TEST_F(GameWorld, GTrainGoalsAndPathsRespectStoppers)
+{
+	PrepareTrainingCorridor();
+	CCollision *pCollision = GameServer()->Collision();
+	// A one-way stopper in the corridor that only lets tees pass to the right.
+	const int StopperX = pCollision->GetWidth() / 2;
+	const int Stopper = pCollision->GetPureMapIndex(vec2(StopperX * 32 + 16, 80));
+	auto *pTiles = const_cast<CTile *>(pCollision->GameLayer());
+	pTiles[Stopper].m_Index = TILE_STOP;
+	pTiles[Stopper].m_Flags = ROTATION_90;
+	ASSERT_EQ(pCollision->GetTileMoveRestrictions(Stopper, false), CANTMOVE_LEFT);
+	ASSERT_EQ(pCollision->GetTileMoveRestrictions(Stopper, true), CANTMOVE_LEFT);
+	g_Config.m_SvGtrainGoalDistance = 100;
+	delete GameServer()->m_pController;
+	GameServer()->m_pController = new CGameControllerGTrain(GameServer());
+	const int Runner = SpawnTrainingPlayers({"Runner"})[0];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	GameServer()->m_apPlayers[Runner]->m_ShowAll = true;
+	bool Crossed = false;
+	for(int Attempt = 0; Attempt < 40; ++Attempt)
+	{
+		const float StartX = GameServer()->GetPlayerChar(Runner)->m_Pos.x;
+		const float GoalX = TrainingGoal(Runner).x;
+		const float StopperCenter = StopperX * 32 + 16;
+		// Goals are never behind the stopper, and paths never cross it leftwards.
+		if(StartX >= StopperCenter)
+		{
+			EXPECT_GT(GoalX, StopperCenter);
+		}
+		Crossed |= StartX < StopperCenter && GoalX > StopperCenter;
+		GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_SELF);
+		GameServer()->m_apPlayers[Runner]->ForceSpawn(vec2(80, 80));
+		pController->Tick();
+	}
+	EXPECT_TRUE(Crossed); // passing in the stopper's direction still works
+}
+
+TEST_F(GameWorld, GTrainPathsFallThroughFreezeOntoUnfreeze)
+{
+	PrepareTrainingCorridor();
+	ClearMapExtras();
+	CCollision *pCollision = GameServer()->Collision();
+	CLayers *pLayers = GameServer()->Layers();
+	ASSERT_NE(pLayers->FrontLayer(), nullptr);
+	auto *pFront = static_cast<CTile *>(pLayers->Map()->GetData(pLayers->FrontLayer()->m_Front));
+	const int Width = pCollision->GetWidth();
+	const int Shaft = Width / 2;
+	ASSERT_GE(pCollision->GetHeight(), 8);
+	g_Config.m_SvGtrainGoalDistance = 2 * Width;
+	int Runner = -1;
+	// An upper corridor from the start line above freeze, with a shaft in
+	// its middle down to a lower corridor, which leads to the finish. The
+	// farthest goal from the left of the upper corridor is in the lower one
+	// when the shaft's tiles let tees fall into it.
+	const auto GoalFromTheLeft = [&](int Tile, int FrontTile, int UnfreezeTile, int UnfreezeFrontTile) {
+		if(Runner >= 0)
+			GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_GAME);
+		for(int y = 0; y < pCollision->GetHeight(); ++y)
+			for(int x = 0; x < Width; ++x)
+			{
+				pCollision->SetCollisionAt(x * 32 + 16, y * 32 + 16, TILE_SOLID);
+				pFront[y * Width + x].m_Index = TILE_AIR;
+			}
+		for(int x = 1; x < Width - 1; ++x)
+		{
+			pCollision->SetCollisionAt(x * 32 + 16, 48, TILE_AIR);
+			pCollision->SetCollisionAt(x * 32 + 16, 80, TILE_FREEZE);
+			pCollision->SetCollisionAt(x * 32 + 16, 176, TILE_AIR);
+			pCollision->SetCollisionAt(x * 32 + 16, 208, TILE_FREEZE);
+		}
+		pCollision->SetCollisionAt(Shaft * 32 + 16, 112, Tile);
+		pFront[3 * Width + Shaft].m_Index = FrontTile;
+		pCollision->SetCollisionAt(Shaft * 32 + 16, 144, UnfreezeTile);
+		pFront[4 * Width + Shaft].m_Index = UnfreezeFrontTile;
+		pCollision->SetCollisionAt(48, 48, TILE_START);
+		pCollision->SetCollisionAt((Width - 2) * 32 + 16, 176, TILE_FINISH);
+		delete GameServer()->m_pController;
+		GameServer()->m_pController = new CGameControllerGTrain(GameServer());
+		if(Runner < 0)
+			Runner = SpawnTrainingPlayers({"Runner"})[0];
+		for(int Attempt = 0; Attempt < 200; ++Attempt)
+		{
+			if(CCharacter *pChr = GameServer()->GetPlayerChar(Runner); pChr && pChr->m_Pos.y == 48 && pChr->m_Pos.x < Shaft * 32)
+				return TrainingGoal(Runner);
+			GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_GAME);
+			GameServer()->m_apPlayers[Runner]->ForceSpawn(vec2(80, 80));
+			GameServer()->m_pController->Tick();
+		}
+		ADD_FAILURE() << "No start left of the shaft";
+		return vec2(0, 0);
+	};
+
+	// Freeze and unfreeze of either layer.
+	EXPECT_EQ(GoalFromTheLeft(TILE_FREEZE, TILE_AIR, TILE_UNFREEZE, TILE_AIR).y, 176);
+	// The path shows while falling through the freeze too.
+	CCharacter *pChr = GameServer()->GetPlayerChar(Runner);
+	pChr->Unfreeze();
+	GameServer()->m_pController->Tick();
+	pChr->m_Pos = pChr->m_PrevPos = vec2(Shaft * 32 + 16, 112);
+	pChr->SetPosition(pChr->m_Pos);
+	GameServer()->m_pController->Tick();
+	GameServer()->m_apPlayers[Runner]->m_ShowAll = true;
+	EXPECT_GT(TrainingMarkers(Runner), 1);
+	EXPECT_EQ(GoalFromTheLeft(TILE_AIR, TILE_FREEZE, TILE_AIR, TILE_UNFREEZE).y, 176);
+	// Deep freeze needs more than unfreeze, stoppers stop the fall.
+	EXPECT_EQ(GoalFromTheLeft(TILE_DFREEZE, TILE_AIR, TILE_UNFREEZE, TILE_AIR).y, 48);
+	EXPECT_EQ(GoalFromTheLeft(TILE_FREEZE, TILE_STOPA, TILE_UNFREEZE, TILE_AIR).y, 48);
+	// So does landing in freeze.
+	EXPECT_EQ(GoalFromTheLeft(TILE_FREEZE, TILE_AIR, TILE_FREEZE, TILE_AIR).y, 48);
+}
+
+TEST_F(GameWorld, GTrainCaptureCountsFailsAtTheSamePosition)
+{
+	PrepareTrainingCorridor();
+	const auto vIds = SpawnTrainingPlayers({"Runner", "Anna", "Bob"});
+	const int Runner = vIds[0], Anna = vIds[1], Bob = vIds[2];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	const auto Capture = [&](int ClientId) {
+		for(int Other : vIds)
+			if(CCharacter *pChr = GameServer()->GetPlayerChar(Other))
+				pChr->Unfreeze();
+		pController->Tick();
+		CCharacter *pChr = GameServer()->GetPlayerChar(ClientId);
+		pChr->m_Pos = pChr->m_PrevPos = TrainingGoal(ClientId);
+		pChr->SetPosition(pChr->m_Pos);
+		CMemoryLogger Logger;
+		{
+			CLogScope Scope(&Logger);
+			pController->Tick();
+		}
+		return Logger.ConcatenatedLines();
+	};
+
+	// Every retry of the same start and goal is a fail, also after dying.
+	const vec2 Goal = TrainingGoal(Runner);
+	m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, Runner);
+	GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_SELF);
+	m_pServer->Console()->ExecuteLineFlag("retry", CFGFLAG_CHAT, Runner);
+	pController->Tick();
+	EXPECT_EQ(TrainingGoal(Runner), Goal);
+	EXPECT_NE(Capture(Runner).find("'Runner' captured the flag in 0.00 seconds (2 fails)."), std::string::npos);
+	// The capture's new position starts without fails, as does a kill.
+	m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, Runner);
+	EXPECT_NE(Capture(Runner).find("'Runner' captured the flag in 0.00 seconds (1 fail)."), std::string::npos);
+	m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, Runner);
+	GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_SELF);
+	GameServer()->m_apPlayers[Runner]->ForceSpawn(vec2(80, 80));
+	pController->Tick();
+	EXPECT_NE(Capture(Runner).find("'Runner' captured the flag in 0.00 seconds (0 fails)."), std::string::npos);
+
+	// Fight members respawning at their fight's position fail as well.
+	pController->Fight(Bob, "Anna");
+	pController->Tick();
+	GameServer()->m_apPlayers[Bob]->KillCharacter(WEAPON_SELF);
+	GameServer()->m_apPlayers[Bob]->ForceSpawn(vec2(80, 80));
+	pController->Tick();
+	m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, Bob);
+	EXPECT_NE(Capture(Bob).find("'Bob' captured the flag (2 fails). First to 10: 'Anna': 0, 'Bob': 1"), std::string::npos);
+	EXPECT_NE(Capture(Anna).find("'Anna' captured the flag (0 fails)."), std::string::npos);
+}
+
+TEST_F(GameWorld, GTrainAttemptsStartWithoutPickups)
+{
+	PrepareTrainingCorridor();
+	const auto vIds = SpawnTrainingPlayers({"Runner", "Anna", "Bob"});
+	const int Runner = vIds[0], Anna = vIds[1], Bob = vIds[2];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	const auto Pickup = [&](int ClientId) {
+		CCharacter *pChr = GameServer()->GetPlayerChar(ClientId);
+		pChr->GiveWeapon(WEAPON_SHOTGUN);
+		pChr->GiveWeapon(WEAPON_LASER);
+		pChr->SetJetpack(true);
+		pChr->SetEndlessHook(true);
+		pChr->SetEndlessJump(true);
+		pChr->SetCollisionDisabled(true);
+	};
+	const auto HasPickups = [&](int ClientId) {
+		CCharacter *pChr = GameServer()->GetPlayerChar(ClientId);
+		const CCharacterCore *pCore = pChr->Core();
+		return pChr->GetWeaponGot(WEAPON_SHOTGUN) || pChr->GetWeaponGot(WEAPON_LASER) ||
+		       pCore->m_Jetpack || pCore->m_EndlessHook || pCore->m_EndlessJump || pCore->m_CollisionDisabled;
+	};
+	const auto Pos = [&](int ClientId) { return GameServer()->GetPlayerChar(ClientId)->m_Pos; };
+	const auto DeathEvents = [&](vec2 Where) {
+		GameServer()->m_apPlayers[Runner]->m_ViewPos = Where;
+		CSnapshotBuffer Buffer;
+		m_pServer->m_SnapshotBuilder.Init();
+		GameServer()->m_Events.Snap(Runner);
+		m_pServer->m_SnapshotBuilder.Finish(&Buffer);
+		int Deaths = 0;
+		const CSnapshot *pSnap = Buffer.AsSnapshot();
+		for(int i = 0; i < pSnap->NumItems(); ++i)
+			Deaths += pSnap->GetItemType(i) == NETEVENTTYPE_DEATH;
+		return Deaths;
+	};
+	const auto Capture = [&](int ClientId) {
+		for(int Other : vIds)
+			if(CCharacter *pChr = GameServer()->GetPlayerChar(Other))
+				pChr->Unfreeze();
+		pController->Tick();
+		CCharacter *pChr = GameServer()->GetPlayerChar(ClientId);
+		pChr->m_Pos = pChr->m_PrevPos = TrainingGoal(ClientId);
+		pChr->SetPosition(pChr->m_Pos);
+		CMemoryLogger Logger;
+		{
+			CLogScope Scope(&Logger);
+			pController->Tick();
+		}
+		return Logger.ConcatenatedLines();
+	};
+
+	const auto Shots = [&](int ClientId) {
+		int Num = 0;
+		for(int Type : {CGameWorld::ENTTYPE_PROJECTILE, CGameWorld::ENTTYPE_LASER})
+			for(CEntity *pEntity = GameServer()->m_World.FindFirst(Type); pEntity; pEntity = pEntity->TypeNext())
+				Num += pEntity->GetOwnerId() == ClientId;
+		return Num;
+	};
+
+	// /r starts over like a kill, only at the same spot and flag. Kept
+	// weapons stay, shots are gone, and there is no death splash.
+	m_pServer->Console()->ExecuteLineFlag("grenade", CFGFLAG_CHAT, Runner);
+	const vec2 Start = Pos(Runner);
+	const vec2 Goal = TrainingGoal(Runner);
+	Pickup(Runner);
+	for(int ClientId : {Runner, Anna})
+	{
+		new CProjectile(&GameServer()->m_World, WEAPON_GRENADE, ClientId, Pos(ClientId), vec2(0, -1), 100, false, true, SOUND_GRENADE_EXPLODE, vec2(0, -1));
+		new CLaser(&GameServer()->m_World, Pos(ClientId), vec2(1, 0), 200, ClientId, WEAPON_SHOTGUN);
+		ASSERT_EQ(Shots(ClientId), 2);
+	}
+	CCharacter *pChr = GameServer()->GetPlayerChar(Runner);
+	pChr->SetPosition(Start + vec2(64, 0));
+	pChr->m_Pos = Start + vec2(64, 0);
+	ASSERT_TRUE(HasPickups(Runner));
+	GameServer()->m_Events.Clear();
+	m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, Runner);
+	EXPECT_FALSE(HasPickups(Runner));
+	EXPECT_TRUE(GameServer()->GetPlayerChar(Runner)->GetWeaponGot(WEAPON_GRENADE));
+	EXPECT_EQ(Shots(Runner), 0);
+	EXPECT_EQ(Shots(Anna), 2);
+	EXPECT_EQ(Pos(Runner), Start);
+	EXPECT_EQ(TrainingGoal(Runner), Goal);
+	EXPECT_EQ(DeathEvents(Start + vec2(64, 0)), 0);
+	pController->Tick();
+	EXPECT_FALSE(HasPickups(Runner));
+	EXPECT_EQ(Pos(Runner), Start);
+
+	// The next spot after a capture starts over as well.
+	Pickup(Runner);
+	EXPECT_NE(Capture(Runner).find("'Runner' captured the flag in 0.00 seconds (1 fail)."), std::string::npos);
+	EXPECT_FALSE(HasPickups(Runner));
+	EXPECT_TRUE(GameServer()->GetPlayerChar(Runner)->GetWeaponGot(WEAPON_GRENADE));
+	EXPECT_EQ(DeathEvents(Goal), 0);
+	// Kills still show.
+	const vec2 KillPos = Pos(Runner);
+	GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_SELF);
+	EXPECT_EQ(DeathEvents(KillPos), 1);
+	GameServer()->m_apPlayers[Runner]->ForceSpawn(vec2(80, 80));
+	pController->Tick();
+
+	// In a fight, /r only starts over for its user, the leader included.
+	pController->Fight(Bob, "Anna");
+	pController->Tick();
+	const vec2 FightGoal = TrainingGoal(Anna);
+	Pickup(Anna);
+	Pickup(Bob);
+	const vec2 AnnaPos = Pos(Anna) + vec2(32, 0);
+	GameServer()->GetPlayerChar(Anna)->SetPosition(AnnaPos);
+	GameServer()->GetPlayerChar(Anna)->m_Pos = AnnaPos;
+	m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, Bob);
+	pController->Tick();
+	EXPECT_FALSE(HasPickups(Bob));
+	EXPECT_TRUE(HasPickups(Anna));
+	EXPECT_EQ(Pos(Anna), AnnaPos);
+	Pickup(Bob);
+	const vec2 BobPos = Pos(Bob) + vec2(32, 0);
+	GameServer()->GetPlayerChar(Bob)->SetPosition(BobPos);
+	GameServer()->GetPlayerChar(Bob)->m_Pos = BobPos;
+	m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, Anna);
+	pController->Tick();
+	EXPECT_FALSE(HasPickups(Anna));
+	EXPECT_TRUE(HasPickups(Bob));
+	EXPECT_EQ(Pos(Bob), BobPos);
+	EXPECT_EQ(TrainingGoal(Anna), FightGoal);
+	EXPECT_EQ(TrainingGoal(Bob), FightGoal);
+}
+
+TEST_F(GameWorld, GTrainCapturesEarnEloByDifficultySpeedAndGoalDistance)
+{
+	// Each star and difficulty is worth more, other maps earn nothing.
+	EXPECT_EQ(CGameControllerGTrain::EloStep("Easy", 1), 0);
+	EXPECT_EQ(CGameControllerGTrain::EloStep("Easy", 3), 2);
+	EXPECT_EQ(CGameControllerGTrain::EloStep("Main", 1), 3);
+	EXPECT_EQ(CGameControllerGTrain::EloStep("hard", 2), 7);
+	EXPECT_EQ(CGameControllerGTrain::EloStep("Insane", 3), 11);
+	EXPECT_EQ(CGameControllerGTrain::EloStep("Extreme", 3), 14);
+	// Deranged maps have no stars, a rating doesn't change them. They count
+	// as Extreme with five stars.
+	EXPECT_EQ(CGameControllerGTrain::EloStep("Deranged", 0), 16);
+	EXPECT_EQ(CGameControllerGTrain::EloStep("deranged", 2), 16);
+	const std::pair<const char *, int> aWithoutElo[] = {{"Mod", 2}, {"Solo", 1}, {"Others", 3}, {"Novice", 1}, {"", 1}, {"Hard", 0}, {"Hard", 4}};
+	for(const auto &[pServer, Stars] : aWithoutElo)
+		EXPECT_FALSE(CGameControllerGTrain::EloStep(pServer, Stars)) << pServer << " " << Stars;
+
+	PrepareTrainingCorridor();
+	g_Config.m_SvSpamprotection = 0;
+	const auto vIds = SpawnTrainingPlayers({"Runner", "Anna", "Bob"});
+	const int Runner = vIds[0], Bob = vIds[2];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	// The corridor is one tile high, so goals are as many tiles away as they are wide.
+	const auto GoalTiles = [&](int ClientId) {
+		return (int)std::abs(TrainingGoal(ClientId).x - GameServer()->GetPlayerChar(ClientId)->m_Pos.x) / 32;
+	};
+	const auto Capture = [&](int ClientId, int Ticks = 0, bool Frozen = false) {
+		for(int Other : vIds)
+			if(CCharacter *pChr = GameServer()->GetPlayerChar(Other))
+				pChr->Unfreeze();
+		pController->Tick();
+		m_pServer->AdvanceTicks(Ticks);
+		CCharacter *pChr = GameServer()->GetPlayerChar(ClientId);
+		pChr->m_Pos = pChr->m_PrevPos = TrainingGoal(ClientId);
+		pChr->SetPosition(pChr->m_Pos);
+		if(Frozen)
+			pChr->Freeze();
+		CMemoryLogger Logger;
+		{
+			CLogScope Scope(&Logger);
+			pController->Tick();
+		}
+		return Logger.ConcatenatedLines();
+	};
+	// The ELO a capture shows depends on the points the player had before.
+	int64_t aPoints[MAX_CLIENTS] = {};
+	const auto Gain = [&](int ClientId, int Step, int Tiles, double Seconds) {
+		const int64_t Before = aPoints[ClientId];
+		aPoints[ClientId] += GTrainElo::CapturePoints(Step, Tiles, Seconds);
+		char aGain[64];
+		str_format(aGain, sizeof(aGain), "+%.2f ELO, %.1fx speed", GTrainElo::FromPoints(aPoints[ClientId]) - GTrainElo::FromPoints(Before), GTrainElo::SpeedFactor(Step, Tiles, Seconds));
+		return std::string(aGain);
+	};
+	const auto Help = [&]() {
+		m_pServer->m_avChatMessages[Runner].clear();
+		Say(Runner, "/help");
+		return m_pServer->m_avChatMessages[Runner].back();
+	};
+
+	// Until the map's difficulty is known, captures earn nothing.
+	std::string Messages = Capture(Runner);
+	EXPECT_NE(Messages.find("'Runner' captured the flag in 0.00 seconds (0 fails)."), std::string::npos);
+	EXPECT_EQ(Messages.find("ELO"), std::string::npos);
+
+	// Instant captures are as fast as it gets.
+	pController->SetMapDifficulty("Hard", 2);
+	EXPECT_EQ(Help(), "Captures here are worth 17.1 times as much as on Easy ★☆☆ maps (Hard ★★☆), longer and faster ones more.");
+	int Tiles = GoalTiles(Runner);
+	ASSERT_GT(Tiles, 0);
+	EXPECT_NE(Capture(Runner).find("(0 fails, " + Gain(Runner, 7, Tiles, 0) + ")."), std::string::npos);
+	// Their speed bonus is the highest.
+	EXPECT_EQ(aPoints[Runner], std::llround(100 * std::pow(Tiles / 100.0, GTrainElo::DISTANCE_EXPONENT) * GTrainElo::PointsPerTile(7) * GTrainElo::MAX_SPEED_FACTOR));
+	// Longer goals earn more, retries don't change what a capture earns. The
+	// corridor is too short for /distance, which takes at least 50 tiles.
+	g_Config.m_SvGtrainGoalDistance = 6;
+	// Starts close to the finish get shorter goals.
+	for(int Attempt = 0; Attempt < 100 && Tiles != 6; ++Attempt)
+	{
+		GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_SELF);
+		GameServer()->m_apPlayers[Runner]->ForceSpawn(vec2(80, 80));
+		pController->Tick();
+		Tiles = GoalTiles(Runner);
+	}
+	ASSERT_EQ(Tiles, 6);
+	m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, Runner);
+	EXPECT_NE(Capture(Runner).find("(1 fail, " + Gain(Runner, 7, Tiles, 0) + ")."), std::string::npos);
+
+	// Frozen tees still capture, without ELO.
+	const int Captures = pController->Stats(Runner).m_Captures;
+	EXPECT_NE(Capture(Runner, 0, true).find("'Runner' captured the flag in 0.00 seconds (0 fails, +0 ELO (frozen))."), std::string::npos);
+	EXPECT_EQ(pController->Stats(Runner).m_Captures, Captures + 1);
+	EXPECT_EQ(pController->Stats(Runner).m_Points, aPoints[Runner]);
+
+	// Kept weapons earn nothing either, also when they are gone again before
+	// the capture.
+	const auto Command = [&](const char *pCommand) { m_pServer->Console()->ExecuteLineFlag(pCommand, CFGFLAG_CHAT, Runner); };
+	Command("ninja");
+	EXPECT_NE(Capture(Runner).find("(0 fails, +0 ELO (kept weapons))."), std::string::npos);
+	Command("ninja");
+	GameServer()->GetPlayerChar(Runner)->Unfreeze();
+	pController->Tick();
+	Command("grenade");
+	pController->Tick();
+	Command("grenade");
+	EXPECT_NE(Capture(Runner).find("(0 fails, +0 ELO (kept weapons))."), std::string::npos);
+	EXPECT_EQ(pController->Stats(Runner).m_Captures, Captures + 3);
+	EXPECT_EQ(pController->Stats(Runner).m_Points, aPoints[Runner]);
+	// Weapons kept while hovering only, then given up, don't count.
+	Command("laser");
+	Command("laser");
+	Tiles = GoalTiles(Runner);
+	EXPECT_NE(Capture(Runner).find("(0 fails, " + Gain(Runner, 7, Tiles, 0) + ")."), std::string::npos);
+
+	// Half the typical speed of an Extreme map is slow.
+	pController->SetMapDifficulty("Extreme", 3);
+	Tiles = GoalTiles(Runner);
+	const int SlowTicks = (int)std::ceil(2 * Tiles / GTrainElo::EXTREME_TILES_PER_SECOND * (double)SERVER_TICK_SPEED);
+	const double SlowSeconds = SlowTicks / (double)SERVER_TICK_SPEED;
+	ASSERT_LT(GTrainElo::SpeedFactor(14, Tiles, SlowSeconds), 1);
+	char aSlow[64];
+	str_format(aSlow, sizeof(aSlow), "in %.2f seconds (0 fails, ", SlowSeconds);
+	EXPECT_NE(Capture(Runner, SlowTicks).find(aSlow + Gain(Runner, 14, Tiles, SlowSeconds) + ")."), std::string::npos);
+
+	// The capturer of a fight earns ELO, the others don't.
+	pController->Fight(Bob, "Anna");
+	pController->Tick();
+	Tiles = GoalTiles(Bob);
+	Messages = Capture(Bob);
+	EXPECT_NE(Messages.find("'Bob' captured the flag (0 fails, " + Gain(Bob, 14, Tiles, 0) + "). First to 10: 'Anna': 0, 'Bob': 1"), std::string::npos);
+	EXPECT_EQ(Messages.find("'Anna' captured"), std::string::npos);
+	// Frozen fight captures score too.
+	Messages = Capture(Bob, 0, true);
+	EXPECT_NE(Messages.find("'Bob' captured the flag (0 fails, +0 ELO (frozen)). First to 10: 'Anna': 0, 'Bob': 2"), std::string::npos);
+	EXPECT_EQ(pController->Stats(Bob).m_Points, aPoints[Bob]);
+
+	// Deranged maps have no stars and are worth what Extreme ★★★★★ would be.
+	// Speed doesn't count there, and goals have at least 100 tiles.
+	pController->SetMapDifficulty("Deranged", 0);
+	EXPECT_EQ(Help(), "Captures here are worth 656.8 times as much as on Easy ★☆☆ maps (Deranged), longer ones more. Speed doesn't count, goals have at least 100 tiles.");
+	const auto Reply = [&](const char *pMessage) {
+		m_pServer->m_avChatMessages[Runner].clear();
+		Say(Runner, pMessage);
+		return m_pServer->m_avChatMessages[Runner].back();
+	};
+	EXPECT_EQ(Reply("/distance 60"), "The goal distance must be between 100 and 1000 tiles on Deranged maps, 0 for the server default.");
+	EXPECT_EQ(Reply("/distance"), "Goal distance: 100 tiles (server default). Use /distance 100-1000 to change it, 0 for the server default.");
+	// The goal from before the difficulty was known is shorter.
+	EXPECT_NE(Capture(Runner).find("(0 fails, +0 ELO (goal under 100 tiles))."), std::string::npos);
+	EXPECT_EQ(pController->Stats(Runner).m_Points, aPoints[Runner]);
+	// New goals aim for 100 tiles, which the short corridor cuts. An instant
+	// capture counts as typical speed.
+	Tiles = GoalTiles(Runner);
+	ASSERT_LT(Tiles, 100);
+	Messages = Capture(Runner);
+	EXPECT_NE(Messages.find("(0 fails, " + Gain(Runner, GTrainElo::DERANGED_STEP, Tiles, 0) + ")."), std::string::npos);
+	EXPECT_NE(Messages.find(", 1.0x speed)."), std::string::npos);
+	EXPECT_EQ(pController->Stats(Runner).m_Points, aPoints[Runner]);
+
+	pController->SetMapDifficulty("Mod", 3);
+	EXPECT_EQ(Help(), "Captures on this map earn no ELO.");
+	Messages = Capture(Runner);
+	EXPECT_NE(Messages.find("'Runner' captured the flag in 0.00 seconds (0 fails)."), std::string::npos);
+	EXPECT_EQ(Messages.find("ELO"), std::string::npos);
+}
+
+TEST_F(GameWorld, GTrainStatsCountAttemptsRespawnsCapturesAndPlaytime)
+{
+	PrepareTrainingCorridor();
+	const auto vIds = SpawnTrainingPlayers({"Runner", "Anna", "Bob"});
+	const int Runner = vIds[0], Anna = vIds[1], Bob = vIds[2];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	const auto Stats = [&](int ClientId) { return pController->Stats(ClientId); };
+	// Ends the hover, then plays for the given time.
+	const auto Play = [&](std::initializer_list<int> Ids, int Ticks) {
+		for(int ClientId : Ids)
+			GameServer()->GetPlayerChar(ClientId)->Unfreeze();
+		pController->Tick();
+		m_pServer->AdvanceTicks(Ticks);
+	};
+	const auto Kill = [&](int ClientId) {
+		GameServer()->m_apPlayers[ClientId]->KillCharacter(WEAPON_SELF);
+		GameServer()->m_apPlayers[ClientId]->ForceSpawn(vec2(80, 80));
+		pController->Tick();
+	};
+	const auto Capture = [&](int ClientId) {
+		CCharacter *pChr = GameServer()->GetPlayerChar(ClientId);
+		pChr->m_Pos = pChr->m_PrevPos = TrainingGoal(ClientId);
+		pChr->SetPosition(pChr->m_Pos);
+		pController->Tick();
+	};
+	const auto Retry = [&](int ClientId) { m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, ClientId); };
+	constexpr int Second = SERVER_TICK_SPEED;
+
+	// Attempts count after two seconds of play.
+	Play({Runner}, 2 * Second - 1);
+	Retry(Runner);
+	EXPECT_EQ(Stats(Runner).m_Attempts, 0);
+	Play({Runner}, 2 * Second);
+	Retry(Runner);
+	EXPECT_EQ(Stats(Runner).m_Attempts, 1);
+	// Giving up a tried spot is a respawn, also while hovering after a retry.
+	Kill(Runner);
+	EXPECT_EQ(Stats(Runner).m_Respawns, 1);
+	// Skipping a spot without trying it is none.
+	Kill(Runner);
+	EXPECT_EQ(Stats(Runner).m_Respawns, 1);
+	// Captures always count as attempts, and their spots never as respawns.
+	Play({Runner}, 0);
+	Capture(Runner);
+	EXPECT_EQ(Stats(Runner).m_Captures, 1);
+	EXPECT_EQ(Stats(Runner).m_Attempts, 2);
+	EXPECT_EQ(Stats(Runner).m_Respawns, 1);
+	Play({Runner}, 3 * Second);
+	Kill(Runner);
+	EXPECT_EQ(Stats(Runner).m_Attempts, 3);
+	EXPECT_EQ(Stats(Runner).m_Respawns, 2);
+
+	// Fight members dying retry the spot, only the leader gives it up.
+	pController->Fight(Bob, "Anna");
+	pController->Tick();
+	Play({Anna, Bob}, 2 * Second);
+	Kill(Bob);
+	EXPECT_EQ(Stats(Bob).m_Attempts, 1);
+	EXPECT_EQ(Stats(Bob).m_Respawns, 0);
+	EXPECT_EQ(Stats(Anna).m_Attempts, 0);
+	Kill(Anna);
+	EXPECT_EQ(Stats(Anna).m_Attempts, 1);
+	EXPECT_EQ(Stats(Anna).m_Respawns, 1);
+	EXPECT_EQ(Stats(Bob).m_Attempts, 1);
+	EXPECT_EQ(Stats(Bob).m_Respawns, 0);
+
+	// Freeplay has no attempts.
+	pController->Freeplay(Runner);
+	Play({Runner}, 3 * Second);
+	Kill(Runner);
+	EXPECT_EQ(Stats(Runner).m_Attempts, 3);
+	EXPECT_EQ(Stats(Runner).m_Respawns, 2);
+	pController->Freeplay(Runner);
+
+	// Playtime counts while playing, not while paused or spectating. Bob
+	// leaves the fight first, his leader's death would kill him too.
+	pController->Fight(Bob, "");
+	pController->Tick();
+	GameServer()->m_apPlayers[Anna]->SetTeam(TEAM_SPECTATORS);
+	ASSERT_EQ(GameServer()->m_apPlayers[Bob]->Pause(CPlayer::PAUSE_PAUSED, true), CPlayer::PAUSE_PAUSED);
+	pController->Tick();
+	const int RunnerPlaytime = Stats(Runner).m_Playtime;
+	const int AnnaPlaytime = Stats(Anna).m_Playtime;
+	const int BobPlaytime = Stats(Bob).m_Playtime;
+	for(int i = 0; i < 3 * Second; ++i)
+		pController->Tick();
+	EXPECT_EQ(Stats(Runner).m_Playtime, RunnerPlaytime + 3);
+	EXPECT_EQ(Stats(Anna).m_Playtime, AnnaPlaytime);
+	EXPECT_EQ(Stats(Bob).m_Playtime, BobPlaytime);
+}
+
+TEST_F(GameWorld, GTrainEloScoreboard)
+{
+	// ELO points are stored per name in the database, which runs jobs in order on its own thread.
+	char aDatabase[64];
+	ASSERT_LT(str_length(m_TestInfo.m_aFilename) + str_length("/elo.sqlite"), (int)sizeof(aDatabase));
+	str_format(aDatabase, sizeof(aDatabase), "%s/elo.sqlite", m_TestInfo.m_aFilename);
+	m_pServer->DbPool()->RegisterSqliteDatabase(CDbConnectionPool::READ, aDatabase);
+	m_pServer->DbPool()->RegisterSqliteDatabase(CDbConnectionPool::WRITE, aDatabase);
+	PrepareTrainingCorridor();
+	g_Config.m_SvSpamprotection = 0;
+	g_Config.m_SvSqlQueriesDelay = 0;
+	const auto vIds = SpawnTrainingPlayers({"Runner", "Anna", "Bob"});
+	const int Runner = vIds[0], Anna = vIds[1], Bob = vIds[2];
+	// Players only get query results after their first snapshots.
+	for(int ClientId : vIds)
+		GameServer()->m_apPlayers[ClientId]->m_SentSnaps = 3;
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	const auto Score = [&](int ClientId) { return pController->SnapPlayerScore(ClientId, GameServer()->m_apPlayers[ClientId]); };
+	const auto Elo = [](int64_t Points) { return (int)GTrainElo::FromPoints(Points); };
+	// A job queued last completes after all earlier ones.
+	const auto WaitForDatabase = [&]() {
+		auto pLast = std::make_shared<CScoreGTrainStatsResult>();
+		GameServer()->Score()->LoadGTrainStats("Runner", pLast);
+		for(int i = 0; i < 1000 && !pLast->m_Completed; ++i)
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		EXPECT_TRUE(pLast->m_Completed);
+		pController->Tick();
+		for(int ClientId : vIds)
+			GameServer()->m_apPlayers[ClientId]->Tick();
+		return pLast->m_Success;
+	};
+	// Reads fail until the database is registered.
+	bool Ready = false;
+	for(int i = 0; i < 100 && !Ready; ++i)
+		Ready = WaitForDatabase();
+	ASSERT_TRUE(Ready);
+	const auto GoalTiles = [&](int ClientId) {
+		return (int)std::abs(TrainingGoal(ClientId).x - GameServer()->GetPlayerChar(ClientId)->m_Pos.x) / 32;
+	};
+	// Instant captures of an Extreme map with three stars.
+	const auto Capture = [&](int ClientId) {
+		for(int Other : vIds)
+			if(CCharacter *pChr = GameServer()->GetPlayerChar(Other))
+				pChr->Unfreeze();
+		pController->Tick();
+		const int64_t Points = GTrainElo::CapturePoints(GTrainElo::EXTREME_STEP, GoalTiles(ClientId), 0);
+		CCharacter *pChr = GameServer()->GetPlayerChar(ClientId);
+		pChr->m_Pos = pChr->m_PrevPos = TrainingGoal(ClientId);
+		pChr->SetPosition(pChr->m_Pos);
+		pController->Tick();
+		return Points;
+	};
+	const auto Rename = [&](int ClientId, const char *pName) {
+		CNetMsg_Cl_ChangeInfo Msg = {};
+		Msg.m_pName = pName;
+		Msg.m_pClan = "";
+		Msg.m_pSkin = "default";
+		GameServer()->OnChangeInfoNetMessage(&Msg, ClientId);
+		EXPECT_STREQ(m_pServer->ClientName(ClientId), pName);
+	};
+
+	const auto AddPoints = [&](const char *pName, int64_t Points) {
+		CGTrainStats Stats;
+		Stats.m_Points = Points;
+		GameServer()->Score()->AddGTrainStats(pName, Stats);
+	};
+
+	// Points from earlier grinding load once the names are set.
+	AddPoints("Runner", 2'000'000'000);
+	AddPoints("Bob", 1'000'000'000);
+	for(int ClientId : vIds)
+		pController->LoadStats(ClientId);
+	ASSERT_TRUE(WaitForDatabase());
+	EXPECT_EQ(Score(Runner), Elo(2'000'000'000));
+	EXPECT_GT(Score(Runner), 0);
+	pController->SetMapDifficulty("Extreme", 3);
+	int64_t RunnerPoints = 2'000'000'000 + Capture(Runner);
+	EXPECT_EQ(Score(Runner), Elo(RunnerPoints));
+	pController->Tick();
+	EXPECT_EQ(m_pServer->m_aClients[Runner].m_Score, Elo(RunnerPoints));
+
+	// Another name has its own ELO. Coming back loads the saved points, plus
+	// what was gained while loading them.
+	Rename(Runner, "Walker");
+	EXPECT_EQ(Score(Runner), 0);
+	ASSERT_TRUE(WaitForDatabase());
+	EXPECT_EQ(Score(Runner), 0);
+	Rename(Runner, "Runner");
+	RunnerPoints += Capture(Runner);
+	ASSERT_TRUE(WaitForDatabase());
+	EXPECT_EQ(Score(Runner), Elo(RunnerPoints));
+	pController->LoadStats(Runner);
+	ASSERT_TRUE(WaitForDatabase());
+	EXPECT_EQ(Score(Runner), Elo(RunnerPoints));
+	EXPECT_EQ(pController->Stats(Runner).m_Captures, 2);
+	EXPECT_EQ(pController->Stats(Runner).m_Attempts, 2);
+
+	// Fighting players show their fight points, until they leave the fight.
+	pController->Fight(Bob, "Anna");
+	pController->Tick();
+	EXPECT_EQ(Score(Bob), 0);
+	const int64_t BobPoints = 1'000'000'000 + Capture(Bob);
+	EXPECT_EQ(Score(Bob), 1);
+	EXPECT_EQ(Score(Anna), 0);
+	pController->Fight(Bob, "");
+	pController->Tick();
+	EXPECT_EQ(Score(Bob), Elo(BobPoints));
+	EXPECT_EQ(m_pServer->m_aClients[Bob].m_Score, Elo(BobPoints));
+
+	// The server browser gets points rather than times.
+	m_pServer->m_aClients[Bob].m_DebugDummy = false;
+	CServer::CCache Cache;
+	m_pServer->CacheServerInfo(&Cache, SERVERINFO_EXTENDED, true);
+	m_pServer->m_aClients[Bob].m_DebugDummy = true;
+	std::string Info;
+	for(const auto &Chunk : Cache.m_vCache)
+		Info.append((const char *)Chunk.m_vData.data(), Chunk.m_vData.size());
+	EXPECT_NE(Info.find(std::string("Bob\0", 4)), std::string::npos);
+	EXPECT_NE(Info.find('\0' + std::to_string(Elo(BobPoints)) + '\0'), std::string::npos);
+	EXPECT_EQ(Info.find("-" + std::to_string(Elo(BobPoints))), std::string::npos);
+
+	// /points and /top5points show the ELO from the database.
+	m_pServer->AdvanceTicks(10);
+	m_pServer->m_avChatMessages[Anna].clear();
+	Say(Anna, "/points Runner");
+	ASSERT_TRUE(WaitForDatabase());
+	ASSERT_FALSE(m_pServer->m_avChatMessages[Anna].empty());
+	EXPECT_EQ(m_pServer->m_avChatMessages[Anna].back(), "1. Runner ELO: " + std::to_string(Elo(RunnerPoints)) + ", requested by Anna");
+	m_pServer->AdvanceTicks(10);
+	m_pServer->m_avChatMessages[Anna].clear();
+	Say(Anna, "/top5elo");
+	ASSERT_TRUE(WaitForDatabase());
+	const auto &vTop = m_pServer->m_avChatMessages[Anna];
+	ASSERT_EQ(vTop.size(), 4u);
+	EXPECT_EQ(vTop[0], "-------- Top ELO --------");
+	EXPECT_EQ(vTop[1], "1. Runner ELO: " + std::to_string(Elo(RunnerPoints)));
+	EXPECT_EQ(vTop[2], "2. Bob ELO: " + std::to_string(Elo(BobPoints)));
+
+	// /rank and /profile show all stats, captures are attempts as well.
+	for(const char *pCommand : {"/rank Runner", "/profile Runner"})
+	{
+		m_pServer->AdvanceTicks(10);
+		m_pServer->m_avChatMessages[Anna].clear();
+		Say(Anna, pCommand);
+		ASSERT_TRUE(WaitForDatabase());
+		ASSERT_FALSE(m_pServer->m_avChatMessages[Anna].empty()) << pCommand;
+		const std::string &Profile = m_pServer->m_avChatMessages[Anna].back();
+		EXPECT_TRUE(Profile.starts_with("1. Runner ELO: " + std::to_string(Elo(RunnerPoints)) + ", 2 captures, 2 attempts, 0 respawns, ")) << Profile;
+		EXPECT_TRUE(Profile.ends_with(" played, requested by Anna")) << Profile;
+	}
+	m_pServer->AdvanceTicks(10);
+	m_pServer->m_avChatMessages[Anna].clear();
+	Say(Anna, "/top5captures");
+	ASSERT_TRUE(WaitForDatabase());
+	ASSERT_EQ(vTop.size(), 4u);
+	EXPECT_EQ(vTop[0], "-------- Top Captures --------");
+	EXPECT_EQ(vTop[1], "1. Runner Captures: 2");
+	EXPECT_EQ(vTop[2], "2. Bob Captures: 1");
+	// /top5 has no race times to show either.
+	m_pServer->AdvanceTicks(10);
+	m_pServer->m_avChatMessages[Anna].clear();
+	Say(Anna, "/top5");
+	ASSERT_TRUE(WaitForDatabase());
+	ASSERT_EQ(vTop.size(), 4u);
+	EXPECT_EQ(vTop[0], "-------- Top ELO --------");
+	EXPECT_EQ(vTop[1], "1. Runner ELO: " + std::to_string(Elo(RunnerPoints)));
+
+	// ELO stops at its maximum.
+	AddPoints("Anna", 1'000'000'000'000'000);
+	pController->LoadStats(Anna);
+	ASSERT_TRUE(WaitForDatabase());
+	EXPECT_EQ(Score(Anna), GTrainElo::MAX_ELO);
+}
+
+TEST_F(GameWorld, GTrainChatOnlyHasGTrainCommands)
+{
+	IConsole *pConsole = m_pServer->Console();
+	const auto IsChatCommand = [&](const char *pName) { return pConsole->GetCommandInfo(pName, CFGFLAG_CHAT, false) != nullptr; };
+	ASSERT_TRUE(IsChatCommand("team"));
+	ASSERT_TRUE(IsChatCommand("solo"));
+	PrepareTrainingCorridor();
+	// Races, DDRace teams and practice have no use in GTrain.
+	for(const char *pName : {"practice", "save", "load", "kill", "times", "swap", "solo", "weapons", "unlaser", "tpxy", "join", "unlock"})
+		EXPECT_FALSE(IsChatCommand(pName)) << pName;
+	for(const char *pName : {"r", "retry", "fight", "lock", "invite", "team", "accept", "a", "distance", "forwards", "trail", "settings", "laser", "rifle", "top5", "rank", "profile", "top5playtime", "spec", "pause", "w", "help", "cmdlist", "map", "timeout"})
+		EXPECT_TRUE(IsChatCommand(pName)) << pName;
+	// Practice binds stay, they retry.
+	for(const char *pName : {"invincible", "tc", "telecursor", "rescue", "back", "tp", "teleport", "lasttp"})
+		EXPECT_TRUE(IsChatCommand(pName)) << pName;
+	// Rcon keeps them.
+	EXPECT_NE(pConsole->GetCommandInfo("practice", CFGFLAG_SERVER, false), nullptr);
+	// GTrain's /team and /invite take player names.
+	EXPECT_STREQ(pConsole->GetCommandInfo("team", CFGFLAG_CHAT, false)->Params(), "?r[player name]");
+	EXPECT_STREQ(pConsole->GetCommandInfo("invite", CFGFLAG_CHAT, false)->Params(), "r[player name]");
+}
+
+TEST_F(GameWorld, GTrainSettingsShowsThoseOfPlayersAndFights)
+{
+	PrepareTrainingCorridor();
+	g_Config.m_SvSpamprotection = 0;
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob", "Runner"});
+	const int Anna = vIds[0], Bob = vIds[1], Runner = vIds[2];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	const auto Settings = [&](int ClientId, const char *pCommand) {
+		m_pServer->m_avChatMessages[ClientId].clear();
+		Say(ClientId, pCommand);
+		return m_pServer->m_avChatMessages[ClientId].empty() ? std::string() : m_pServer->m_avChatMessages[ClientId].back();
+	};
+
+	EXPECT_EQ(Settings(Anna, "/settings"), "Your settings: /trail on, /distance 3 (server default), /nodj off, /forwards off, /freeplay off, /scorelimit 10, /lock off, kept weapons: none");
+	for(const char *pCommand : {"/distance 120", "/nodj", "/forwards", "/ninja", "/shotgun", "/scorelimit 0", "/trail"})
+		Say(Anna, pCommand);
+	const std::string AnnaSettings = "/distance 120, /nodj on, /forwards on, /freeplay off, /scorelimit off, /lock off, kept weapons: shotgun, ninja";
+	EXPECT_EQ(Settings(Anna, "/settings"), "Your settings: /trail off, " + AnnaSettings);
+	EXPECT_EQ(Settings(Runner, "/settings Anna"), "Settings of 'Anna': /trail off, " + AnnaSettings);
+	EXPECT_EQ(Settings(Runner, "/settings Nobody"), "Player not found. Use their full name.");
+
+	// In a fight, the leader's settings apply to everyone, except the trail.
+	pController->Fight(Bob, "Anna");
+	pController->Tick();
+	EXPECT_EQ(Settings(Bob, "/settings"), "Your settings: /trail on, from fight leader 'Anna': " + AnnaSettings);
+	EXPECT_EQ(Settings(Runner, "/settings Bob"), "Settings of 'Bob': /trail on, from fight leader 'Anna': " + AnnaSettings);
+	EXPECT_EQ(Settings(Runner, "/settings *Anna*"), "Settings of 'Anna' (fight leader): /trail off, " + AnnaSettings);
+	EXPECT_EQ(Settings(Anna, "/settings"), "Your settings (fight leader): /trail off, " + AnnaSettings);
+}
+
+TEST_F(GameWorld, GTrainPracticeBindsRetry)
+{
+	PrepareTrainingCorridor();
+	g_Config.m_SvSpamprotection = 0;
+	const int Runner = SpawnTrainingPlayers({"Runner"})[0];
+	const vec2 Start = GameServer()->GetPlayerChar(Runner)->m_Pos;
+	const vec2 Goal = TrainingGoal(Runner);
+	for(const char *pCommand : {"/r", "/retry", "/tc", "/telecursor", "/invincible", "/rescue", "/back", "/tp", "/teleport Runner", "/lasttp"})
+	{
+		CCharacter *pChr = GameServer()->GetPlayerChar(Runner);
+		pChr->SetPosition(Start + vec2(64, 0));
+		pChr->m_Pos = Start + vec2(64, 0);
+		Say(Runner, pCommand);
+		EXPECT_EQ(GameServer()->GetPlayerChar(Runner)->m_Pos, Start) << pCommand;
+		EXPECT_EQ(TrainingGoal(Runner), Goal) << pCommand;
+	}
+}
+
+TEST_F(GameWorld, GTrainNeverPlacesOnUnfreezeTiles)
+{
+	// Unfreeze tiles would end the hover right away.
+	PrepareTrainingCorridor();
+	CCollision *pCollision = GameServer()->Collision();
+	for(int x = 10; x <= 20; ++x)
+		pCollision->SetCollisionAt(x * 32 + 16, 80, TILE_UNFREEZE);
+	delete GameServer()->m_pController;
+	GameServer()->m_pController = new CGameControllerGTrain(GameServer());
+	const int Runner = SpawnTrainingPlayers({"Runner"})[0];
+	const auto OnUnfreeze = [](vec2 Pos) { return Pos.x >= 10 * 32 && Pos.x < 21 * 32; };
+	bool FoundBehind = false;
+	for(int Attempt = 0; Attempt < 200; ++Attempt)
+	{
+		const vec2 Start = GameServer()->GetPlayerChar(Runner)->m_Pos;
+		ASSERT_FALSE(OnUnfreeze(Start)) << Start.x;
+		ASSERT_FALSE(OnUnfreeze(TrainingGoal(Runner))) << TrainingGoal(Runner).x;
+		FoundBehind |= Start.x > 21 * 32;
+		GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_SELF);
+		GameServer()->m_apPlayers[Runner]->ForceSpawn(vec2(80, 80));
+		GameServer()->m_pController->Tick();
+	}
+	// The tiles still belong to the path.
+	EXPECT_TRUE(FoundBehind);
+}
+
+TEST_F(GameWorld, GTrainSkipsTheStartOfTheMap)
+{
+	PrepareTrainingCorridor();
+	// The start line is at x = 1, so x = 2 to 6 is within 5 tiles of it.
+	g_Config.m_SvGtrainStartExclusion = 5;
+	delete GameServer()->m_pController;
+	GameServer()->m_pController = new CGameControllerGTrain(GameServer());
+	const int Runner = SpawnTrainingPlayers({"Runner"})[0];
+	const float FirstAllowed = 7 * 32 + 16;
+	const auto NextAttempt = [&]() {
+		GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_SELF);
+		GameServer()->m_apPlayers[Runner]->ForceSpawn(vec2(80, 80));
+		GameServer()->m_pController->Tick();
+	};
+	bool FoundFirstAllowed = false;
+	for(int Attempt = 0; Attempt < 1000 && !FoundFirstAllowed; ++Attempt)
+	{
+		const float StartX = GameServer()->GetPlayerChar(Runner)->m_Pos.x;
+		// Goals behind such a start would be in the start area too.
+		ASSERT_GE(StartX, FirstAllowed);
+		ASSERT_GE(TrainingGoal(Runner).x, FirstAllowed);
+		FoundFirstAllowed = StartX == FirstAllowed;
+		NextAttempt();
+	}
+	EXPECT_TRUE(FoundFirstAllowed);
+
+	// Maps entirely within the distance keep all their tiles. Characters
+	// keep the controller's teams, so the runner must not outlive it.
+	g_Config.m_SvGtrainStartExclusion = 10000;
+	GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_GAME);
+	delete GameServer()->m_pController;
+	GameServer()->m_pController = new CGameControllerGTrain(GameServer());
+	bool FoundBesideStart = false;
+	for(int Attempt = 0; Attempt < 1000 && !FoundBesideStart; ++Attempt)
+	{
+		NextAttempt();
+		TrainingGoal(Runner);
+		FoundBesideStart = GameServer()->GetPlayerChar(Runner)->m_Pos.x == 2 * 32 + 16;
+	}
+	EXPECT_TRUE(FoundBesideStart);
+}
+
+TEST_F(GameWorld, GTrainOnlyPlacesWithinTheRace)
+{
+	// Spots and goals farther from the start line than the finish line is,
+	// or farther from the finish line than the start line is, are off the
+	// race. The fill reaches past both lines through the freeze below.
+	PrepareTrainingCorridor();
+	CCollision *pCollision = GameServer()->Collision();
+	const int Width = pCollision->GetWidth();
+	ASSERT_GE(Width, 30);
+	const int StartX = 10, FinishX = Width - 10;
+	const auto Tile = [](int x, int y) { return vec2(x * 32 + 16, y * 32 + 16); };
+	const auto SetTile = [&](int x, int y, int Index) { pCollision->SetCollisionAt(x * 32 + 16, y * 32 + 16, Index); };
+	SetTile(1, 2, TILE_AIR);
+	SetTile(Width - 2, 2, TILE_AIR);
+	SetTile(StartX, 2, TILE_START);
+	SetTile(FinishX, 2, TILE_FINISH);
+	const int Runner = SpawnTrainingPlayers({"Runner"})[0];
+	// Every spot, in rows, as starts and goals of many attempts.
+	std::vector<vec2> vStarts, vGoals;
+	const auto CollectSpots = [&]() {
+		// Characters keep the controller's teams, they must not outlive it.
+		GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_GAME);
+		delete GameServer()->m_pController;
+		GameServer()->m_pController = new CGameControllerGTrain(GameServer());
+		vStarts.clear();
+		vGoals.clear();
+		const auto Add = [](std::vector<vec2> &vSpots, vec2 Pos) {
+			if(std::find(vSpots.begin(), vSpots.end(), Pos) == vSpots.end())
+				vSpots.push_back(Pos);
+		};
+		for(int Attempt = 0; Attempt < 1500; ++Attempt)
+		{
+			GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_SELF);
+			GameServer()->m_apPlayers[Runner]->ForceSpawn(vec2(80, 80));
+			GameServer()->m_pController->Tick();
+			Add(vStarts, GameServer()->GetPlayerChar(Runner)->m_Pos);
+			Add(vGoals, TrainingGoal(Runner));
+		}
+		const auto Order = [](vec2 A, vec2 B) { return A.y != B.y ? A.y < B.y : A.x < B.x; };
+		std::sort(vStarts.begin(), vStarts.end(), Order);
+		std::sort(vGoals.begin(), vGoals.end(), Order);
+	};
+	std::vector<vec2> vBetween;
+	for(int x = StartX + 1; x < FinishX; ++x)
+		vBetween.push_back(Tile(x, 2));
+
+	// Behind the start, no path leads to the finish, and none leads past
+	// the finish from the start.
+	CollectSpots();
+	EXPECT_EQ(vStarts, vBetween);
+	EXPECT_EQ(vGoals, vBetween);
+
+	// Around the lines, the tiles above them connect both sides. Going around
+	// a line takes longer than passing it, so the tiles above the lines and
+	// behind them are farther from the other line than this line is. Those
+	// beside the race are not.
+	for(int x : {StartX - 1, StartX, StartX + 1, FinishX - 1, FinishX, FinishX + 1})
+		SetTile(x, 1, TILE_AIR);
+	std::vector<vec2> vInRace = vBetween;
+	vInRace.insert(vInRace.begin(), {Tile(StartX + 1, 1), Tile(FinishX - 1, 1)});
+	CollectSpots();
+	EXPECT_EQ(vStarts, vInRace);
+	EXPECT_EQ(vGoals, vInRace);
+}
+
+TEST_F(GameWorld, GTrainRatesSpotsWhileEveryoneSpectates)
+{
+	PrepareTrainingCorridor();
+	const int Runner = SpawnTrainingPlayers({"Runner"})[0];
+	ASSERT_TRUE(GameServer()->GetPlayerChar(Runner));
+	g_Config.m_SvGtrainTileRatings = 1;
+	GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_GAME);
+	delete GameServer()->m_pController;
+	auto *pController = new CGameControllerGTrain(GameServer());
+	GameServer()->m_pController = pController;
+	ASSERT_TRUE(pController->RatingTiles());
+	char aReason[128] = "";
+	EXPECT_FALSE(pController->CanJoinTeam(TEAM_GAME, Runner, aReason, sizeof(aReason)));
+	EXPECT_TRUE(str_find(aReason, "rated")) << aReason;
+
+	// Everyone spectates with the progress shown, and plays once it is done.
+	m_pServer->AdvanceTicks(SERVER_TICK_SPEED - m_pServer->Tick() % SERVER_TICK_SPEED);
+	m_pServer->m_avBroadcasts[Runner].clear();
+	for(int Wait = 0; Wait < 6000 && pController->RatingTiles(); ++Wait)
+	{
+		pController->Tick();
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	ASSERT_FALSE(pController->RatingTiles());
+	EXPECT_EQ(GameServer()->m_apPlayers[Runner]->GetTeam(), TEAM_GAME);
+	ASSERT_GE(m_pServer->m_avBroadcasts[Runner].size(), 2u);
+	EXPECT_TRUE(str_find(m_pServer->m_avBroadcasts[Runner].front().c_str(), "Rating this map's spots")) << m_pServer->m_avBroadcasts[Runner].front();
+	EXPECT_EQ(m_pServer->m_avBroadcasts[Runner].back(), "");
+	EXPECT_TRUE(pController->CanJoinTeam(TEAM_GAME, Runner, aReason, sizeof(aReason)));
+
+	// The ratings are saved for this version of the map, and loaded again.
+	char aSha256[SHA256_MAXSTRSIZE];
+	sha256_str(GameServer()->Map()->Sha256(), aSha256, sizeof(aSha256));
+	char aPath[IO_MAX_PATH_LENGTH];
+	str_format(aPath, sizeof(aPath), "gtrain_ratings/%s_%s.gtr", fs_filename(g_Config.m_SvMap), aSha256);
+	EXPECT_TRUE(m_pStorage->FileExists(aPath, IStorage::TYPE_SAVE)) << aPath;
+	GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_GAME);
+	delete GameServer()->m_pController;
+	CMemoryLogger Logger;
+	{
+		CLogScope Scope(&Logger);
+		GameServer()->m_pController = new CGameControllerGTrain(GameServer());
+	}
+	EXPECT_FALSE(static_cast<CGameControllerGTrain *>(GameServer()->m_pController)->RatingTiles());
+	EXPECT_TRUE(str_find(Logger.ConcatenatedLines().c_str(), "loaded the ratings of")) << Logger.ConcatenatedLines();
+}
+
+TEST_F(GameWorld, GTrainCapturesEarnByTheirTiles)
+{
+	PrepareTrainingCorridor();
+	g_Config.m_SvSpamprotection = 0;
+	// Far enough for the goal's tile to keep its own rating in the blur.
+	g_Config.m_SvGtrainGoalDistance = 8;
+	CCollision *pCollision = GameServer()->Collision();
+	const int Width = pCollision->GetWidth();
+	const int Runner = SpawnTrainingPlayers({"Runner"})[0];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	// The stars don't count with rated tiles, only that the category earns.
+	pController->SetMapDifficulty("Easy", 1);
+	const auto TileX = [](vec2 Pos) { return (int)(Pos.x / 32); };
+	// A spot with two corridor tiles behind it, away from the goal.
+	int Direction = 0;
+	for(int Attempt = 0; Attempt < 1000; ++Attempt)
+	{
+		const int StartX = TileX(GameServer()->GetPlayerChar(Runner)->m_Pos);
+		Direction = TileX(TrainingGoal(Runner)) > StartX ? 1 : -1;
+		if(StartX - 2 * Direction >= 2 && StartX - 2 * Direction <= Width - 3 && std::abs(TileX(TrainingGoal(Runner)) - StartX) >= 7)
+			break;
+		GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_SELF);
+		GameServer()->m_apPlayers[Runner]->ForceSpawn(vec2(80, 80));
+		pController->Tick();
+		Direction = 0;
+	}
+	ASSERT_NE(Direction, 0);
+	CCharacter *pChr = GameServer()->GetPlayerChar(Runner);
+	const vec2 Start = pChr->m_Pos, Goal = TrainingGoal(Runner);
+	const int Distance = std::abs(TileX(Goal) - TileX(Start));
+	const vec2 Behind = Start - vec2(32.0f * Direction, 0), FarBehind = Start - vec2(64.0f * Direction, 0);
+	const auto &aSteps = GTrainElo::TILE_STEP_DIFFICULTIES;
+	std::vector<float> vDifficulties((size_t)Width * pCollision->GetHeight(), CGTrainTileRatings::UNRATED);
+	const auto Rate = [&](vec2 Pos, float Difficulty) { vDifficulties[pCollision->GetPureMapIndex(Pos)] = Difficulty; };
+	Rate(Start, aSteps[6]);
+	Rate(Behind, aSteps[8]);
+	Rate(FarBehind, aSteps[14]); // only reached frozen
+	// The easiest spots are rated below 0, they count all the same.
+	Rate(Goal, -2.0f);
+	pController->SetTileDifficulties(vDifficulties);
+
+	const auto MoveTo = [&](vec2 Pos) {
+		pChr->m_Pos = pChr->m_PrevPos = Pos;
+		pChr->SetPosition(Pos);
+		CMemoryLogger Logger;
+		{
+			CLogScope Scope(&Logger);
+			pController->Tick();
+		}
+		return Logger.ConcatenatedLines();
+	};
+	pChr->Unfreeze();
+	MoveTo(Start); // the release
+	MoveTo(Behind);
+	pChr->Freeze();
+	MoveTo(FarBehind);
+	pChr->Unfreeze();
+	MoveTo(Behind);
+	MoveTo(Start); // each tile counts once
+	const std::string Messages = MoveTo(Goal);
+
+	// The start, the tile behind it and the goal earn by their own blurred
+	// steps, their mean sets the typical speed. The Extreme tile passed frozen
+	// earns nothing, it only makes the tiles near it harder.
+	const std::vector<float> vBlurred = BlurTileDifficulties(vDifficulties, Width, 3);
+	const auto Blurred = [&](vec2 Pos) { return (double)vBlurred[pCollision->GetPureMapIndex(Pos)]; };
+	EXPECT_GT(Blurred(Behind), aSteps[8]);
+	EXPECT_FLOAT_EQ(Blurred(Goal), -2.0f);
+	const double Step = GTrainElo::TileStep((Blurred(Start) + Blurred(Behind) + Blurred(Goal)) / 3);
+	const double Seconds = GTrainElo::MIN_SECONDS;
+	double TilePoints = 0;
+	for(const vec2 Pos : {Start, Behind, Goal})
+		TilePoints += GTrainElo::RatedTilePoints(GTrainElo::TileStep(Blurred(Pos)));
+	const int64_t Points = GTrainElo::CapturePointsOfTiles(TilePoints, Step, false, Distance, Seconds);
+	EXPECT_EQ(Points, std::llround(TilePoints * std::sqrt(Distance / 100.0) * GTrainElo::SpeedFactor(Step, false, Distance, Seconds)));
+	EXPECT_EQ(pController->Stats(Runner).m_Points, Points);
+	char aStep[64];
+	CGameControllerGTrain::FormatStep(aStep, sizeof(aStep), Step);
+	char aExpected[128];
+	str_format(aExpected, sizeof(aExpected), "(0 fails, +%.2f ELO, %.1fx speed, %s)",
+		GTrainElo::FromPoints(Points), GTrainElo::SpeedFactor(Step, false, Distance, Seconds), aStep);
+	EXPECT_TRUE(str_find(Messages.c_str(), aExpected)) << Messages << "\nexpected " << aExpected;
+}
+
+TEST_F(GameWorld, GTrainFightCapturesShowTheirDifficulty)
+{
+	// Like solo captures, fight captures tell how hard their part was.
+	PrepareTrainingCorridor();
+	g_Config.m_SvSpamprotection = 0;
+	g_Config.m_SvGtrainGoalDistance = 6;
+	CCollision *pCollision = GameServer()->Collision();
+	const int Width = pCollision->GetWidth();
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob"});
+	const int Anna = vIds[0], Bob = vIds[1];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	pController->SetMapDifficulty("Easy", 1);
+	std::vector<float> vDifficulties((size_t)Width * pCollision->GetHeight(), CGTrainTileRatings::UNRATED);
+	for(int x = 1; x < Width - 1; ++x)
+		vDifficulties[pCollision->GetPureMapIndex(vec2(x * 32 + 16, 80))] = GTrainElo::TILE_STEP_DIFFICULTIES[3];
+	pController->SetTileDifficulties(vDifficulties);
+	pController->Fight(Bob, "Anna");
+	pController->Tick();
+	GameServer()->GetPlayerChar(Anna)->Unfreeze();
+	GameServer()->GetPlayerChar(Bob)->Unfreeze();
+	pController->Tick();
+
+	CCharacter *pChr = GameServer()->GetPlayerChar(Bob);
+	pChr->m_Pos = pChr->m_PrevPos = TrainingGoal(Bob);
+	pChr->SetPosition(pChr->m_Pos);
+	CMemoryLogger Logger;
+	{
+		CLogScope Scope(&Logger);
+		pController->Tick();
+	}
+	const std::string Messages = Logger.ConcatenatedLines();
+	EXPECT_TRUE(str_find(Messages.c_str(), "'Bob' captured the flag (0 fails, +")) << Messages;
+	EXPECT_TRUE(str_find(Messages.c_str(), "x speed, Main ★☆☆). First to 10: 'Anna': 0, 'Bob': 1")) << Messages;
+}
+
+TEST_F(GameWorld, GTrainTeamMembersEarnUntilTheirFlag)
+{
+	// Members play on after taking their flag, but what they earn ends there:
+	// their tiles and their time.
+	PrepareTrainingCorridor();
+	g_Config.m_SvSpamprotection = 0;
+	g_Config.m_SvGtrainGoalDistance = 6;
+	CCollision *pCollision = GameServer()->Collision();
+	const int Width = pCollision->GetWidth();
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob"});
+	const int Anna = vIds[0], Bob = vIds[1];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	pController->SetMapDifficulty("Easy", 1);
+	Say(Anna, "/team Bob");
+	Say(Bob, "/a");
+	pController->Tick();
+	const auto Chr = [&](int ClientId) { return GameServer()->GetPlayerChar(ClientId); };
+	const auto MoveTo = [&](int ClientId, vec2 Pos) {
+		Chr(ClientId)->SetPosition(Pos);
+		Chr(ClientId)->m_Pos = Chr(ClientId)->m_PrevPos = Pos;
+		Chr(ClientId)->ResetVelocity();
+		pController->Tick();
+	};
+	const int Tiles = (int)std::abs(TrainingGoal(Anna).x - Chr(Anna)->m_Pos.x) / 32;
+	const vec2 BobStart = Chr(Bob)->m_Pos;
+	const std::vector<vec2> vFlags = TrainingFlags(Bob);
+	ASSERT_EQ(vFlags.size(), 2u);
+	// Every corridor tile Main, one Extreme tile far from Bob's start and flag.
+	const auto &aSteps = GTrainElo::TILE_STEP_DIFFICULTIES;
+	std::vector<float> vDifficulties((size_t)Width * pCollision->GetHeight(), CGTrainTileRatings::UNRATED);
+	for(int x = 1; x < Width - 1; ++x)
+		vDifficulties[pCollision->GetPureMapIndex(vec2(x * 32 + 16, 80))] = aSteps[3];
+	std::optional<vec2> Hard;
+	for(int x = 1; x < Width - 1 && !Hard; ++x)
+	{
+		const vec2 Pos(x * 32 + 16, 80);
+		if(distance(Pos, BobStart) > 8 * 32 && distance(Pos, vFlags[0]) > 8 * 32)
+			Hard = Pos;
+	}
+	ASSERT_TRUE(Hard.has_value());
+	vDifficulties[pCollision->GetPureMapIndex(*Hard)] = aSteps[14];
+	pController->SetTileDifficulties(vDifficulties);
+
+	Chr(Anna)->Unfreeze();
+	Chr(Bob)->Unfreeze();
+	pController->Tick();
+	const CGTrainStats Before = pController->Stats(Bob);
+	MoveTo(Bob, vFlags[0]);
+	MoveTo(Bob, *Hard);
+	m_pServer->AdvanceTicks(5 * m_pServer->TickSpeed());
+	CMemoryLogger Logger;
+	{
+		CLogScope Scope(&Logger);
+		MoveTo(Anna, vFlags[1]);
+	}
+	ASSERT_EQ(pController->Stats(Bob).m_Captures, Before.m_Captures + 1);
+
+	// Bob's start and flag, at the moment he took it, shared by two.
+	const std::vector<float> vBlurred = BlurTileDifficulties(vDifficulties, Width, 3);
+	const double StartDifficulty = vBlurred[pCollision->GetPureMapIndex(BobStart)], FlagDifficulty = vBlurred[pCollision->GetPureMapIndex(vFlags[0])];
+	const double TilePoints = GTrainElo::RatedTilePoints(GTrainElo::TileStep(StartDifficulty)) + GTrainElo::RatedTilePoints(GTrainElo::TileStep(FlagDifficulty));
+	const double Step = GTrainElo::TileStep((StartDifficulty + FlagDifficulty) / 2);
+	const int64_t Points = std::llround(GTrainElo::CapturePointsOfTiles(TilePoints, Step, false, Tiles, GTrainElo::MIN_SECONDS) / 2.0);
+	EXPECT_EQ(pController->Stats(Bob).m_Points - Before.m_Points, Points);
+	// So does the difficulty his message shows.
+	char aExpected[256];
+	str_format(aExpected, sizeof(aExpected), "'Bob' captured a flag for their team in 0.00 seconds (0 fails, +%.2f ELO, %.1fx speed, Main ★☆☆).",
+		GTrainElo::FromPoints(Before.m_Points + Points) - GTrainElo::FromPoints(Before.m_Points), GTrainElo::SpeedFactor(Step, false, Tiles, GTrainElo::MIN_SECONDS));
+	EXPECT_NE(Logger.ConcatenatedLines().find(aExpected), std::string::npos) << Logger.ConcatenatedLines() << "\nexpected " << aExpected;
+}
+
+TEST(GTrainTiles, BlurAveragesTheRatedTilesAround)
+{
+	// 7x3 tiles, U without a rating. Ratings below 0 are ratings too.
+	constexpr float U = CGTrainTileRatings::UNRATED;
+	const std::vector<float> vTiles = {
+		1, 1, U, U, U, U, 9,
+		1, 4, U, U, -2, U, U,
+		1, 1, U, U, U, U, U};
+	const std::vector<float> vRadius1 = BlurTileDifficulties(vTiles, 7, 1);
+	// A disc: radius 1 takes the diagonals too (1 + 1 <= 1 + 1).
+	EXPECT_FLOAT_EQ(vRadius1[7 + 1], (5 + 4) / 6.0f);
+	EXPECT_FLOAT_EQ(vRadius1[0], (3 + 4) / 4.0f);
+	EXPECT_FLOAT_EQ(vRadius1[6], 9); // alone, at the edge
+	EXPECT_EQ(vRadius1[2], U); // unrated stays unrated
+	EXPECT_FLOAT_EQ(vRadius1[7 + 4], -2);
+	EXPECT_EQ(BlurTileDifficulties(vTiles, 7, 0), vTiles);
+	// Radius 5 reaches the lone tile from the second column, 5 tiles away,
+	// two rows down too (25 + 4 <= 25 + 5), but not from the first.
+	const std::vector<float> vRadius5 = BlurTileDifficulties(vTiles, 7, 5);
+	EXPECT_FLOAT_EQ(vRadius5[6], (9 + 1 + 4 + 1 - 2) / 5.0f);
+	EXPECT_FLOAT_EQ(vRadius5[14], (5 + 4 - 2) / 7.0f);
+}
+
+TEST_F(GameWorld, GTrainTileStepsFollowTheKoGRatings)
+{
+	// Each whole step is at its difficulty, steps between are interpolated,
+	// those beyond extrapolated, at least Easy with one star and without an
+	// end above Extreme with three.
+	const auto &aSteps = GTrainElo::TILE_STEP_DIFFICULTIES;
+	for(int Step = 0; Step <= GTrainElo::EXTREME_STEP; ++Step)
+		EXPECT_NEAR(GTrainElo::TileStep(aSteps[Step]), Step, 1e-9);
+	EXPECT_NEAR(GTrainElo::TileStep((aSteps[3] + aSteps[4]) / 2), 3.5, 1e-9);
+	EXPECT_NEAR(GTrainElo::TileStep(aSteps[14] + (aSteps[14] - aSteps[13])), 15, 1e-9);
+	EXPECT_NEAR(GTrainElo::TileStep(aSteps[14] + 6 * (aSteps[14] - aSteps[13])), 20, 1e-9);
+	EXPECT_EQ(GTrainElo::TileStep(-100), 0);
+
+	// Every category has three stars, Deranged as many as it takes.
+	const std::pair<double, const char *> aLabels[] = {{-1.0, "Easy ★☆☆"}, {0.4, "Easy ★☆☆"}, {2.6, "Main ★☆☆"}, {7.0, "Hard ★★☆"},
+		{14.0, "Extreme ★★★"}, {14.6, "Deranged ★☆☆"}, {16.0, "Deranged ★★☆"}, {17.0, "Deranged ★★★"}, {19.0, "Deranged ★★★★★"}};
+	for(const auto &[Step, pLabel] : aLabels)
+	{
+		char aLabel[64];
+		CGameControllerGTrain::FormatStep(aLabel, sizeof(aLabel), Step);
+		EXPECT_STREQ(aLabel, pLabel) << Step;
+	}
+	// Whole steps earn what the categories and stars did.
+	EXPECT_EQ(GTrainElo::CapturePoints(7.0, false, 100, 10), GTrainElo::CapturePoints(7, 100, 10));
+	EXPECT_EQ(GTrainElo::CapturePoints(16.0, true, 100, 10), GTrainElo::CapturePoints(GTrainElo::DERANGED_STEP, 100, 10));
+}
+
+TEST_F(GameWorld, GTrainRaceTimerRestartsWithEveryAttempt)
+{
+	PrepareTrainingCorridor();
+	const int Runner = SpawnTrainingPlayers({"Runner"})[0];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	m_pServer->m_aClients[Runner].m_DDNetVersion = VERSION_DDNET_GAMETICK;
+	GameServer()->m_apPlayers[Runner]->m_TimerType = CPlayer::TIMERTYPE_GAMETIMER;
+	const auto SnappedStartTick = [&]() -> std::optional<int> {
+		CSnapshotBuffer Buffer;
+		m_pServer->m_SnapshotBuilder.Init();
+		pController->Snap(Runner);
+		m_pServer->m_SnapshotBuilder.Finish(&Buffer);
+		const CSnapshot *pSnap = Buffer.AsSnapshot();
+		for(int i = 0; i < pSnap->NumItems(); ++i)
+		{
+			if(pSnap->GetItemType(i) != NETOBJTYPE_GAMEINFO)
+				continue;
+			const auto *pInfo = (const CNetObj_GameInfo *)pSnap->GetItem(i)->Data();
+			if(pInfo->m_GameStateFlags & GAMESTATEFLAG_RACETIME)
+				return -pInfo->m_WarmupTimer;
+		}
+		return std::nullopt;
+	};
+
+	// The timer stays at zero while hovering, then counts the attempt.
+	EXPECT_EQ(SnappedStartTick(), m_pServer->Tick());
+	m_pServer->AdvanceTicks(20);
+	EXPECT_EQ(SnappedStartTick(), m_pServer->Tick());
+	CCharacter *pChr = GameServer()->GetPlayerChar(Runner);
+	pChr->Unfreeze();
+	pController->Tick();
+	const int StartTick = m_pServer->Tick();
+	m_pServer->AdvanceTicks(3 * m_pServer->TickSpeed());
+	EXPECT_EQ(SnappedStartTick(), StartTick);
+
+	// Retrying and killing both start the timer from zero again.
+	m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, Runner);
+	EXPECT_EQ(SnappedStartTick(), m_pServer->Tick());
+	pChr->Unfreeze();
+	pController->Tick();
+	m_pServer->AdvanceTicks(m_pServer->TickSpeed());
+	EXPECT_EQ(pController->RaceTimerStartTick(pChr), m_pServer->Tick() - m_pServer->TickSpeed());
+	GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_SELF);
+	pChr = GameServer()->m_apPlayers[Runner]->ForceSpawn(vec2(80, 80));
+	EXPECT_EQ(SnappedStartTick(), m_pServer->Tick()); // placement is still pending
+	pController->Tick();
+	EXPECT_EQ(SnappedStartTick(), m_pServer->Tick());
+	EXPECT_EQ(pChr->m_DDRaceState, ERaceState::CHEATED); // the finish line still never counts
+}
+
+TEST_F(GameWorld, GTrainGoalDistanceIsPersonalAndSetByFightLeaders)
+{
+	PrepareTrainingCorridor();
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob"});
+	const int Anna = vIds[0], Bob = vIds[1];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	const auto GoalDistance = [&](int ClientId) {
+		return distance(GameServer()->GetPlayerChar(ClientId)->m_Pos, TrainingGoal(ClientId)) / 32.0f;
+	};
+	const auto NewAttempt = [&](int ClientId) {
+		GameServer()->m_apPlayers[ClientId]->KillCharacter(WEAPON_SELF);
+		GameServer()->m_apPlayers[ClientId]->ForceSpawn(vec2(80, 80));
+		pController->Tick();
+	};
+	const auto Command = [&](int ClientId, const char *pCommand) {
+		m_pServer->m_avChatMessages[ClientId].clear();
+		m_pServer->Console()->ExecuteLineFlag(pCommand, CFGFLAG_CHAT, ClientId);
+		return m_pServer->m_avChatMessages[ClientId].empty() ? std::string() : m_pServer->m_avChatMessages[ClientId].back();
+	};
+	// The corridor is shorter than the shortest /distance, but every spot has
+	// more than the server default of 3 tiles to one of its sides.
+	const auto LongGoal = [&](int ClientId) { return GoalDistance(ClientId) > 3.0f; };
+
+	EXPECT_EQ(Command(Anna, "distance"), "Goal distance: 3 tiles (server default). Use /distance 50-1000 to change it, 0 for the server default.");
+	for(const char *pInvalid : {"distance 1001", "distance 49", "distance 1", "distance -1"})
+		EXPECT_EQ(Command(Anna, pInvalid), "The goal distance must be between 50 and 1000 tiles, 0 for the server default.") << pInvalid;
+
+	// Retries keep the current goal, new goals use the player's own distance.
+	const vec2 Goal = TrainingGoal(Anna);
+	EXPECT_EQ(Command(Anna, "distance 50"), "Goal distance set to 50 tiles for new goals.");
+	EXPECT_TRUE(m_pServer->m_avChatMessages[Bob].empty() || m_pServer->m_avChatMessages[Bob].back().find("Goal distance") == std::string::npos);
+	m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, Anna);
+	EXPECT_EQ(TrainingGoal(Anna), Goal);
+	NewAttempt(Anna);
+	EXPECT_TRUE(LongGoal(Anna));
+	NewAttempt(Bob);
+	EXPECT_FLOAT_EQ(GoalDistance(Bob), 3.0f);
+	EXPECT_EQ(Command(Anna, "distance"), "Goal distance: 50 tiles. Use /distance 50-1000 to change it, 0 for the server default.");
+
+	// In a fight, the leader's distance applies to everyone.
+	pController->Fight(Bob, "Anna");
+	pController->Tick();
+	EXPECT_EQ(Command(Bob, "distance 60"), "Only the fight leader can change the goal distance.");
+	EXPECT_EQ(Command(Bob, "distance"), "Goal distance: 50 tiles. Use /distance 50-1000 to change it, 0 for the server default.");
+	m_pServer->m_avChatMessages[Bob].clear();
+	EXPECT_EQ(Command(Anna, "distance 1000"), "Goal distance set to 1000 tiles for new goals.");
+	ASSERT_FALSE(m_pServer->m_avChatMessages[Bob].empty());
+	EXPECT_EQ(m_pServer->m_avChatMessages[Bob].back(), "Goal distance set to 1000 tiles for new goals.");
+	NewAttempt(Anna);
+	for(int ClientId : vIds)
+	{
+		EXPECT_TRUE(LongGoal(ClientId));
+		EXPECT_EQ(TrainingGoal(ClientId), TrainingGoal(Anna));
+	}
+	EXPECT_EQ(Command(Anna, "distance 0"), "Goal distance set to 3 tiles (server default) for new goals.");
+	NewAttempt(Anna);
+	for(int ClientId : vIds)
+		EXPECT_FLOAT_EQ(GoalDistance(ClientId), 3.0f);
+}
+
+TEST_F(GameWorld, GTrainNoDoubleJumpStartsAttemptsWithoutAirJump)
+{
+	PrepareTrainingCorridor();
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob"});
+	const int Anna = vIds[0], Bob = vIds[1];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	const auto Command = [&](int ClientId, const char *pCommand) {
+		m_pServer->m_avChatMessages[ClientId].clear();
+		m_pServer->Console()->ExecuteLineFlag(pCommand, CFGFLAG_CHAT, ClientId);
+		return m_pServer->m_avChatMessages[ClientId].empty() ? std::string() : m_pServer->m_avChatMessages[ClientId].back();
+	};
+	CCharacter *pChr = GameServer()->GetPlayerChar(Anna);
+	EXPECT_EQ(Command(Anna, "nodj"), "Attempts now start without double jump. Touching the ground gives it back.");
+	EXPECT_EQ(pChr->Core()->m_Jumped, 0); // the current attempt keeps it
+	m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, Anna);
+	EXPECT_EQ(pChr->Core()->m_Jumped, 2);
+	EXPECT_EQ(pChr->Core()->m_JumpedTotal, pChr->Core()->m_Jumps - 1);
+
+	// The feet stay dark in the air, touching the ground lights them again.
+	GameServer()->m_World.Tick();
+	EXPECT_EQ(pChr->Core()->m_Jumped & 2, 2);
+	GameServer()->Collision()->SetCollisionAt(pChr->m_Pos.x, pChr->m_Pos.y + 32, TILE_SOLID);
+	GameServer()->m_World.Tick();
+	EXPECT_EQ(pChr->Core()->m_Jumped & 2, 0);
+
+	// Fight members start attempts with their leader's setting.
+	pController->Fight(Bob, "Anna");
+	pController->Tick();
+	EXPECT_EQ(GameServer()->GetPlayerChar(Bob)->Core()->m_Jumped, 2);
+	EXPECT_EQ(Command(Bob, "nodj"), "Only the fight leader can toggle /nodj.");
+	EXPECT_EQ(Command(Anna, "nodj"), "Attempts now start with double jump.");
+	EXPECT_EQ(m_pServer->m_avChatMessages[Bob].back(), "Attempts now start with double jump.");
+	m_pServer->Console()->ExecuteLineFlag("r", CFGFLAG_CHAT, Bob);
+	EXPECT_EQ(GameServer()->GetPlayerChar(Bob)->Core()->m_Jumped, 0);
+}
+
+TEST_F(GameWorld, GTrainForwardsGoalsLeadTowardsTheFinish)
+{
+	PrepareTrainingCorridor();
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob"});
+	const int Anna = vIds[0], Bob = vIds[1];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	const auto Command = [&](int ClientId, const char *pCommand) {
+		m_pServer->m_avChatMessages[ClientId].clear();
+		m_pServer->Console()->ExecuteLineFlag(pCommand, CFGFLAG_CHAT, ClientId);
+		return m_pServer->m_avChatMessages[ClientId].empty() ? std::string() : m_pServer->m_avChatMessages[ClientId].back();
+	};
+	const auto NewAttempt = [&](int ClientId) {
+		GameServer()->m_apPlayers[ClientId]->KillCharacter(WEAPON_SELF);
+		GameServer()->m_apPlayers[ClientId]->ForceSpawn(vec2(80, 80));
+		pController->Tick();
+	};
+	// The finish is on the right of the corridor.
+	const auto SpotX = [&](int ClientId) { return (int)GameServer()->GetPlayerChar(ClientId)->m_Pos.x / 32; };
+	const auto GoalOffset = [&](int ClientId) { return (int)TrainingGoal(ClientId).x / 32 - SpotX(ClientId); };
+	const int FinishX = GameServer()->Collision()->GetWidth() - 2;
+
+	bool Backwards = false;
+	for(int i = 0; i < 100 && !Backwards; ++i)
+	{
+		NewAttempt(Anna);
+		Backwards = GoalOffset(Anna) < 0;
+	}
+	EXPECT_TRUE(Backwards);
+
+	// Spots closer to the finish than the goal distance are skipped, the
+	// tiles beside it are 0 tiles away.
+	EXPECT_EQ(Command(Anna, "forwards"), "New goals only lead towards the finish line.");
+	for(int i = 0; i < 100; ++i)
+	{
+		NewAttempt(Anna);
+		EXPECT_EQ(GoalOffset(Anna), 3);
+		EXPECT_LE(SpotX(Anna), FinishX - 1 - 3);
+	}
+
+	// The corridor is shorter than 50 tiles, so every goal leads from its
+	// farthest spot to the finish.
+	Command(Anna, "distance 50");
+	NewAttempt(Anna);
+	EXPECT_EQ(SpotX(Anna), 2);
+	EXPECT_EQ((int)TrainingGoal(Anna).x / 32, FinishX - 1);
+	Command(Anna, "distance 0");
+
+	// In a fight, the leader's setting applies to everyone.
+	pController->Fight(Bob, "Anna");
+	pController->Tick();
+	EXPECT_EQ(Command(Bob, "forwards"), "Only the fight leader can toggle /forwards.");
+	for(int i = 0; i < 20; ++i)
+	{
+		NewAttempt(Anna);
+		EXPECT_EQ(GoalOffset(Bob), 3);
+	}
+	EXPECT_EQ(Command(Anna, "forwards"), "New goals lead in any direction again.");
+	EXPECT_EQ(m_pServer->m_avChatMessages[Bob].back(), "New goals lead in any direction again.");
+}
+
+TEST_F(GameWorld, GTrainScoreLimitEndsTheFight)
+{
+	PrepareTrainingCorridor();
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob"});
+	const int Anna = vIds[0], Bob = vIds[1];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	pController->Fight(Bob, "Anna");
+	pController->Tick();
+	const auto Command = [&](int ClientId, const char *pCommand) {
+		m_pServer->m_avChatMessages[ClientId].clear();
+		m_pServer->Console()->ExecuteLineFlag(pCommand, CFGFLAG_CHAT, ClientId);
+		return m_pServer->m_avChatMessages[ClientId].empty() ? std::string() : m_pServer->m_avChatMessages[ClientId].back();
+	};
+	const auto Capture = [&](int ClientId) {
+		for(int Other : vIds)
+			GameServer()->GetPlayerChar(Other)->Unfreeze();
+		pController->Tick();
+		CCharacter *pChr = GameServer()->GetPlayerChar(ClientId);
+		pChr->m_Pos = pChr->m_PrevPos = TrainingGoal(ClientId);
+		pChr->SetPosition(pChr->m_Pos);
+		CMemoryLogger Logger;
+		{
+			CLogScope Scope(&Logger);
+			pController->Tick();
+		}
+		return Logger.ConcatenatedLines();
+	};
+	const auto Score = [&](int ClientId) { return pController->SnapPlayerScore(ClientId, GameServer()->m_apPlayers[ClientId]); };
+
+	EXPECT_EQ(Command(Bob, "scorelimit"), "Fight score limit: 10. Use /scorelimit 1-1000 to change it, 0 for no limit.");
+	EXPECT_EQ(Command(Bob, "scorelimit 2"), "Only the fight leader can change the score limit.");
+	EXPECT_EQ(Command(Anna, "scorelimit 1001"), "The score limit must be between 1 and 1000, 0 for no limit.");
+	EXPECT_EQ(Command(Anna, "scorelimit 2"), "The first to 2 points wins the fight.");
+	EXPECT_EQ(m_pServer->m_avChatMessages[Bob].back(), "The first to 2 points wins the fight.");
+
+	EXPECT_EQ(Capture(Bob).find("won the fight"), std::string::npos);
+	EXPECT_EQ(Capture(Anna).find("won the fight"), std::string::npos);
+	const std::string Messages = Capture(Bob);
+	EXPECT_NE(Messages.find("'Bob' captured the flag (0 fails). First to 2: 'Anna': 1, 'Bob': 2"), std::string::npos);
+	EXPECT_NE(Messages.find("'Bob' won the fight with 2 points! The fight score starts over."), std::string::npos);
+	const int BreakTicks = 10 * m_pServer->TickSpeed();
+	for(int ClientId : vIds)
+	{
+		EXPECT_EQ(Score(ClientId), 0);
+		EXPECT_EQ(m_pServer->m_aClients[ClientId].m_Score, 0);
+		ASSERT_FALSE(m_pServer->m_avBroadcasts[ClientId].empty());
+		EXPECT_EQ(m_pServer->m_avBroadcasts[ClientId].back(), "'Bob' won the fight!\n'Bob': 2, 'Anna': 1");
+		EXPECT_EQ(GameServer()->GetPlayerChar(ClientId)->m_FreezeTime, BreakTicks);
+	}
+	// Members dying during the break hover until it ends, the next ones not.
+	const auto Respawn = [&](int ClientId) {
+		GameServer()->m_apPlayers[ClientId]->KillCharacter(WEAPON_SELF);
+		GameServer()->m_apPlayers[ClientId]->ForceSpawn(vec2(80, 80));
+		pController->Tick();
+		return GameServer()->GetPlayerChar(ClientId)->m_FreezeTime;
+	};
+	m_pServer->AdvanceTicks(BreakTicks / 2);
+	EXPECT_EQ(Respawn(Bob), BreakTicks / 2);
+	m_pServer->AdvanceTicks(BreakTicks / 2);
+	EXPECT_EQ(Respawn(Bob), 50);
+	EXPECT_EQ(Respawn(Anna), 50);
+
+	// Without a limit, captures only add up.
+	EXPECT_EQ(Command(Anna, "scorelimit 0"), "The fight score limit is disabled.");
+	EXPECT_EQ(Command(Bob, "scorelimit"), "Fight score limit: none. Use /scorelimit 1-1000 to change it, 0 for no limit.");
+	for(int i = 0; i < 2; ++i)
+		EXPECT_EQ(Capture(Bob).find("won the fight"), std::string::npos);
+	EXPECT_NE(Capture(Bob).find("Fight score: 'Anna': 0, 'Bob': 3"), std::string::npos);
+
+	// Leaving ends the fight's score for both, rejoining starts from zero.
+	pController->Fight(Bob, "");
+	pController->Tick();
+	EXPECT_EQ(Score(Bob), 0);
+	pController->Fight(Bob, "Anna");
+	pController->Tick();
+	EXPECT_EQ(Score(Bob), 0);
+	EXPECT_NE(Capture(Anna).find("'Anna': 1, 'Bob': 0"), std::string::npos);
+}
+
+TEST_F(GameWorld, GTrainHelpListsOnlyGTrainCommands)
+{
+	PrepareTrainingCorridor();
+	g_Config.m_SvSpamprotection = 0;
+	const int Runner = SpawnTrainingPlayers({"Runner"})[0];
+	m_pServer->m_avChatMessages[Runner].clear();
+	Say(Runner, "/help");
+	const auto &vMessages = m_pServer->m_avChatMessages[Runner];
+	ASSERT_EQ(vMessages.size(), 21);
+	EXPECT_EQ(vMessages.front(), "GTrain commands:");
+	EXPECT_EQ(vMessages.back(), "Captures on this map earn no ELO.");
+	std::string Help;
+	for(const auto &Message : vMessages)
+		Help += Message + "\n";
+	const auto Lists = [&](const std::string &Command) {
+		for(size_t Pos = Help.find(Command); Pos != std::string::npos; Pos = Help.find(Command, Pos + 1))
+			if(Pos + Command.size() == Help.size() || !std::isalnum((unsigned char)Help[Pos + Command.size()]))
+				return true;
+		return false;
+	};
+	EXPECT_TRUE(Lists("Kill:"));
+	// Every chat command is listed, except DDNet's general ones.
+	const std::vector<std::string> vGeneral = {"help", "info", "rules", "list", "timeout", "timer", "pause", "spec", "specteam", "pausevoted", "specvoted",
+		"showothers", "showall", "ninjajetpack", "w", "whisper", "c", "converse", "whispers", "dnd", "emote", "eyeemote"};
+	IConsole *pConsole = GameServer()->Console();
+	for(const IConsole::ICommandInfo *pCmd = pConsole->FirstCommandInfo(IConsole::CLIENT_ID_UNSPECIFIED, CFGFLAG_CHAT); pCmd;
+		pCmd = pConsole->NextCommandInfo(pCmd, IConsole::CLIENT_ID_UNSPECIFIED, CFGFLAG_CHAT))
+		if(std::find(vGeneral.begin(), vGeneral.end(), pCmd->Name()) == vGeneral.end())
+			EXPECT_TRUE(Lists(std::string("/") + pCmd->Name())) << pCmd->Name();
+	for(const char *pOther : {"/practice", "/save", "/join"})
+		EXPECT_FALSE(Lists(pOther)) << pOther;
+
+	// Help for a single command still shows its usage.
+	m_pServer->m_avChatMessages[Runner].clear();
+	Say(Runner, "/help distance");
+	ASSERT_FALSE(vMessages.empty());
+	EXPECT_EQ(vMessages.front(), "Usage: distance ?i[tiles]");
+}
+
+TEST_F(GameWorld, GTrainWeaponCommandsKeepWeaponsAndFollowTheFight)
+{
+	PrepareTrainingCorridor();
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob", "Wilson"});
+	const int Anna = vIds[0], Bob = vIds[1], Wilson = vIds[2];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	const auto Command = [&](int ClientId, const char *pCommand) {
+		m_pServer->m_avChatMessages[ClientId].clear();
+		m_pServer->Console()->ExecuteLineFlag(pCommand, CFGFLAG_CHAT, ClientId);
+		return m_pServer->m_avChatMessages[ClientId].empty() ? std::string() : m_pServer->m_avChatMessages[ClientId].back();
+	};
+	const auto HasWeapon = [&](int ClientId, int Weapon) {
+		return GameServer()->GetPlayerChar(ClientId)->Core()->m_aWeapons[Weapon].m_Got;
+	};
+
+	EXPECT_EQ(Command(Anna, "shotgun"), "You keep the shotgun in every attempt until /shotgun is used again.");
+	EXPECT_TRUE(HasWeapon(Anna, WEAPON_SHOTGUN));
+	EXPECT_FALSE(HasWeapon(Bob, WEAPON_SHOTGUN));
+	GameServer()->m_apPlayers[Anna]->KillCharacter(WEAPON_SELF);
+	GameServer()->m_apPlayers[Anna]->ForceSpawn(vec2(80, 80));
+	pController->Tick();
+	EXPECT_TRUE(HasWeapon(Anna, WEAPON_SHOTGUN)); // new attempts keep it
+
+	// Ninja does not run out.
+	Command(Anna, "ninja");
+	EXPECT_TRUE(HasWeapon(Anna, WEAPON_NINJA));
+	m_pServer->AdvanceTicks(20 * m_pServer->TickSpeed());
+	pController->Tick();
+	EXPECT_EQ(GameServer()->GetPlayerChar(Anna)->Core()->m_Ninja.m_ActivationTick, m_pServer->Tick());
+	EXPECT_EQ(Command(Anna, "shotgun"), "The shotgun was removed.");
+	EXPECT_FALSE(HasWeapon(Anna, WEAPON_SHOTGUN));
+
+	// Joiners get the fight's weapons and lose the ones it does not have.
+	Command(Wilson, "grenade");
+	EXPECT_TRUE(HasWeapon(Wilson, WEAPON_GRENADE));
+	pController->Fight(Bob, "Anna");
+	pController->Fight(Wilson, "Anna");
+	pController->Tick();
+	for(int ClientId : {Bob, Wilson})
+		EXPECT_TRUE(HasWeapon(ClientId, WEAPON_NINJA));
+	EXPECT_FALSE(HasWeapon(Wilson, WEAPON_GRENADE));
+	EXPECT_EQ(Command(Bob, "laser"), "Only the fight leader can toggle /laser.");
+	EXPECT_FALSE(HasWeapon(Bob, WEAPON_LASER));
+	EXPECT_EQ(Command(Anna, "rifle"), "You keep the laser in every attempt until /laser is used again.");
+	for(int ClientId : vIds)
+		EXPECT_TRUE(HasWeapon(ClientId, WEAPON_LASER));
+
+	// Leavers keep their fight's weapons.
+	pController->Fight(Bob, "");
+	pController->Tick();
+	EXPECT_TRUE(HasWeapon(Bob, WEAPON_LASER));
+	EXPECT_TRUE(HasWeapon(Bob, WEAPON_NINJA));
+	EXPECT_EQ(Command(Bob, "ninja"), "The ninja was removed.");
+	EXPECT_FALSE(HasWeapon(Bob, WEAPON_NINJA));
+	EXPECT_TRUE(HasWeapon(Wilson, WEAPON_NINJA));
+}
+
+// A corridor between the start and the finish line, with a shaft down to
+// freeze in its middle: every spot has its goal straight above or below,
+// within reach of the hook.
+static void PrepareTrainingShaft(CGameContext *pGameServer)
+{
+	CCollision *pCollision = pGameServer->Collision();
+	const int Width = pCollision->GetWidth();
+	const int Shaft = Width / 2;
+	ASSERT_GE(pCollision->GetHeight(), 14);
+	for(int y = 0; y < pCollision->GetHeight(); ++y)
+		for(int x = 0; x < Width; ++x)
+			pCollision->SetCollisionAt(x * 32 + 16, y * 32 + 16, TILE_SOLID);
+	for(int x = 1; x < Width - 1; ++x)
+		pCollision->SetCollisionAt(x * 32 + 16, 48, TILE_AIR);
+	for(int y = 2; y <= 11; ++y)
+		pCollision->SetCollisionAt(Shaft * 32 + 16, y * 32 + 16, TILE_AIR);
+	pCollision->SetCollisionAt(Shaft * 32 + 16, 12 * 32 + 16, TILE_FREEZE);
+	pCollision->SetCollisionAt(48, 48, TILE_START);
+	pCollision->SetCollisionAt((Width - 2) * 32 + 16, 48, TILE_FINISH);
+	g_Config.m_SvGtrainGoalDistance = 4;
+	delete pGameServer->m_pController;
+	pGameServer->m_pController = new CGameControllerGTrain(pGameServer);
+}
+
+TEST_F(GameWorld, GTrainCapturesReplayExactly)
+{
+	char aDatabase[IO_MAX_PATH_LENGTH];
+	UseTestDatabase("r.db", aDatabase, sizeof(aDatabase));
+	// Only servers that want the runs store them.
+	g_Config.m_SvGtrainRecordRuns = 1;
+	PrepareTrainingCorridor();
+	ClearMapExtras();
+	PrepareTrainingShaft(GameServer());
+	// Only captures that earn ELO are stored.
+	static_cast<CGameControllerGTrain *>(GameServer()->m_pController)->SetMapDifficulty("Main", 1);
+	g_Config.m_SvGtrainHoverDoor = 1;
+	m_pServer->AdvanceTicks(10);
+	const int Runner = SpawnTrainingPlayers({"Runner"})[0];
+	const auto Command = [&](const char *pCommand) { m_pServer->Console()->ExecuteLineFlag(pCommand, CFGFLAG_CHAT, Runner); };
+
+	// GTrain's hover doors have the last switch, which replays leave alone.
+	const int DoorSwitch = (int)GameServer()->Switchers().size() - 1;
+	const auto State = [&](CCharacter *pChr) {
+		CGTrainRunState Result;
+		Result.Save(pChr, DoorSwitch);
+		return Result;
+	};
+
+	// What the capturing attempt did: the state at the release and after
+	// every tick before the capture, the input of every tick after the
+	// release.
+	struct CLive
+	{
+		std::vector<CGTrainRunState> m_vStates;
+		std::vector<CNetObj_PlayerInput> m_vInputs;
+	};
+
+	// Plays attempts until one captures: keys held through the hover, firing
+	// the weapon chosen for the release, then up the hook or down the shaft,
+	// switching weapons and firing them at the walls.
+	CNetObj_PlayerInput Input = {};
+	int Scrolls = 0;
+	const auto Play = [&](std::optional<int> ReleaseWeapon) {
+		const bool HoldKeys = ReleaseWeapon.has_value();
+		auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+		for(int Attempt = 0; Attempt < 20; ++Attempt)
+		{
+			CLive Live;
+			Input = {};
+			for(int i = 0; i < 100 && GameServer()->GetPlayerChar(Runner)->m_FreezeTime > 0; ++i)
+			{
+				// Upwards, a kept ninja dashes at the release.
+				Input.m_TargetX = i % 3 - 1;
+				Input.m_TargetY = -100 - 3 * i;
+				Input.m_Jump = HoldKeys;
+				if(HoldKeys && i == 10)
+					++Input.m_Fire;
+				// Frozen tees switch weapons too, an odd number of times.
+				if(i % 16 == 8)
+					Input.m_NextWeapon = Scrolls += 2;
+				if(HoldKeys && i >= 40)
+					Input.m_WantedWeapon = *ReleaseWeapon + 1;
+				TickWithInput(Runner, Input);
+			}
+			Live.m_vStates.push_back(State(GameServer()->GetPlayerChar(Runner)));
+			const vec2 Goal = TrainingGoal(Runner);
+			const int Captures = pController->Stats(Runner).m_Captures;
+			for(int Tick = 0; Tick < 300; ++Tick)
+			{
+				const vec2 Pos = GameServer()->GetPlayerChar(Runner)->m_Pos;
+				const bool Up = Goal.y < Pos.y;
+				// Back to the shaft, in it against its walls.
+				const int Side = (Tick / 4) % 2 ? 1 : -1;
+				Input.m_Direction = std::abs(Goal.x - Pos.x) > 4 ? (Goal.x > Pos.x ? 1 : -1) : Side;
+				// The hook flies where it was aimed when fired, weapons hit the walls.
+				Input.m_Hook = Up && Tick % 40 != 0;
+				Input.m_TargetX = Tick % 40 < 3 ? Tick % 7 - 3 : Side * (100 + Tick * 37 % 50);
+				Input.m_TargetY = Tick % 40 < 3 ? -300 : 0;
+				if(Tick == 3 || Tick == 8 || Tick == 11)
+					Input.m_Jump = Tick == 8;
+				if(Tick % 7 == 0 || (Tick % 7 == 3 && Input.m_Fire % 2))
+					++Input.m_Fire;
+				// Not right away, the release's scrolling would not count.
+				if(Tick % 15 == 14)
+					Input.m_WantedWeapon = 1 + (Tick / 15) % NUM_WEAPONS;
+				TickWithInput(Runner, Input);
+				Live.m_vInputs.push_back(Input);
+				if(pController->Stats(Runner).m_Captures > Captures)
+					return Live;
+				Live.m_vStates.push_back(State(GameServer()->GetPlayerChar(Runner)));
+			}
+			// A spot this bot cannot do, on to another.
+			GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_SELF);
+			GameServer()->m_apPlayers[Runner]->ForceSpawn(vec2(80, 80));
+			TickWithInput(Runner, CNetObj_PlayerInput{});
+		}
+		ADD_FAILURE() << "The runner did not capture the flag";
+		return CLive();
+	};
+
+	// Held by a door. The release fires the gun, its bullet is in flight
+	// when the run starts.
+	std::vector<CLive> vRated;
+	vRated.push_back(Play(WEAPON_GUN));
+	// Hovering in zero gravity without double jump, holding nothing.
+	g_Config.m_SvGtrainHoverDoor = 0;
+	Command("nodj");
+	Command("r");
+	vRated.push_back(Play(std::nullopt));
+
+	const std::vector<CStoredRun> vStored = StoredRuns(aDatabase);
+	ASSERT_EQ(vStored.size(), vRated.size());
+	char aSha256[SHA256_MAXSTRSIZE];
+	sha256_str(GameServer()->Map()->Sha256(), aSha256, sizeof(aSha256));
+	for(const CStoredRun &Stored : vStored)
+	{
+		EXPECT_EQ(Stored.m_Map, "coverage");
+		EXPECT_EQ(Stored.m_MapSha256, aSha256);
+		EXPECT_EQ(Stored.m_Name, "Runner");
+		EXPECT_EQ(Stored.m_Ticks, (int)Stored.m_Run.m_vInputs.size());
+		EXPECT_GT(Stored.m_Distance, 0);
+		EXPECT_EQ(Stored.m_Run.m_KeptWeapons, 0);
+		// What the capture earned, at the speed of its stored ticks.
+		EXPECT_GT(Stored.m_Elo, 0.0f);
+		EXPECT_FLOAT_EQ(Stored.m_SpeedFactor, GTrainElo::SpeedFactor(*CGameControllerGTrain::EloStep("Main", 1), Stored.m_Distance, Stored.m_Ticks / (double)SERVER_TICK_SPEED));
+		EXPECT_EQ(Stored.m_Points, GTrainElo::CapturePoints(*CGameControllerGTrain::EloStep("Main", 1), Stored.m_Distance, Stored.m_Ticks / (double)SERVER_TICK_SPEED));
+	}
+	ASSERT_EQ(vStored[0].m_Run.m_Start.m_vShots.size(), 1u);
+	EXPECT_FALSE(vStored[0].m_Run.m_Start.m_vShots[0].m_Laser);
+	EXPECT_EQ(vStored[1].m_Run.m_Start.m_Jumped & 2, 2);
+	EXPECT_TRUE(vStored[1].m_Run.m_Start.m_vShots.empty());
+
+	// Kept weapons earn no ELO, so their runs are not stored, but replays
+	// handle them all the same. These runs leave out the capture tick, whose
+	// end the test does not see.
+	std::vector<std::pair<CLive, int>> vWithWeapons;
+	// Held by a door, keeping the grenade, laser and shotgun. The release
+	// fires a grenade.
+	g_Config.m_SvGtrainHoverDoor = 1;
+	Command("nodj");
+	Command("grenade");
+	Command("laser");
+	Command("shotgun");
+	Command("r");
+	vWithWeapons.emplace_back(Play(WEAPON_GRENADE), (1 << WEAPON_SHOTGUN) | (1 << WEAPON_GRENADE) | (1 << WEAPON_LASER));
+	// Hovering in zero gravity without double jump, keeping ninja, which
+	// dashes at the release.
+	g_Config.m_SvGtrainHoverDoor = 0;
+	Command("grenade");
+	Command("laser");
+	Command("shotgun");
+	Command("ninja");
+	Command("nodj");
+	Command("r");
+	vWithWeapons.emplace_back(Play(WEAPON_NINJA), 1 << WEAPON_NINJA);
+	// A shotgun laser in flight at the release.
+	g_Config.m_SvGtrainHoverDoor = 1;
+	Command("ninja");
+	Command("nodj");
+	Command("shotgun");
+	Command("r");
+	vWithWeapons.emplace_back(Play(WEAPON_SHOTGUN), 1 << WEAPON_SHOTGUN);
+	EXPECT_EQ(StoredRuns(aDatabase).size(), vStored.size());
+
+	std::vector<std::pair<CGTrainRun, CLive>> vReplays;
+	for(size_t i = 0; i < vStored.size(); ++i)
+		vReplays.emplace_back(vStored[i].m_Run, vRated[i]);
+	for(const auto &[Live, KeptWeapons] : vWithWeapons)
+	{
+		CGTrainRun Run;
+		Run.m_Start = Live.m_vStates.front();
+		Run.m_KeptWeapons = KeptWeapons;
+		Run.m_vInputs.assign(Live.m_vInputs.begin(), Live.m_vInputs.end() - 1);
+		Run.m_EndPos = Live.m_vStates.back().m_Pos;
+		Run.m_EndVel = Live.m_vStates.back().m_Vel;
+		vReplays.emplace_back(Run, Live);
+	}
+	ASSERT_EQ(vReplays[2].first.m_Start.m_vShots.size(), 1u);
+	EXPECT_FALSE(vReplays[2].first.m_Start.m_vShots[0].m_Laser);
+	EXPECT_EQ(vReplays[3].first.m_Start.m_Jumped & 2, 2);
+	EXPECT_GT(vReplays[3].first.m_Start.m_NinjaCurrentMoveTime, 0);
+	ASSERT_EQ(vReplays[4].first.m_Start.m_vShots.size(), 1u);
+	EXPECT_TRUE(vReplays[4].first.m_Start.m_vShots[0].m_Laser);
+
+	// Replays need a world GTrain does not control, without the lasers still
+	// bouncing. They start at the same ticks as the runs did.
+	GameServer()->m_apPlayers[Runner]->KillCharacter(WEAPON_GAME);
+	delete GameServer()->m_pController;
+	GameServer()->m_pController = new CGameControllerDDNet(GameServer());
+	for(int i = 0; i < SERVER_TICK_SPEED; ++i)
+	{
+		m_pServer->AdvanceTicks(1);
+		GameServer()->OnTick();
+	}
+	// Every tick ends in the same state, not just at the same position.
+	for(size_t i = 0; i < vReplays.size(); ++i)
+	{
+		const auto &[Run, Live] = vReplays[i];
+		const std::vector<CGTrainRunState> &vLive = Live.m_vStates;
+		EXPECT_TRUE(Run.m_Start == vLive[0]) << "run " << i;
+		m_pServer->AdvanceTicks(Run.m_Start.m_Tick - m_pServer->Tick());
+		std::vector<CGTrainRunState> vReplayed;
+		EXPECT_TRUE(ReplayGTrainRun(GameServer(), Runner, Run, [&]() { m_pServer->AdvanceTicks(1); }, [&](CCharacter *pChr) { vReplayed.push_back(State(pChr)); })) << "run " << i;
+		// Replays leave out the release, stored ones end with the capture.
+		ASSERT_EQ(vReplayed.size(), Run.m_vInputs.size()) << "run " << i;
+		ASSERT_GE(vReplayed.size() + 1, vLive.size()) << "run " << i;
+		for(size_t Tick = 1; Tick < vLive.size(); ++Tick)
+			ASSERT_TRUE(vReplayed[Tick - 1] == vLive[Tick]) << "run " << i << ", tick " << Tick << ": " << vReplayed[Tick - 1].m_Pos.x << "," << vReplayed[Tick - 1].m_Pos.y << " instead of " << vLive[Tick].m_Pos.x << "," << vLive[Tick].m_Pos.y;
+		EXPECT_EQ(vReplayed.back().m_Pos, Run.m_EndPos);
+	}
+	// Stored runs end where their last tick reached the flag.
+	for(size_t i = 0; i < vStored.size(); ++i)
+	{
+		const CGTrainRun &Run = vStored[i].m_Run;
+		EXPECT_LT(distance(Run.m_EndPos, Run.m_Goal), 42.0f + distance(Run.m_EndPos, vRated[i].m_vStates.back().m_Pos)) << "run " << i;
+	}
+}
+
+TEST_F(GameWorld, GTrainTeamCapturesReplayExactly)
+{
+	char aDatabase[IO_MAX_PATH_LENGTH];
+	UseTestDatabase("t.db", aDatabase, sizeof(aDatabase));
+	g_Config.m_SvGtrainRecordRuns = 1;
+	PrepareTrainingCorridor();
+	ClearMapExtras();
+	// Spots need freeze below, so the corridor has no gravity instead of a
+	// floor: teammates float along it, collide, hook and hit each other.
+	// Hammers push up, never into the freeze.
+	ASSERT_GE(GameServer()->Collision()->GetWidth(), 40);
+	for(CTuningParams *pTuning : {GameServer()->GlobalTuning(), &GameServer()->TuningList()[0]})
+	{
+		pTuning->Set("player_collision", 1);
+		pTuning->Set("player_hooking", 1);
+		pTuning->Set("gravity", 0);
+	}
+	for(int Zone = 1; Zone < TuneZone::NUM; ++Zone)
+		GameServer()->TuningList()[Zone] = GameServer()->TuningList()[0];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	pController->SetMapDifficulty("Main", 1);
+	g_Config.m_SvGtrainGoalDistance = 20;
+	g_Config.m_SvSpamprotection = 0;
+	m_pServer->AdvanceTicks(10);
+	const std::vector<int> vIds = SpawnTrainingPlayers({"Anna", "Bob", "Carl"});
+	const int Anna = vIds[0];
+	Say(Anna, "/team Bob");
+	Say(vIds[1], "/a");
+	Say(Anna, "/team Carl");
+	Say(vIds[2], "/a");
+	// Goals towards the finish line on the right, farther than the starts and
+	// flags spread: every flag lies ahead of every start.
+	Say(Anna, "/forwards");
+	pController->Tick();
+
+	const int DoorSwitch = (int)GameServer()->Switchers().size() - 1;
+	const auto State = [&](CCharacter *pChr) {
+		CGTrainRunState Result;
+		Result.Save(pChr, DoorSwitch);
+		return Result;
+	};
+	const auto Chr = [&](int ClientId) { return GameServer()->GetPlayerChar(ClientId); };
+
+	// Everyone walks right, taking the first free flag they reach, hooking
+	// the teammate ahead and hammering. The state at the release and after
+	// every tick before the last flag.
+	std::vector<CGTrainRunState> avLive[MAX_CLIENTS];
+	int aFire[MAX_CLIENTS] = {};
+	bool Captured = false, HookedTeammate = false;
+	for(int Attempt = 0; Attempt < 20 && !Captured; ++Attempt)
+	{
+		GameServer()->m_apPlayers[Anna]->KillCharacter(WEAPON_SELF);
+		pController->Tick();
+		for(int ClientId : vIds)
+			ASSERT_NE(Chr(ClientId), nullptr) << "after the restart, " << ClientId;
+		CNetObj_PlayerInput Hover = {};
+		Hover.m_WantedWeapon = WEAPON_HAMMER + 1;
+		Hover.m_TargetX = 1;
+		for(int i = 0; i < 100 && Chr(Anna)->m_FreezeTime > 0; ++i)
+			TickWithInputs({{vIds[0], Hover}, {vIds[1], Hover}, {vIds[2], Hover}});
+		for(auto &vLive : avLive)
+			vLive.clear();
+		for(int ClientId : vIds)
+			avLive[ClientId].push_back(State(Chr(ClientId)));
+		const int Captures = pController->Stats(Anna).m_Captures;
+		for(int Tick = 0; Tick < 400; ++Tick)
+		{
+			for(int ClientId : vIds)
+				ASSERT_NE(Chr(ClientId), nullptr) << "attempt " << Attempt << ", tick " << Tick << ", " << ClientId;
+			std::vector<std::pair<int, CNetObj_PlayerInput>> vInputs;
+			for(int ClientId : vIds)
+			{
+				const CCharacter *pChr = Chr(ClientId);
+				const CCharacter *pAhead = nullptr;
+				for(int Other : vIds)
+					if(Other != ClientId && Chr(Other)->m_Pos.x > pChr->m_Pos.x && (!pAhead || Chr(Other)->m_Pos.x < pAhead->m_Pos.x))
+						pAhead = Chr(Other);
+				const CCharacter *pNearest = nullptr;
+				for(int Other : vIds)
+					if(Other != ClientId && (!pNearest || distance(Chr(Other)->m_Pos, pChr->m_Pos) < distance(pNearest->m_Pos, pChr->m_Pos)))
+						pNearest = Chr(Other);
+				CNetObj_PlayerInput Input = {};
+				Input.m_WantedWeapon = WEAPON_HAMMER + 1;
+				// Now and then into the nearest teammate, head-on.
+				Input.m_Direction = Tick % 40 >= 20 && Tick % 40 < 30 ? (pNearest->m_Pos.x > pChr->m_Pos.x ? 1 : -1) : 1;
+				Input.m_Hook = pAhead && Tick % 30 < 12;
+				Input.m_TargetX = pAhead ? std::max(1, (int)(pAhead->m_Pos.x - pChr->m_Pos.x)) : 100;
+				Input.m_TargetY = Tick % 11 - 5;
+				if((Tick + ClientId) % 5 == 0)
+					++aFire[ClientId];
+				Input.m_Fire = aFire[ClientId];
+				Input.m_Jump = Tick % 25 == 0;
+				vInputs.emplace_back(ClientId, Input);
+			}
+			TickWithInputs(vInputs);
+			if(pController->Stats(Anna).m_Captures > Captures)
+			{
+				Captured = true;
+				break;
+			}
+			for(int ClientId : vIds)
+			{
+				avLive[ClientId].push_back(State(Chr(ClientId)));
+				const int Hooked = Chr(ClientId)->Core()->HookedPlayer();
+				HookedTeammate |= Hooked != ClientId && std::find(vIds.begin(), vIds.end(), Hooked) != vIds.end();
+			}
+		}
+	}
+	ASSERT_TRUE(Captured) << "The team did not take all flags";
+	EXPECT_TRUE(HookedTeammate);
+
+	// Each member's row has the whole team's run and what they earned: a
+	// third of a capture alone, by their own time.
+	const std::vector<CStoredRun> vStored = StoredRuns(aDatabase);
+	ASSERT_EQ(vStored.size(), 3u);
+	ASSERT_TRUE(vStored[0].m_TeamRun.has_value());
+	const CGTrainTeamRun Run = *vStored[0].m_TeamRun;
+	ASSERT_EQ(Run.m_vMembers.size(), 3u);
+	EXPECT_EQ(Run.m_Team, Anna);
+	const int Step = *CGameControllerGTrain::EloStep("Main", 1);
+	for(const CStoredRun &Stored : vStored)
+	{
+		ASSERT_TRUE(Stored.m_TeamRun.has_value());
+		EXPECT_TRUE(*Stored.m_TeamRun == Run);
+		const auto pMember = std::find_if(Run.m_vMembers.begin(), Run.m_vMembers.end(), [&](const CGTrainTeamRun::CMember &Member) { return Stored.m_Name == Member.m_aName; });
+		ASSERT_NE(pMember, Run.m_vMembers.end()) << Stored.m_Name;
+		EXPECT_EQ(m_pServer->ClientName(pMember->m_ClientId), Stored.m_Name);
+		EXPECT_EQ(Stored.m_Ticks, pMember->m_CaptureTicks);
+		EXPECT_GT(Stored.m_Elo, 0.0f);
+		const double Seconds = Stored.m_Ticks / (double)SERVER_TICK_SPEED;
+		EXPECT_FLOAT_EQ(Stored.m_SpeedFactor, GTrainElo::SpeedFactor(Step, Stored.m_Distance, Seconds));
+		EXPECT_EQ(Stored.m_Points, std::llround(GTrainElo::CapturePoints(Step, Stored.m_Distance, Seconds) / 3.0));
+	}
+	for(const CGTrainTeamRun::CMember &Member : Run.m_vMembers)
+	{
+		EXPECT_EQ(Member.m_Run.m_vInputs.size(), avLive[Member.m_ClientId].size());
+		EXPECT_LE(Member.m_CaptureTicks, (int)Member.m_Run.m_vInputs.size());
+		EXPECT_EQ(Member.m_HookedPlayer, -1);
+		for(const CGTrainTeamRun::CMember &Other : Run.m_vMembers)
+		{
+			if(&Other != &Member)
+				EXPECT_GE(distance(Member.m_Run.m_Goal, Other.m_Run.m_Goal), 2 * 32.0f);
+		}
+	}
+
+	// Replays need a world GTrain does not control, starting at the run's
+	// tick. Every member ends every tick in the same state.
+	for(int ClientId : vIds)
+		GameServer()->m_apPlayers[ClientId]->KillCharacter(WEAPON_GAME);
+	delete GameServer()->m_pController;
+	GameServer()->m_pController = new CGameControllerDDNet(GameServer());
+	for(int i = 0; i < SERVER_TICK_SPEED; ++i)
+	{
+		m_pServer->AdvanceTicks(1);
+		GameServer()->OnTick();
+	}
+	for(const CGTrainTeamRun::CMember &Member : Run.m_vMembers)
+		EXPECT_TRUE(Member.m_Run.m_Start == avLive[Member.m_ClientId].front()) << Member.m_aName;
+	m_pServer->AdvanceTicks(Run.m_vMembers.front().m_Run.m_Start.m_Tick - m_pServer->Tick());
+	std::vector<CGTrainRunState> avReplayed[MAX_CLIENTS];
+	EXPECT_TRUE(ReplayGTrainTeamRun(GameServer(), Run, [&]() { m_pServer->AdvanceTicks(1); }, [&](int Member, CCharacter *pChr) { avReplayed[Run.m_vMembers[Member].m_ClientId].push_back(State(pChr)); }));
+	for(const CGTrainTeamRun::CMember &Member : Run.m_vMembers)
+	{
+		const std::vector<CGTrainRunState> &vLive = avLive[Member.m_ClientId];
+		const std::vector<CGTrainRunState> &vReplayed = avReplayed[Member.m_ClientId];
+		ASSERT_EQ(vReplayed.size(), Member.m_Run.m_vInputs.size()) << Member.m_aName;
+		for(size_t Tick = 1; Tick < vLive.size(); ++Tick)
+			ASSERT_TRUE(vReplayed[Tick - 1] == vLive[Tick]) << Member.m_aName << ", tick " << Tick << ": " << vReplayed[Tick - 1].m_Pos.x << "," << vReplayed[Tick - 1].m_Pos.y << " instead of " << vLive[Tick].m_Pos.x << "," << vLive[Tick].m_Pos.y;
+		EXPECT_EQ(vReplayed.back().m_Pos, Member.m_Run.m_EndPos) << Member.m_aName;
+		EXPECT_LT(distance(vReplayed[Member.m_CaptureTicks - 1].m_Pos, Member.m_Run.m_Goal), 42.0f + 32.0f) << Member.m_aName;
+	}
+}
+
+TEST_F(GameWorld, GTrainStoresOnlyCapturesThatEarnElo)
+{
+	char aDatabase[IO_MAX_PATH_LENGTH];
+	UseTestDatabase("r.db", aDatabase, sizeof(aDatabase));
+	// Only servers that want the runs store them.
+	g_Config.m_SvGtrainRecordRuns = 1;
+	PrepareTrainingCorridor();
+	ClearMapExtras();
+	const int Runner = SpawnTrainingPlayers({"Runner"})[0];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	const auto Command = [&](const char *pCommand) { m_pServer->Console()->ExecuteLineFlag(pCommand, CFGFLAG_CHAT, Runner); };
+	const auto Release = [&]() {
+		for(int i = 0; i < 100 && GameServer()->GetPlayerChar(Runner)->m_FreezeTime > 0; ++i)
+			TickWithInput(Runner, CNetObj_PlayerInput{});
+		TickWithInput(Runner, CNetObj_PlayerInput{});
+	};
+	const auto Capture = [&](bool Frozen) {
+		CCharacter *pChr = GameServer()->GetPlayerChar(Runner);
+		if(Frozen)
+			pChr->Freeze();
+		pChr->m_Pos = pChr->m_PrevPos = TrainingGoal(Runner);
+		pChr->SetPosition(pChr->m_Pos);
+		pController->Tick();
+	};
+
+	// Maps without ELO store nothing.
+	Release();
+	Capture(false);
+	EXPECT_EQ(StoredRuns(aDatabase).size(), 0u);
+	pController->SetMapDifficulty("Main", 1);
+	// Runs keep the ELO the capture added, not the player's total.
+	const auto CaptureEarning = [&]() {
+		const double EloBefore = GTrainElo::FromPoints(pController->Stats(Runner).m_Points);
+		Release();
+		Capture(false);
+		return GTrainElo::FromPoints(pController->Stats(Runner).m_Points) - EloBefore;
+	};
+	const auto ExpectEarned = [&](double Elo) {
+		const CStoredRun Stored = StoredRuns(aDatabase).back();
+		EXPECT_GT(Elo, 0.0);
+		EXPECT_FLOAT_EQ(Stored.m_Elo, Elo);
+		// Instant captures are as fast as it gets.
+		EXPECT_FLOAT_EQ(Stored.m_SpeedFactor, GTrainElo::MAX_SPEED_FACTOR);
+	};
+	double Elo = CaptureEarning();
+	EXPECT_EQ(StoredRuns(aDatabase).size(), 1u);
+	ExpectEarned(Elo);
+	// Neither do frozen captures.
+	Release();
+	Capture(true);
+	EXPECT_EQ(StoredRuns(aDatabase).size(), 1u);
+	// Nor those with kept weapons, also when they were on only midway.
+	Command("grenade");
+	Release();
+	Capture(false);
+	EXPECT_EQ(StoredRuns(aDatabase).size(), 1u);
+	Command("grenade");
+	Release();
+	Command("grenade");
+	TickWithInput(Runner, CNetObj_PlayerInput{});
+	Command("grenade");
+	Capture(false);
+	EXPECT_EQ(StoredRuns(aDatabase).size(), 1u);
+	// Pauses cannot be replayed.
+	Release();
+	ASSERT_EQ(GameServer()->m_apPlayers[Runner]->Pause(CPlayer::PAUSE_PAUSED, true), CPlayer::PAUSE_PAUSED);
+	TickWithInput(Runner, CNetObj_PlayerInput{});
+	ASSERT_EQ(GameServer()->m_apPlayers[Runner]->Pause(CPlayer::PAUSE_NONE, true), CPlayer::PAUSE_NONE);
+	TickWithInput(Runner, CNetObj_PlayerInput{});
+	Capture(false);
+	EXPECT_EQ(StoredRuns(aDatabase).size(), 1u);
+	// The server can turn storing off.
+	g_Config.m_SvGtrainRecordRuns = 0;
+	Release();
+	Capture(false);
+	EXPECT_EQ(StoredRuns(aDatabase).size(), 1u);
+	g_Config.m_SvGtrainRecordRuns = 1;
+	Elo = CaptureEarning();
+	EXPECT_EQ(StoredRuns(aDatabase).size(), 2u);
+	ExpectEarned(Elo);
+}
+
+TEST_F(GameWorld, WeaponChatCommandsStillRequirePracticeOutsideGTrain)
+{
+	g_Config.m_DbgDummies = 1;
+	m_pServer->UpdateDebugDummies(false);
+	const int ClientId = m_pServer->MaxClients() - 1;
+	CCharacter *pChr = GameServer()->m_apPlayers[ClientId]->ForceSpawn(vec2(80, 80));
+	m_pServer->m_avChatMessages[ClientId].clear();
+	m_pServer->Console()->ExecuteLineFlag("shotgun", CFGFLAG_CHAT, ClientId);
+	EXPECT_FALSE(pChr->Core()->m_aWeapons[WEAPON_SHOTGUN].m_Got);
+	ASSERT_FALSE(m_pServer->m_avChatMessages[ClientId].empty());
+	EXPECT_NE(m_pServer->m_avChatMessages[ClientId].back().find("/practice"), std::string::npos);
 }
 
 TEST_F(GameWorld, ClosestCharacter)

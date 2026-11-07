@@ -71,6 +71,9 @@ public:
 	{
 		return GetMoveRestrictions(nullptr, nullptr, Pos, Distance);
 	}
+	// Directions in which stoppers on a tile block moving onto it, or with
+	// OnTile, moving while on it. Switchable doors are not included.
+	int GetTileMoveRestrictions(int Index, bool OnTile) const;
 
 	int GetTile(int x, int y) const;
 	int GetFrontTile(int x, int y) const;

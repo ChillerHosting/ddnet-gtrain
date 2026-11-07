@@ -600,16 +600,13 @@ void IGameController::Snap(int SnappingClient)
 	if(pPlayer && (pPlayer->m_TimerType == CPlayer::TIMERTYPE_GAMETIMER || pPlayer->m_TimerType == CPlayer::TIMERTYPE_GAMETIMER_AND_BROADCAST) && pPlayer->GetClientVersion() >= VERSION_DDNET_GAMETICK)
 	{
 		if((pPlayer->GetTeam() == TEAM_SPECTATORS || pPlayer->IsPaused()) && pPlayer->SpectatorId() != SPEC_FREEVIEW && (pPlayer2 = GameServer()->m_apPlayers[pPlayer->SpectatorId()]))
+			pChr = pPlayer2->GetCharacter();
+		else
+			pChr = pPlayer->GetCharacter();
+		std::optional<int> RaceStartTick;
+		if(pChr && (RaceStartTick = RaceTimerStartTick(pChr)))
 		{
-			if((pChr = pPlayer2->GetCharacter()) && pChr->m_DDRaceState == ERaceState::STARTED)
-			{
-				GameInfo.m_WarmupTimer = -pChr->m_StartTime;
-				GameInfo.m_GameStateFlags |= GAMESTATEFLAG_RACETIME;
-			}
-		}
-		else if((pChr = pPlayer->GetCharacter()) && pChr->m_DDRaceState == ERaceState::STARTED)
-		{
-			GameInfo.m_WarmupTimer = -pChr->m_StartTime;
+			GameInfo.m_WarmupTimer = -*RaceStartTick;
 			GameInfo.m_GameStateFlags |= GAMESTATEFLAG_RACETIME;
 		}
 	}
@@ -686,6 +683,13 @@ void IGameController::Snap(int SnappingClient)
 			Server()->SnapNewItem(0, MapBestTime);
 		}
 	}
+}
+
+std::optional<int> IGameController::RaceTimerStartTick(CCharacter *pChr)
+{
+	if(pChr->m_DDRaceState != ERaceState::STARTED)
+		return std::nullopt;
+	return pChr->m_StartTime;
 }
 
 int IGameController::GetAutoTeam(int NotThisId)

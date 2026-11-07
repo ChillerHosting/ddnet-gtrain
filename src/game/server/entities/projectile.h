@@ -7,6 +7,8 @@
 
 class CProjectile : public CEntity
 {
+	friend class CGTrainRunState;
+
 public:
 	CProjectile(
 		CGameWorld *pGameWorld,

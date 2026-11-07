@@ -2,16 +2,24 @@
 #define GAME_SERVER_GAMEMODES_GTRAIN_H
 
 #include "ddnet.h"
+#include "gtrain_elo.h"
+#include "gtrain_map.h"
 #include "gtrain_path.h"
+#include "gtrain_run.h"
+#include "gtrain_tiles.h"
 
 #include <base/vmath.h>
 
 #include <engine/shared/protocol.h>
 
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <vector>
+
+struct CScoreGTrainStatsResult;
+struct CScoreMapDifficultyResult;
 
 // Gores training: players get placed at random positions between
 // the start and the finish line, killing places them again.
@@ -20,66 +28,293 @@ class CGameControllerGTrain : public CGameControllerDDNet
 	enum
 	{
 		HOVER_TICKS = 50,
-		MAX_FREEZE_DISTANCE = 20,
+		// The hover after a won fight, to see its result.
+		FIGHT_BREAK_SECONDS = 10,
 		NUM_DIRECTION_PARTICLES = 256,
 		MAX_PATH_NODES = 256,
+		MIN_GOAL_DISTANCE = 50,
+		// Short goals on Deranged maps were farmed, their goals are longer.
+		DERANGED_MIN_GOAL_DISTANCE = 100,
+		MAX_GOAL_DISTANCE = 1000,
+		DEFAULT_SCORE_LIMIT = 10,
+		MAX_SCORE_LIMIT = 1000,
+		// Shorter attempts are no attempts, unless they capture the flag.
+		MIN_ATTEMPT_SECONDS = 2,
+		STATS_SAVE_SECONDS = 60,
+		// /team requests and fight invites last this long.
+		REQUEST_SECONDS = 60,
+		TEAM_SPOT_RANGE = 8, // tiles from the team's start
+		TEAM_SPOT_SPACING = 2, // tiles between teammates
+		// Tiles earn by the mean difficulty of the rated tiles this close,
+		// see BlurTileDifficulties(). On the lain captures, it ranked maps
+		// closer to their KoG ratings than single tiles did.
+		TILE_BLUR_RADIUS = 3,
 	};
 
-	// centers of all non-freeze tiles between the start and the finish line
-	std::vector<vec2> m_vTrainPositions;
+	CGTrainMap m_Map;
 	bool m_aPendingPlace[MAX_CLIENTS];
-	CGTrainPathGraph m_PathGraph;
-	std::vector<int> m_vTileNodes;
 	CGTrainPathfinder m_Pathfinder;
+	// The difficulty of every tile from the spot ratings, blurred, UNRATED
+	// for tiles that are no spots. Without ratings it is empty, and captures earn
+	// by the map's difficulty.
+	std::vector<float> m_vTileDifficulties;
+	// of the mean difficulty of all spots, for /help
+	double m_MapTileStep = 0;
+	// Rates the spots of a map version once, everyone spectates until it is
+	// done. See InitTileRatings().
+	std::unique_ptr<CGTrainTileRatingJob> m_pRatingJob;
+	// put into spectators while rating, to put back into the game once done
+	bool m_aRatingSpectators[MAX_CLIENTS] = {};
+	struct CEloGain
+	{
+		double m_Elo;
+		double m_SpeedFactor;
+		// why the capture earns nothing, like being frozen
+		const char *m_pNoElo = nullptr;
+		int64_t m_Points = 0;
+	};
 	struct CAttempt
 	{
 		std::shared_ptr<CGTrainGoal> m_pGoal;
 		int m_Start = -1;
 		int m_TargetDistance = 0;
 		int m_StartTick = -1;
+		// tile of the laser door holding the hovering tee, -1 for zero gravity
+		int m_DoorIndex = -1;
+		// retries of this start and goal, after death or /r
+		int m_Fails = 0;
+		// Released with a goal, until the attempt ends. Freeplay has none.
+		bool m_Running = false;
+		// An attempt at this start and goal counted, so giving it up by
+		// dying is a respawn.
+		bool m_SpotTried = false;
+		// Kept weapons were on since the release, so a capture earns no ELO,
+		// also once they are gone again.
+		bool m_WithWeapons = false;
 		std::vector<int> m_vRoute;
 		size_t m_RouteIndex = 0;
 		int m_RouteNode = -1;
-		int m_LastPathTick = -1;
+		// Recorded from the release on, to store the run if its capture earns
+		// ELO.
+		std::optional<CGTrainRun> m_Run;
+		// Rated tiles the tee was on unfrozen since the release, a tile again
+		// only after another one. Captures earn by each of them once.
+		std::vector<int> m_vTouchedTiles;
+		// Team members reaching their flag keep playing until every flag is
+		// taken, which ends the attempt. What they earn waits until then.
+		int m_CaptureTick = -1;
+		std::optional<CEloGain> m_TeamGain;
+		// the teammate the hook held at the release, for the team's run
+		int m_RunHookedPlayer = -1;
+	};
+	// A team's flags around its goal, one for each member, any member takes
+	// any one of them.
+	struct CTeamFlag
+	{
+		int m_Node = -1;
+		int m_Collector = -1;
+	};
+	// Fight leaders choose these for their whole group. Leaving players and
+	// promoted leaders keep the group's settings.
+	struct CSettings
+	{
+		bool m_Freeplay = false;
+		bool m_NoDoubleJump = false;
+		// goals only on a shortest path towards the finish line
+		bool m_Forwards = false;
+		int m_GoalDistance = 0; // 0 uses sv_gtrain_goal_distance
+		int m_ScoreLimit = DEFAULT_SCORE_LIMIT; // 0 disables the limit
+		int m_Weapons = 0; // bit per weapon kept for good
 	};
 	CAttempt m_aAttempts[MAX_CLIENTS];
+	// Players sharing an attempt form a group, named after its leader: a
+	// fight, or a team with /team. Teams play together in one DDRace team,
+	// fights race each other solo. Nobody is in both.
 	int m_aFightGroup[MAX_CLIENTS];
+	bool m_aTeamGroup[MAX_CLIENTS] = {};
+	// The player each player asked to team up with, and when.
+	int m_aTeamRequest[MAX_CLIENTS];
+	int m_aTeamRequestTick[MAX_CLIENTS] = {};
 	int m_aFightTeam[MAX_CLIENTS] = {};
 	int m_aScoreboardTeams[MAX_CLIENTS] = {};
 	bool m_aFightRestart[MAX_CLIENTS] = {};
+	// Until this tick, every attempt of the group hovers, also of members
+	// respawning, so none gets a head start out of the break.
+	int m_aFightBreakEndTick[MAX_CLIENTS] = {};
 	int m_aFightWins[MAX_CLIENTS] = {};
-	bool m_aFreeplay[MAX_CLIENTS] = {};
+	// By group: only players its leader invites join a locked fight. Unlike
+	// the settings, leaving players don't keep it, promoted leaders do.
+	bool m_aFightLocked[MAX_CLIENTS] = {};
+	// The fight that invited each player last, and when, -1 for none. Invites
+	// belong to the group, so only group leaders have any.
+	int m_aFightInvite[MAX_CLIENTS];
+	int m_aFightInviteTick[MAX_CLIENTS] = {};
+	CSettings m_aSettings[MAX_CLIENTS];
+	// By group, empty for groups that are no team.
+	std::vector<CTeamFlag> m_avTeamFlags[MAX_CLIENTS];
+	// Every viewer chooses this for themselves, also in fights.
+	bool m_aHideTrail[MAX_CLIENTS] = {};
 	bool m_SyncFightDeaths = false;
-	std::optional<int> m_FlagSnapId;
+	// switch number of the hover doors, -1 without door collision
+	int m_DoorSwitch = -1;
+	std::array<std::optional<int>, MAX_CLIENTS> m_aDoorSnapIds;
+	// one for each flag a team can have
+	std::array<std::optional<int>, MAX_CLIENTS> m_aFlagSnapIds;
 	std::array<std::optional<int>, NUM_DIRECTION_PARTICLES> m_aDirectionSnapIds;
+	std::shared_ptr<CScoreMapDifficultyResult> m_pMapDifficultyResult;
+	// Difficulty step of the map for capture points, unset on maps without
+	// ELO.
+	std::optional<int> m_EloStep;
+	// The map's category earns ELO, even if its stars don't count: with
+	// rated tiles, those tell how hard a capture is.
+	bool m_EloCategory = false;
+	// The stats of each player's name: their changes since requesting them
+	// from the database, plus the loaded stats once the request completes.
+	CGTrainStats m_aStats[MAX_CLIENTS];
+	std::shared_ptr<CScoreGTrainStatsResult> m_apStatsResults[MAX_CLIENTS];
+	// Changes not saved yet, for the name the stats were loaded for.
+	CGTrainStats m_aUnsavedStats[MAX_CLIENTS];
+	char m_aaStatsNames[MAX_CLIENTS][MAX_NAME_LENGTH] = {};
+	int m_aPlaytimeTicks[MAX_CLIENTS] = {};
 
-	void FindTrainPositions();
-	void PlaceRandomly(class CCharacter *pChr);
-	void PlaceForAttempt(class CCharacter *pChr, const std::shared_ptr<CGTrainGoal> &pGoal, int Start, int TargetDistance);
-	void RestartFight(int Group);
+	void HideUnrelatedChatCommands();
+	int RandomStart(int Group) const;
+	int HoverDoorIndex(int Start, class CCharacter *pChr) const;
+	void DelayHoverDoor(class CCharacter *pChr);
+	void OpenHoverDoor(class CCharacter *pChr);
+	void PlaceRandomly(class CPlayer *pPlayer);
+	// Deletes the player's character if it played already, see the definition.
+	void PlaceForAttempt(class CPlayer *pPlayer, const std::shared_ptr<CGTrainGoal> &pGoal, int Start, int TargetDistance, bool Retry);
+	// Places the whole group at the chosen start, a random spot without one.
+	void HoldHoverDoor(class CCharacter *pChr, int Hover);
+	void RestartFight(int Group, std::optional<int> ChosenStart = std::nullopt);
+	void PlaceGroup(int Group, const std::shared_ptr<CGTrainGoal> &pGoal, int Start, int TargetDistance, bool Retry);
+	std::vector<int> TeamStarts(const CGTrainGoal &Goal, int Start, int Count);
+	// Spots around the goal, spread like the team's starts.
+	std::vector<int> TeamFlagNodes(int Goal, int Count);
+	// The team's flags, if the player plays one of them.
+	const std::vector<CTeamFlag> *TeamFlags(int ClientId) const;
+	bool ReachedFlag(class CCharacter *pChr, vec2 Flag) const;
+	void CollectTeamFlag(class CCharacter *pChr, CTeamFlag &Flag);
+	// Everyone gets what they earned once the last flag is taken.
+	void FinishTeamRun(int Group);
+	void SaveTeamRun(int Group, const std::vector<int> &vMembers);
 	bool LeaveFight(int ClientId, bool NewAttempt);
+	// Joins the fight of the target, if the player can and the fight takes them.
+	void JoinFight(int ClientId, int Target);
+	// Whether the players can be in one fight, tells the player why not.
+	bool CheckCanFight(int ClientId, int Target);
+	bool InvitedToFight(int ClientId, int Group) const;
+	// Before the group's leader joins another group.
+	void ForgetFightLock(int Group);
 	int FightSize(int Group) const;
+	bool InTeam(int ClientId) const { return m_aTeamGroup[m_aFightGroup[ClientId]]; }
+	const char *GroupName(int Group) const { return m_aTeamGroup[Group] ? "team" : "fight"; }
+	void UpdateDDRaceTeam(class CCharacter *pChr);
+	bool IsDeranged() const { return m_EloStep == GTrainElo::DERANGED_STEP; }
+	// The shortest /distance, more on Deranged maps.
+	int MinGoalDistance() const;
+	// The group's /distance or the server default, at least
+	// DERANGED_MIN_GOAL_DISTANCE on Deranged maps.
+	int GoalDistance(int Group) const;
+	int HoverTicks(int Group) const;
+	bool CheckFightLeader(int ClientId, const char *pAction);
+	void SendFightChat(int Group, const char *pMessage);
+	void KeepWeapons(class CCharacter *pChr);
 	void UpdateFightTeams();
-	void AnnounceFightScore(int Winner);
-	int PathNode(vec2 Pos) const;
+	static void FormatCaptureResult(char *pBuf, int BufSize, int Fails, const std::optional<CEloGain> &Gain);
+	// Returns whether the capture won the fight.
+	bool AnnounceFightScore(int Winner, const std::optional<CEloGain> &Gain);
+	// What the capture earns, without adding it yet. Team members share it.
+	std::optional<CEloGain> CaptureGain(int ClientId, bool Frozen);
+	void AddGain(int ClientId, CEloGain &Gain);
+	std::optional<CEloGain> AwardElo(int ClientId, bool Frozen);
+	void AddStats(int ClientId, const CGTrainStats &Stats);
+	void EndAttempt(int ClientId, bool Captured);
+	void StartRun(class CCharacter *pChr);
+	void SaveRun(class CCharacter *pChr, const CEloGain &Gain);
+	void SaveStats(int ClientId);
 	void UpdatePath(class CCharacter *pChr);
 	void CheckGoal(class CCharacter *pChr);
+	void TileRatingsPath(char *pBuf, int BufSize) const;
+	void InitTileRatings();
+	void HoldForTileRatings();
+	void FinishTileRatings();
+	int TileRatingsPercent() const;
+	void TrackTouchedTile(class CCharacter *pChr);
+	void UseTileDifficulties(const std::vector<float> &vDifficulties);
+	// The rated tiles of the attempt, each once.
+	static std::vector<int> UniqueTouchedTiles(const CAttempt &Attempt);
+	// The mean difficulty of the rated tiles of the attempt, each once.
+	std::optional<double> TouchedTileDifficulty(const CAttempt &Attempt) const;
+	// The difficulty of the capture as a whole, for its label and typical
+	// speed. From the tiles, which must be rated. Without any rated tile
+	// touched it is the easiest.
+	double CaptureStep(const CAttempt &Attempt) const;
+	// What the attempt's tiles earn, each once by its own step.
+	double TouchedTilePoints(const CAttempt &Attempt) const;
+	void AppendCaptureStep(char *pBuf, int BufSize, const CAttempt &Attempt) const;
 
 public:
 	CGameControllerGTrain(class CGameContext *pGameServer);
 	~CGameControllerGTrain() override;
+	static bool AddSwitchLayer(class IStorage *pStorage, const char *pPath, char *pNewPath, int NewPathSize);
+	// 0 for Easy with one star up to 14 for Extreme with three and 16 for
+	// Deranged, which has no stars and counts as Extreme with five. Every
+	// step makes captures worth more.
+	// Other categories and ratings have no ELO.
+	static std::optional<int> EloStep(const char *pServer, int Stars);
+	// "Hard ★★☆" for the nearest whole step of a capture's tiles, "Deranged
+	// ★★★★" for four steps above Extreme with three stars.
+	static void FormatStep(char *pBuf, int BufSize, double Step);
+	void LoadMapDifficulty();
+	void SetMapDifficulty(const char *pServer, int Stars);
+	// Loads the stats of the player's current name, after joining or
+	// renaming. Changes to the previous name's stats are saved first.
+	void LoadStats(int ClientId);
+	// Before the database shows stats, so they include the latest changes.
+	void SaveAllStats();
+	const CGTrainStats &Stats(int ClientId) const { return m_aStats[ClientId]; }
+	// Shadow-bans the stored runs on a map, of a player or both (empty for
+	// all) or lifts the ban, see CScore::BanGTrainRuns.
+	void BanRuns(const char *pMap, const char *pName, bool Ban);
 
 	void OnCharacterSpawn(class CCharacter *pChr) override;
 	int OnCharacterDeath(class CCharacter *pVictim, class CPlayer *pKiller, int Weapon) override;
 	void OnPlayerDisconnect(class CPlayer *pPlayer, const char *pReason) override;
 	void OnPlayerConnect(class CPlayer *pPlayer) override;
+	bool CanJoinTeam(int Team, int NotThisId, char *pErrorReason, int ErrorReasonSize) override;
+	void DoTeamChange(class CPlayer *pPlayer, int Team, bool DoChatMsg) override;
+	bool RatingTiles() const { return m_pRatingJob != nullptr; }
+	// Rates the tiles directly, UNRATED for none, like the spot ratings would.
+	// For tests, whose maps differ from their files.
+	void SetTileDifficulties(const std::vector<float> &vDifficulties) { UseTileDifficulties(vDifficulties); }
 	int SnapPlayerScore(int SnappingClient, CPlayer *pPlayer) override;
 	bool HasTimeScore() const override { return false; }
 	CFinishTime SnapPlayerTime(int SnappingClient, CPlayer *pPlayer) override { return CFinishTime::Unset(); }
 	void Snap(int SnappingClient) override;
+	std::optional<int> RaceTimerStartTick(class CCharacter *pChr) override;
 	void Fight(int ClientId, const char *pName);
+	void TeamUp(int ClientId, const char *pName);
+	// Accepts the latest /team request or fight invite.
+	void Accept(int ClientId);
+	// Toggles the lock of the player's fight without a value.
+	void Lock(int ClientId, std::optional<bool> Locked);
+	void Invite(int ClientId, const char *pName);
 	void Freeplay(int ClientId);
 	void Retry(int ClientId);
+	// Retries like the other practice binds, freeplay starts where the player
+	// aims instead.
+	void TeleCursor(int ClientId);
+	void Distance(int ClientId, std::optional<int> Tiles);
+	void NoDoubleJump(int ClientId);
+	void Forwards(int ClientId);
+	void Trail(int ClientId);
+	void ScoreLimit(int ClientId, std::optional<int> Limit);
+	void ToggleWeapon(int ClientId, int Weapon);
+	// The settings of the player's group, pName empty for the player itself.
+	void ShowSettings(int ClientId, const char *pName);
+	void Help();
 
 	void Tick() override;
 };

@@ -50,6 +50,11 @@ void CGameContext::ConHelp(IConsole::IResult *pResult, void *pUserData)
 
 	if(pResult->NumArguments() == 0)
 	{
+		if(auto *pController = dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController))
+		{
+			pController->Help();
+			return;
+		}
 		log_info("chatresp", "/cmdlist will show a list of all chat commands");
 		log_info("chatresp", "/help + any command will show you the help for this command");
 		log_info("chatresp", "Example /help settings will display the help about /settings");
@@ -83,6 +88,13 @@ void CGameContext::ConHelp(IConsole::IResult *pResult, void *pUserData)
 void CGameContext::ConSettings(IConsole::IResult *pResult, void *pUserData)
 {
 	CGameContext *pSelf = (CGameContext *)pUserData;
+	// GTrain shows the training settings of a player and their fight.
+	if(auto *pController = dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController))
+	{
+		if(CheckClientId(pResult->m_ClientId) && pSelf->m_apPlayers[pResult->m_ClientId])
+			pController->ShowSettings(pResult->m_ClientId, pResult->NumArguments() > 0 ? pResult->GetString(0) : "");
+		return;
+	}
 
 	if(pResult->NumArguments() == 0)
 	{
@@ -379,6 +391,12 @@ void CGameContext::ConTop(IConsole::IResult *pResult, void *pUserData)
 	CGameContext *pSelf = (CGameContext *)pUserData;
 	if(!CheckClientId(pResult->m_ClientId))
 		return;
+	// GTrain has no race times, its top players have the most ELO.
+	if(dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController))
+	{
+		ConTopElo(pResult, pUserData);
+		return;
+	}
 
 	if(g_Config.m_SvHideScore)
 	{
@@ -946,6 +964,12 @@ void CGameContext::ConRank(IConsole::IResult *pResult, void *pUserData)
 	CGameContext *pSelf = (CGameContext *)pUserData;
 	if(!CheckClientId(pResult->m_ClientId))
 		return;
+	// GTrain attempts never finish the map, its players have profiles.
+	if(dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController))
+	{
+		ConProfile(pResult, pUserData);
+		return;
+	}
 
 	if(pResult->NumArguments() > 0)
 	{
@@ -1114,6 +1138,20 @@ void CGameContext::AttemptJoinTeam(int ClientId, int Team)
 	}
 }
 
+void CGameContext::ConAcceptTeam(IConsole::IResult *pResult, void *pUserData)
+{
+	CGameContext *pSelf = (CGameContext *)pUserData;
+	if(!CheckClientId(pResult->m_ClientId) || !pSelf->m_apPlayers[pResult->m_ClientId])
+		return;
+	auto *pController = dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController);
+	if(!pController)
+	{
+		pSelf->SendChatTarget(pResult->m_ClientId, "Team requests and fight invites are only available in GTrain.");
+		return;
+	}
+	pController->Accept(pResult->m_ClientId);
+}
+
 void CGameContext::ConFight(IConsole::IResult *pResult, void *pUserData)
 {
 	CGameContext *pSelf = (CGameContext *)pUserData;
@@ -1154,6 +1192,76 @@ void CGameContext::ConRetry(IConsole::IResult *pResult, void *pUserData)
 		return;
 	}
 	pController->Retry(pResult->m_ClientId);
+}
+
+void CGameContext::ConGoalDistance(IConsole::IResult *pResult, void *pUserData)
+{
+	CGameContext *pSelf = (CGameContext *)pUserData;
+	if(!CheckClientId(pResult->m_ClientId) || !pSelf->m_apPlayers[pResult->m_ClientId])
+		return;
+	auto *pController = dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController);
+	if(!pController)
+	{
+		pSelf->SendChatTarget(pResult->m_ClientId, "Goal distances are only available in GTrain.");
+		return;
+	}
+	pController->Distance(pResult->m_ClientId, pResult->NumArguments() ? std::optional<int>(pResult->GetInteger(0)) : std::nullopt);
+}
+
+void CGameContext::ConNoDoubleJump(IConsole::IResult *pResult, void *pUserData)
+{
+	CGameContext *pSelf = (CGameContext *)pUserData;
+	if(!CheckClientId(pResult->m_ClientId) || !pSelf->m_apPlayers[pResult->m_ClientId])
+		return;
+	auto *pController = dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController);
+	if(!pController)
+	{
+		pSelf->SendChatTarget(pResult->m_ClientId, "/nodj is only available in GTrain.");
+		return;
+	}
+	pController->NoDoubleJump(pResult->m_ClientId);
+}
+
+void CGameContext::ConForwards(IConsole::IResult *pResult, void *pUserData)
+{
+	CGameContext *pSelf = (CGameContext *)pUserData;
+	if(!CheckClientId(pResult->m_ClientId) || !pSelf->m_apPlayers[pResult->m_ClientId])
+		return;
+	auto *pController = dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController);
+	if(!pController)
+	{
+		pSelf->SendChatTarget(pResult->m_ClientId, "/forwards is only available in GTrain.");
+		return;
+	}
+	pController->Forwards(pResult->m_ClientId);
+}
+
+void CGameContext::ConTrail(IConsole::IResult *pResult, void *pUserData)
+{
+	CGameContext *pSelf = (CGameContext *)pUserData;
+	if(!CheckClientId(pResult->m_ClientId) || !pSelf->m_apPlayers[pResult->m_ClientId])
+		return;
+	auto *pController = dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController);
+	if(!pController)
+	{
+		pSelf->SendChatTarget(pResult->m_ClientId, "/trail is only available in GTrain.");
+		return;
+	}
+	pController->Trail(pResult->m_ClientId);
+}
+
+void CGameContext::ConScoreLimit(IConsole::IResult *pResult, void *pUserData)
+{
+	CGameContext *pSelf = (CGameContext *)pUserData;
+	if(!CheckClientId(pResult->m_ClientId) || !pSelf->m_apPlayers[pResult->m_ClientId])
+		return;
+	auto *pController = dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController);
+	if(!pController)
+	{
+		pSelf->SendChatTarget(pResult->m_ClientId, "Score limits are only available in GTrain.");
+		return;
+	}
+	pController->ScoreLimit(pResult->m_ClientId, pResult->NumArguments() ? std::optional<int>(pResult->GetInteger(0)) : std::nullopt);
 }
 
 void CGameContext::ConInvite(IConsole::IResult *pResult, void *pUserData)
@@ -1292,11 +1400,9 @@ void CGameContext::ConTeam(IConsole::IResult *pResult, void *pUserData)
 	CPlayer *pPlayer = pSelf->m_apPlayers[pResult->m_ClientId];
 	if(!pPlayer)
 		return;
+	// GTrain registers its own /team, which takes player names.
 	if(dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController))
-	{
-		pSelf->SendChatTarget(pResult->m_ClientId, "/team is disabled in GTrain. Use /fight to join a fight group.");
 		return;
-	}
 
 	if(pResult->NumArguments() > 0)
 	{
@@ -1665,6 +1771,12 @@ void CGameContext::ConSetTimerType(IConsole::IResult *pResult, void *pUserData)
 
 void CGameContext::ConRescue(IConsole::IResult *pResult, void *pUserData)
 {
+	// Practice binds retry in GTrain, which has no practice mode.
+	if(dynamic_cast<CGameControllerGTrain *>(((CGameContext *)pUserData)->m_pController))
+	{
+		ConRetry(pResult, pUserData);
+		return;
+	}
 	CGameContext *pSelf = (CGameContext *)pUserData;
 	if(!CheckClientId(pResult->m_ClientId))
 		return;
@@ -1757,6 +1869,12 @@ void CGameContext::ConRescueMode(IConsole::IResult *pResult, void *pUserData)
 
 void CGameContext::ConBack(IConsole::IResult *pResult, void *pUserData)
 {
+	// Practice binds retry in GTrain, which has no practice mode.
+	if(dynamic_cast<CGameControllerGTrain *>(((CGameContext *)pUserData)->m_pController))
+	{
+		ConRetry(pResult, pUserData);
+		return;
+	}
 	auto *pSelf = static_cast<CGameContext *>(pUserData);
 	if(auto *pChr = pSelf->GetPracticeCharacter(pResult))
 	{
@@ -1774,6 +1892,12 @@ void CGameContext::ConBack(IConsole::IResult *pResult, void *pUserData)
 
 void CGameContext::ConTeleTo(IConsole::IResult *pResult, void *pUserData)
 {
+	// Practice binds retry in GTrain, which has no practice mode.
+	if(dynamic_cast<CGameControllerGTrain *>(((CGameContext *)pUserData)->m_pController))
+	{
+		ConRetry(pResult, pUserData);
+		return;
+	}
 	CGameContext *pSelf = (CGameContext *)pUserData;
 	if(!CheckClientId(pResult->m_ClientId))
 		return;
@@ -1897,6 +2021,12 @@ void CGameContext::ConTeleCursor(IConsole::IResult *pResult, void *pUserData)
 	CGameContext *pSelf = (CGameContext *)pUserData;
 	if(!CheckClientId(pResult->m_ClientId))
 		return;
+	// GTrain has no practice mode, it retries or chooses the freeplay start.
+	if(auto *pController = dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController))
+	{
+		pController->TeleCursor(pResult->m_ClientId);
+		return;
+	}
 	CPlayer *pPlayer = pSelf->m_apPlayers[pResult->m_ClientId];
 	if(!pPlayer)
 		return;
@@ -1941,6 +2071,12 @@ void CGameContext::ConTeleCursor(IConsole::IResult *pResult, void *pUserData)
 
 void CGameContext::ConLastTele(IConsole::IResult *pResult, void *pUserData)
 {
+	// Practice binds retry in GTrain, which has no practice mode.
+	if(dynamic_cast<CGameControllerGTrain *>(((CGameContext *)pUserData)->m_pController))
+	{
+		ConRetry(pResult, pUserData);
+		return;
+	}
 	CGameContext *pSelf = (CGameContext *)pUserData;
 	if(!CheckClientId(pResult->m_ClientId))
 		return;
@@ -1965,6 +2101,17 @@ void CGameContext::ConLastTele(IConsole::IResult *pResult, void *pUserData)
 	}
 	pPlayer->m_LastTeleTee.Load(pChr);
 	pPlayer->Pause(CPlayer::PAUSE_NONE, true);
+}
+
+bool CGameContext::ToggleTrainingWeapon(IConsole::IResult *pResult, int Weapon)
+{
+	// GTrain has no practice mode, its weapon commands toggle lasting weapons.
+	auto *pController = dynamic_cast<CGameControllerGTrain *>(m_pController);
+	if(!pController)
+		return false;
+	if(CheckClientId(pResult->m_ClientId) && m_apPlayers[pResult->m_ClientId])
+		pController->ToggleWeapon(pResult->m_ClientId, Weapon);
+	return true;
 }
 
 CCharacter *CGameContext::GetPracticeCharacter(IConsole::IResult *pResult)
@@ -2128,6 +2275,8 @@ void CGameContext::ConPracticeLiveFreeze(IConsole::IResult *pResult, void *pUser
 void CGameContext::ConPracticeShotgun(IConsole::IResult *pResult, void *pUserData)
 {
 	CGameContext *pSelf = (CGameContext *)pUserData;
+	if(pSelf->ToggleTrainingWeapon(pResult, WEAPON_SHOTGUN))
+		return;
 	if(pSelf->GetPracticeCharacter(pResult))
 		ConShotgun(pResult, pUserData);
 }
@@ -2135,6 +2284,8 @@ void CGameContext::ConPracticeShotgun(IConsole::IResult *pResult, void *pUserDat
 void CGameContext::ConPracticeGrenade(IConsole::IResult *pResult, void *pUserData)
 {
 	CGameContext *pSelf = (CGameContext *)pUserData;
+	if(pSelf->ToggleTrainingWeapon(pResult, WEAPON_GRENADE))
+		return;
 	if(pSelf->GetPracticeCharacter(pResult))
 		ConGrenade(pResult, pUserData);
 }
@@ -2142,6 +2293,8 @@ void CGameContext::ConPracticeGrenade(IConsole::IResult *pResult, void *pUserDat
 void CGameContext::ConPracticeLaser(IConsole::IResult *pResult, void *pUserData)
 {
 	CGameContext *pSelf = (CGameContext *)pUserData;
+	if(pSelf->ToggleTrainingWeapon(pResult, WEAPON_LASER))
+		return;
 	if(pSelf->GetPracticeCharacter(pResult))
 		ConLaser(pResult, pUserData);
 }
@@ -2219,6 +2372,8 @@ void CGameContext::ConPracticeUnWeapons(IConsole::IResult *pResult, void *pUserD
 void CGameContext::ConPracticeNinja(IConsole::IResult *pResult, void *pUserData)
 {
 	CGameContext *pSelf = (CGameContext *)pUserData;
+	if(pSelf->ToggleTrainingWeapon(pResult, WEAPON_NINJA))
+		return;
 	if(pSelf->GetPracticeCharacter(pResult))
 		ConNinja(pResult, pUserData);
 }
@@ -2345,6 +2500,12 @@ void CGameContext::ConPoints(IConsole::IResult *pResult, void *pUserData)
 	CGameContext *pSelf = (CGameContext *)pUserData;
 	if(!CheckClientId(pResult->m_ClientId))
 		return;
+	// GTrain attempts never finish the map, its players collect ELO instead.
+	if(dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController))
+	{
+		ConElo(pResult, pUserData);
+		return;
+	}
 
 	if(pResult->NumArguments() > 0)
 	{
@@ -2363,6 +2524,11 @@ void CGameContext::ConTopPoints(IConsole::IResult *pResult, void *pUserData)
 	CGameContext *pSelf = (CGameContext *)pUserData;
 	if(!CheckClientId(pResult->m_ClientId))
 		return;
+	if(dynamic_cast<CGameControllerGTrain *>(pSelf->m_pController))
+	{
+		ConTopElo(pResult, pUserData);
+		return;
+	}
 
 	if(g_Config.m_SvHideScore)
 	{
@@ -2374,6 +2540,84 @@ void CGameContext::ConTopPoints(IConsole::IResult *pResult, void *pUserData)
 		pSelf->Score()->ShowTopPoints(pResult->m_ClientId, pResult->GetInteger(0));
 	else
 		pSelf->Score()->ShowTopPoints(pResult->m_ClientId);
+}
+
+void CGameContext::ShowGTrainPlayer(IConsole::IResult *pResult, bool Profile)
+{
+	if(!CheckClientId(pResult->m_ClientId))
+		return;
+	auto *pController = dynamic_cast<CGameControllerGTrain *>(m_pController);
+	if(!pController)
+	{
+		SendChatTarget(pResult->m_ClientId, Profile ? "Profiles are only available in GTrain." : "ELO is only available in GTrain.");
+		return;
+	}
+	if(pResult->NumArguments() > 0 && g_Config.m_SvHideScore)
+	{
+		log_info("chatresp", "Showing the %s of other players is not allowed on this server.", Profile ? "profile" : "ELO");
+		return;
+	}
+	const char *pName = pResult->NumArguments() > 0 ? pResult->GetString(0) : Server()->ClientName(pResult->m_ClientId);
+	// Unsaved changes are queued first, the database runs jobs in order.
+	pController->SaveAllStats();
+	if(Profile)
+		Score()->ShowGTrainProfile(pResult->m_ClientId, pName);
+	else
+		Score()->ShowElo(pResult->m_ClientId, pName);
+}
+
+void CGameContext::ShowGTrainTop(IConsole::IResult *pResult, EGTrainStat Stat)
+{
+	if(!CheckClientId(pResult->m_ClientId))
+		return;
+	auto *pController = dynamic_cast<CGameControllerGTrain *>(m_pController);
+	if(!pController)
+	{
+		SendChatTarget(pResult->m_ClientId, "These ladders are only available in GTrain.");
+		return;
+	}
+	if(g_Config.m_SvHideScore)
+	{
+		log_info("chatresp", "Showing the ladders is not allowed on this server.");
+		return;
+	}
+	pController->SaveAllStats();
+	Score()->ShowGTrainTop(pResult->m_ClientId, Stat, pResult->NumArguments() > 0 ? pResult->GetInteger(0) : 1);
+}
+
+void CGameContext::ConElo(IConsole::IResult *pResult, void *pUserData)
+{
+	((CGameContext *)pUserData)->ShowGTrainPlayer(pResult, false);
+}
+
+void CGameContext::ConProfile(IConsole::IResult *pResult, void *pUserData)
+{
+	((CGameContext *)pUserData)->ShowGTrainPlayer(pResult, true);
+}
+
+void CGameContext::ConTopElo(IConsole::IResult *pResult, void *pUserData)
+{
+	((CGameContext *)pUserData)->ShowGTrainTop(pResult, EGTrainStat::POINTS);
+}
+
+void CGameContext::ConTopCaptures(IConsole::IResult *pResult, void *pUserData)
+{
+	((CGameContext *)pUserData)->ShowGTrainTop(pResult, EGTrainStat::CAPTURES);
+}
+
+void CGameContext::ConTopAttempts(IConsole::IResult *pResult, void *pUserData)
+{
+	((CGameContext *)pUserData)->ShowGTrainTop(pResult, EGTrainStat::ATTEMPTS);
+}
+
+void CGameContext::ConTopRespawns(IConsole::IResult *pResult, void *pUserData)
+{
+	((CGameContext *)pUserData)->ShowGTrainTop(pResult, EGTrainStat::RESPAWNS);
+}
+
+void CGameContext::ConTopPlaytime(IConsole::IResult *pResult, void *pUserData)
+{
+	((CGameContext *)pUserData)->ShowGTrainTop(pResult, EGTrainStat::PLAYTIME);
 }
 
 void CGameContext::ConTimeCP(IConsole::IResult *pResult, void *pUserData)

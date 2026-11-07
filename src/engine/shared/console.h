@@ -186,6 +186,7 @@ public:
 	void RegisterTemp(const char *pName, const char *pParams, int Flags, const char *pHelp) override;
 	void DeregisterTemp(const char *pName) override;
 	void DeregisterTempAll() override;
+	void RemoveCommandFlags(const char *pName, int Flags) override;
 	void Chain(const char *pName, FChainCommandCallback pfnChainFunc, void *pUser) override;
 	void StoreCommands(bool Store) override;
 

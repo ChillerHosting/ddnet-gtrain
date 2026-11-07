@@ -8,6 +8,8 @@
 
 class CLaser : public CEntity
 {
+	friend class CGTrainRunState;
+
 public:
 	CLaser(CGameWorld *pGameWorld, vec2 Pos, vec2 Direction, float StartEnergy, int Owner, int Type);
 

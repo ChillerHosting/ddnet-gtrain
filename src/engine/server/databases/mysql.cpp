@@ -337,17 +337,23 @@ bool CMysqlConnection::ConnectImpl()
 		char aCreateMaps[1024];
 		char aCreateSaves[1024];
 		char aCreatePoints[1024];
+		char aCreateGTrainStats[1024];
+		char aCreateGTrainRuns[1024];
 		FormatCreateRace(aCreateRace, sizeof(aCreateRace), /* Backup */ false);
 		FormatCreateTeamrace(aCreateTeamrace, sizeof(aCreateTeamrace), "VARBINARY(16)", /* Backup */ false);
 		FormatCreateMaps(aCreateMaps, sizeof(aCreateMaps));
 		FormatCreateSaves(aCreateSaves, sizeof(aCreateSaves), /* Backup */ false);
 		FormatCreatePoints(aCreatePoints, sizeof(aCreatePoints));
+		FormatCreateGTrainStats(aCreateGTrainStats, sizeof(aCreateGTrainStats));
+		FormatCreateGTrainRuns(aCreateGTrainRuns, sizeof(aCreateGTrainRuns), "MEDIUMBLOB");
 
 		if(!PrepareAndExecuteStatement(aCreateRace) ||
 			!PrepareAndExecuteStatement(aCreateTeamrace) ||
 			!PrepareAndExecuteStatement(aCreateMaps) ||
 			!PrepareAndExecuteStatement(aCreateSaves) ||
-			!PrepareAndExecuteStatement(aCreatePoints))
+			!PrepareAndExecuteStatement(aCreatePoints) ||
+			!PrepareAndExecuteStatement(aCreateGTrainStats) ||
+			!PrepareAndExecuteStatement(aCreateGTrainRuns))
 		{
 			return false;
 		}

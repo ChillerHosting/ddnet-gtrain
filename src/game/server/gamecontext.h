@@ -53,6 +53,7 @@ class CConfig;
 class CHeap;
 class CPlayer;
 class CScore;
+enum class EGTrainStat;
 class CUnpacker;
 class CRconRole;
 class IAntibot;
@@ -156,6 +157,9 @@ class CGameContext : public IGameServer
 	static void ConChangeMap(IConsole::IResult *pResult, void *pUserData);
 	static void ConRandomMap(IConsole::IResult *pResult, void *pUserData);
 	static void ConRandomUnfinishedMap(IConsole::IResult *pResult, void *pUserData);
+	static void ConBanRuns(IConsole::IResult *pResult, void *pUserData);
+	static void ConUnbanRuns(IConsole::IResult *pResult, void *pUserData);
+	void BanGTrainRuns(IConsole::IResult *pResult, bool Ban) const;
 	static void ConRestart(IConsole::IResult *pResult, void *pUserData);
 	static void ConServerAlert(IConsole::IResult *pResult, void *pUserData);
 	static void ConModAlert(IConsole::IResult *pResult, void *pUserData);
@@ -273,6 +277,7 @@ public:
 
 	char m_aDeleteTempfile[128];
 	void DeleteTempfile();
+	bool ImportMapSettings(char *pNewMapName, int MapNameSize);
 
 	enum
 	{
@@ -407,6 +412,7 @@ public:
 
 	CUuid GameUuid() const override;
 	const char *GameType() const override;
+	bool HasTimeScore() const override;
 	char m_aVersionString[32];
 	const char *Version() const override;
 	const char *NetVersion() const override;
@@ -513,6 +519,15 @@ private:
 	static void ConTimes(IConsole::IResult *pResult, void *pUserData);
 	static void ConPoints(IConsole::IResult *pResult, void *pUserData);
 	static void ConTopPoints(IConsole::IResult *pResult, void *pUserData);
+	static void ConElo(IConsole::IResult *pResult, void *pUserData);
+	static void ConProfile(IConsole::IResult *pResult, void *pUserData);
+	static void ConTopElo(IConsole::IResult *pResult, void *pUserData);
+	static void ConTopCaptures(IConsole::IResult *pResult, void *pUserData);
+	static void ConTopAttempts(IConsole::IResult *pResult, void *pUserData);
+	static void ConTopRespawns(IConsole::IResult *pResult, void *pUserData);
+	static void ConTopPlaytime(IConsole::IResult *pResult, void *pUserData);
+	void ShowGTrainPlayer(IConsole::IResult *pResult, bool Profile);
+	void ShowGTrainTop(IConsole::IResult *pResult, EGTrainStat Stat);
 	static void ConTimeCP(IConsole::IResult *pResult, void *pUserData);
 
 	static void ConDND(IConsole::IResult *pResult, void *pUserData);
@@ -535,8 +550,14 @@ private:
 	static void ConInvite(IConsole::IResult *pResult, void *pUserData);
 	static void ConJoin(IConsole::IResult *pResult, void *pUserData);
 	static void ConFight(IConsole::IResult *pResult, void *pUserData);
+	static void ConAcceptTeam(IConsole::IResult *pResult, void *pUserData);
 	static void ConFreeplay(IConsole::IResult *pResult, void *pUserData);
 	static void ConRetry(IConsole::IResult *pResult, void *pUserData);
+	static void ConGoalDistance(IConsole::IResult *pResult, void *pUserData);
+	static void ConNoDoubleJump(IConsole::IResult *pResult, void *pUserData);
+	static void ConForwards(IConsole::IResult *pResult, void *pUserData);
+	static void ConTrail(IConsole::IResult *pResult, void *pUserData);
+	static void ConScoreLimit(IConsole::IResult *pResult, void *pUserData);
 	static void ConTeam0Mode(IConsole::IResult *pResult, void *pUserData);
 	static void ConWhisper(IConsole::IResult *pResult, void *pUserData);
 	static void ConConverse(IConsole::IResult *pResult, void *pUserData);
@@ -603,6 +624,7 @@ private:
 	static void ConReloadCensorlist(IConsole::IResult *pResult, void *pUserData);
 
 	CCharacter *GetPracticeCharacter(IConsole::IResult *pResult);
+	bool ToggleTrainingWeapon(IConsole::IResult *pResult, int Weapon);
 
 	CMutes m_Mutes;
 	CMutes m_VoteMutes;

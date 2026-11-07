@@ -63,7 +63,7 @@ public:
 	void OnPredictedEarlyInput(const CNetObj_PlayerInput *pNewInput);
 	void OnDisconnect();
 
-	void KillCharacter(int Weapon = WEAPON_GAME, bool SendKillMsg = true);
+	void KillCharacter(int Weapon = WEAPON_GAME, bool SendKillMsg = true, bool Effects = true);
 	CCharacter *GetCharacter();
 	const CCharacter *GetCharacter() const;
 

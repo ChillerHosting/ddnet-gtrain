@@ -308,6 +308,20 @@ int CCollision::GetMoveRestrictions(CALLBACK_SWITCHACTIVE pfnSwitchActive, void 
 	return Restrictions;
 }
 
+int CCollision::GetTileMoveRestrictions(int Index, bool OnTile) const
+{
+	int Restrictions = 0;
+	for(int Front = 0; Front < 2; Front++)
+	{
+		const int Tile = Front ? GetFrontTileIndex(Index) : GetTileIndex(Index);
+		const int Flags = Front ? GetFrontTileFlags(Index) : GetTileFlags(Index);
+		// Same rule as GetMoveRestrictions: only one-way stoppers hold us on top.
+		if(!OnTile || Tile == TILE_STOP)
+			Restrictions |= GetMoveRestrictionsRaw(MR_DIR_HERE, Tile, Flags);
+	}
+	return Restrictions;
+}
+
 int CCollision::GetTile(int x, int y) const
 {
 	if(!m_pTiles)

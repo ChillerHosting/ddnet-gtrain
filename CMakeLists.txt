@@ -2454,6 +2454,8 @@ set_src(GAME_SHARED GLOB src/game
   prng.cpp
   prng.h
   race_state.h
+  switch_layer.cpp
+  switch_layer.h
   team_state.h
   teamscore.cpp
   teamscore.h
@@ -3084,6 +3086,31 @@ endif()
 
 
 ########################################################################
+# DDNET_PHYSICS
+########################################################################
+
+# GTrain rates the spots of maps by simulating tees with ddnet_physics, in
+# the server and in gtrain_rate_tiles. It is a submodule.
+if(SERVER OR TOOLS)
+  if(NOT EXISTS ${PROJECT_SOURCE_DIR}/src/engine/external/ddnet_physics/CMakeLists.txt)
+    message(FATAL_ERROR "ddnet_physics is missing, run: git submodule update --init --recursive src/engine/external/ddnet_physics")
+  endif()
+  # Its map loader links zlib as ZLIB::ZLIB, which DDNet's FindZLIB does not define.
+  if(ZLIB_FOUND AND NOT ZLIB_BUNDLED AND NOT TARGET ZLIB::ZLIB)
+    add_library(ZLIB::ZLIB INTERFACE IMPORTED)
+    set_target_properties(ZLIB::ZLIB PROPERTIES
+      INTERFACE_INCLUDE_DIRECTORIES "${ZLIB_INCLUDE_DIRS}"
+      INTERFACE_LINK_LIBRARIES "${ZLIB_LIBRARIES}"
+    )
+  endif()
+  set(DDNET_PHYSICS_BUILD_TESTS OFF CACHE BOOL "Build the tests and the oracle comparison tool of ddnet_physics")
+  set(DDNET_PHYSICS_BUILD_EXAMPLES OFF CACHE BOOL "Build the examples of ddnet_physics")
+  set(DDNET_PHYSICS_BACKEND ddnet_optimized CACHE STRING "Implementation of ddnet_physics to build")
+  set(DDNET_PHYSICS_EVENTS OFF CACHE BOOL "Also build the optimized backend of ddnet_physics with events")
+  add_subdirectory(src/engine/external/ddnet_physics EXCLUDE_FROM_ALL)
+endif()
+
+########################################################################
 # SERVER
 ########################################################################
 
@@ -3165,8 +3192,16 @@ if(SERVER)
     gamemodes/ddnet.h
     gamemodes/gtrain.cpp
     gamemodes/gtrain.h
+    gamemodes/gtrain_elo.h
+    gamemodes/gtrain_map.cpp
+    gamemodes/gtrain_map.h
     gamemodes/gtrain_path.cpp
     gamemodes/gtrain_path.h
+    gamemodes/gtrain_physics_map.cpp
+    gamemodes/gtrain_run.cpp
+    gamemodes/gtrain_run.h
+    gamemodes/gtrain_tiles.cpp
+    gamemodes/gtrain_tiles.h
     gamemodes/mod.cpp
     gamemodes/mod.h
     gameworld.cpp
@@ -3223,6 +3258,7 @@ if(SERVER)
     ${MINIUPNPC_LIBRARIES}
     ${MYSQL_LIBRARIES}
     ${TARGET_ANTIBOT}
+    ddnet_physics
 
     ${LIBS}
   )
@@ -3317,6 +3353,8 @@ if(TOOLS)
     demo_extract_chat.cpp
     dilate.cpp
     dummy_map.cpp
+    gtrain_rate_tiles.cpp
+    map_add_switch_layer.cpp
     map_convert_07.cpp
     map_diff.cpp
     map_extract.cpp
@@ -3351,6 +3389,18 @@ if(TOOLS)
       endif()
       if(TOOL MATCHES "^config_")
         list(APPEND EXTRA_TOOL_SRC "src/tools/config_common.h")
+      endif()
+      if(TOOL MATCHES "^gtrain_rate_tiles$")
+        list(APPEND EXTRA_TOOL_SRC
+          src/game/server/gamemodes/gtrain_map.cpp
+          src/game/server/gamemodes/gtrain_map.h
+          src/game/server/gamemodes/gtrain_path.cpp
+          src/game/server/gamemodes/gtrain_path.h
+          src/game/server/gamemodes/gtrain_physics_map.cpp
+          src/game/server/gamemodes/gtrain_tiles.cpp
+          src/game/server/gamemodes/gtrain_tiles.h
+        )
+        list(APPEND TOOL_LIBS ddnet_physics)
       endif()
       if(TOOL MATCHES "^map_render$")
         list(APPEND TOOL_INCLUDE_DIRS ${PNG_INCLUDE_DIRS} ${FREETYPE_INCLUDE_DIRS} ${GLEW_INCLUDE_DIRS})
@@ -3462,7 +3512,9 @@ if((GTEST_FOUND OR DOWNLOAD_GTEST) AND SERVER)
     fs_test.cpp
     gameworld_test.cpp
     git_revision_test.cpp
+    gtrain_elo_test.cpp
     gtrain_path_test.cpp
+    gtrain_run_test.cpp
     hash_test.cpp
     huffman_test.cpp
     io_test.cpp

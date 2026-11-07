@@ -2908,6 +2908,8 @@ void CGameContext::OnChangeInfoNetMessage(const CNetMsg_Cl_ChangeInfo *pMsg, int
 		Score()->PlayerData(ClientId)->Reset();
 		Server()->SetClientScore(ClientId, std::nullopt);
 		Score()->LoadPlayerData(ClientId);
+		if(auto *pController = dynamic_cast<CGameControllerGTrain *>(m_pController))
+			pController->LoadStats(ClientId);
 
 		SixupNeedsUpdate = true;
 
@@ -3344,6 +3346,28 @@ void CGameContext::ConRandomMap(IConsole::IResult *pResult, void *pUserData)
 		return;
 
 	pSelf->m_pScore->RandomMap(ClientId, MinStars, MaxStars);
+}
+
+void CGameContext::BanGTrainRuns(IConsole::IResult *pResult, bool Ban) const
+{
+	auto *pController = dynamic_cast<CGameControllerGTrain *>(m_pController);
+	if(!pController)
+	{
+		log_info("gtrain", "runs are only stored in GTrain");
+		return;
+	}
+	const char *pMap = pResult->GetString(0);
+	pController->BanRuns(str_comp(pMap, "*") == 0 ? "" : pMap, pResult->NumArguments() > 1 ? pResult->GetString(1) : "", Ban);
+}
+
+void CGameContext::ConBanRuns(IConsole::IResult *pResult, void *pUserData)
+{
+	((CGameContext *)pUserData)->BanGTrainRuns(pResult, true);
+}
+
+void CGameContext::ConUnbanRuns(IConsole::IResult *pResult, void *pUserData)
+{
+	((CGameContext *)pUserData)->BanGTrainRuns(pResult, false);
 }
 
 void CGameContext::ConRandomUnfinishedMap(IConsole::IResult *pResult, void *pUserData)
@@ -3945,6 +3969,8 @@ void CGameContext::OnConsoleInit()
 	Console()->Register("change_map", "r[map]", CFGFLAG_SERVER | CFGFLAG_STORE, ConChangeMap, this, "Change map");
 	Console()->Register("random_map", "?i[stars] ?i[max stars]", CFGFLAG_SERVER | CFGFLAG_STORE, ConRandomMap, this, "Random map");
 	Console()->Register("random_unfinished_map", "?i[stars] ?i[max stars]", CFGFLAG_SERVER | CFGFLAG_STORE, ConRandomUnfinishedMap, this, "Random unfinished map");
+	Console()->Register("ban_runs", "s[map] ?r[player name]", CFGFLAG_SERVER, ConBanRuns, this, "Shadow-ban the stored GTrain runs on map s (* for every map), only those of player r if given: they stay stored, their points and captures are taken off the stats");
+	Console()->Register("unban_runs", "s[map] ?r[player name]", CFGFLAG_SERVER, ConUnbanRuns, this, "Lift ban_runs for the runs on map s (* for every map), only those of player r if given, giving their points and captures back");
 	Console()->Register("restart", "?i[seconds]", CFGFLAG_SERVER | CFGFLAG_STORE, ConRestart, this, "Restart in x seconds (0 = abort)");
 	Console()->Register("server_alert", "r[message]", CFGFLAG_SERVER, ConServerAlert, this, "Send a server alert message to all players");
 	Console()->Register("mod_alert", "v[id] r[message]", CFGFLAG_SERVER, ConModAlert, this, "Send a moderator alert message to player");
@@ -4057,7 +4083,7 @@ void CGameContext::RegisterChatCommands()
 	Console()->Register("rules", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRules, this, "Shows the server rules");
 	Console()->Register("emote", "?s[emote name] i[duration in seconds]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConEyeEmote, this, "Sets your tee's eye emote");
 	Console()->Register("eyeemote", "?s['on'|'off'|'toggle']", CFGFLAG_CHAT | CFGFLAG_SERVER, ConSetEyeEmote, this, "Toggles use of standard eye-emotes on/off, eyeemote s, where s = on for on, off for off, toggle for toggle and nothing to show current status");
-	Console()->Register("settings", "?s[configname]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConSettings, this, "Shows gameplay information for this server");
+	Console()->Register("settings", "?r[configname]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConSettings, this, "Shows gameplay information for this server, in GTrain the settings of you or a player");
 	Console()->Register("help", "?r[command]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConHelp, this, "Shows help to command r, general help if left blank");
 	Console()->Register("info", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConInfo, this, "Shows info about this server");
 	Console()->Register("list", "?s[filter]", CFGFLAG_CHAT, ConList, this, "List connected players with optional case-insensitive substring matching filter");
@@ -4085,14 +4111,21 @@ void CGameContext::RegisterChatCommands()
 	Console()->Register("rankteam", "?r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTeamRank, this, "Shows the team rank of player with name r (your team rank by default)");
 	Console()->Register("teamrank", "?r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTeamRank, this, "Shows the team rank of player with name r (your team rank by default)");
 
-	Console()->Register("rank", "?r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRank, this, "Shows the rank of player with name r (your rank by default)");
+	Console()->Register("rank", "?r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRank, this, "Shows the rank of player with name r (your rank by default), the GTrain profile in GTrain");
 	Console()->Register("top5team", "?s[player name] ?i[rank to start with]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTeamTop5, this, "Shows five team ranks of the ladder or of a player beginning with rank i (1 by default, -1 for worst)");
 	Console()->Register("teamtop5", "?s[player name] ?i[rank to start with]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTeamTop5, this, "Shows five team ranks of the ladder or of a player beginning with rank i (1 by default, -1 for worst)");
-	Console()->Register("top", "?i[rank to start with]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTop, this, "Shows the top ranks of the global and regional ladder beginning with rank i (1 by default, -1 for worst)");
-	Console()->Register("top5", "?i[rank to start with]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTop, this, "Shows the top ranks of the global and regional ladder beginning with rank i (1 by default, -1 for worst)");
+	Console()->Register("top", "?i[rank to start with]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTop, this, "Shows the top ranks of the global and regional ladder beginning with rank i (1 by default, -1 for worst), the ELO ladder in GTrain");
+	Console()->Register("top5", "?i[rank to start with]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTop, this, "Shows the top ranks of the global and regional ladder beginning with rank i (1 by default, -1 for worst), the ELO ladder in GTrain");
 	Console()->Register("times", "?s[player name] ?i[number of times to skip]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTimes, this, "/times ?s?i shows last 5 times of the server or of a player beginning with name s starting with time i (i = 1 by default, -1 for first)");
-	Console()->Register("points", "?r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConPoints, this, "Shows the global points of a player beginning with name r (your rank by default)");
-	Console()->Register("top5points", "?i[number]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTopPoints, this, "Shows five points of the global point ladder beginning with rank i (1 by default)");
+	Console()->Register("points", "?r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConPoints, this, "Shows the global points of a player beginning with name r (your rank by default), the ELO in GTrain");
+	Console()->Register("top5points", "?i[number]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTopPoints, this, "Shows five points of the global point ladder beginning with rank i (1 by default), the ELO ladder in GTrain");
+	Console()->Register("elo", "?r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConElo, this, "Shows the GTrain ELO of a player (yours by default)");
+	Console()->Register("top5elo", "?i[number]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTopElo, this, "Shows five players of the GTrain ELO ladder beginning with rank i (1 by default)");
+	Console()->Register("profile", "?r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConProfile, this, "Shows the GTrain stats and playtime of a player (yours by default)");
+	Console()->Register("top5captures", "?i[number]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTopCaptures, this, "Shows five players of the GTrain flag capture ladder beginning with rank i (1 by default)");
+	Console()->Register("top5attempts", "?i[number]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTopAttempts, this, "Shows five players of the GTrain attempt ladder beginning with rank i (1 by default)");
+	Console()->Register("top5respawns", "?i[number]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTopRespawns, this, "Shows five players of the GTrain respawn ladder beginning with rank i (1 by default)");
+	Console()->Register("top5playtime", "?i[number]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTopPlaytime, this, "Shows five players of the GTrain playtime ladder beginning with rank i (1 by default)");
 	Console()->Register("timecp", "?r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTimeCP, this, "Set your checkpoints based on another player");
 
 	Console()->Register("team", "?i[id]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTeam, this, "Lets you join team i (shows your team if left blank)");
@@ -4101,12 +4134,19 @@ void CGameContext::RegisterChatCommands()
 	Console()->Register("invite", "r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConInvite, this, "Invite a person to a locked team");
 	Console()->Register("join", "r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConJoin, this, "Join the team of the specified player");
 	Console()->Register("fight", "?r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConFight, this, "Join a GTrain fight with a player (no name to leave)");
+	Console()->Register("accept", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConAcceptTeam, this, "Join the GTrain team or fight of the last player who asked you with /team or /invite");
+	Console()->Register("a", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConAcceptTeam, this, "Join the GTrain team or fight of the last player who asked you with /team or /invite");
 	Console()->Register("freeplay", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConFreeplay, this, "Toggle training without flags or paths (fight leader only in a group)");
 	Console()->Register("retry", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRetry, this, "Retry the current training position and goal");
 	Console()->Register("r", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRetry, this, "Retry the current training position and goal");
 	Console()->Register("invincible", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRetry, this, "Retry the current training position and goal");
-	Console()->Register("tc", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRetry, this, "Retry the current training position and goal");
-	Console()->Register("telecursor", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConRetry, this, "Retry the current training position and goal");
+	Console()->Register("tc", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTeleCursor, this, "Retry the current training position and goal, in freeplay start where you aim or at the middle of the /spec view (fight leader only in a group)");
+	Console()->Register("telecursor", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTeleCursor, this, "Retry the current training position and goal, in freeplay start where you aim or at the middle of the /spec view (fight leader only in a group)");
+	Console()->Register("distance", "?i[tiles]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConGoalDistance, this, "Show or set the GTrain goal distance, 50-1000 tiles or 0 for the server default (fight leader only in a group)");
+	Console()->Register("nodj", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConNoDoubleJump, this, "Toggle starting GTrain attempts without double jump (fight leader only in a group)");
+	Console()->Register("forwards", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConForwards, this, "Toggle GTrain goals only leading towards the finish line (fight leader only in a group)");
+	Console()->Register("trail", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTrail, this, "Toggle showing the GTrain trail to the flag");
+	Console()->Register("scorelimit", "?i[score]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConScoreLimit, this, "Show or set the points to win a GTrain fight, 0 for no limit (fight leader only in a group)");
 	Console()->Register("team0mode", "?i['0'|'1']", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTeam0Mode, this, "Toggle team between team 0 and team mode. This mode will make your team behave like team 0.");
 
 	Console()->Register("showothers", "?i['0'|'1'|'2']", CFGFLAG_CHAT | CFGFLAG_SERVER, ConShowOthers, this, "Whether to show players from other teams or not (off by default), optional i = 0 for off, i = 1 for on, i = 2 for own team only");
@@ -4263,20 +4303,33 @@ void CGameContext::OnInit(const void *pPersistentData)
 
 	const bool IsGTrain = !str_comp(Config()->m_SvGametype, "gtrain");
 	if(IsGTrain)
+	{
 		g_Config.m_SvSoloServer = 1;
+		// Hooks pull equally strong, whoever ticks first. Solo tees move the
+		// same either way, so stored runs still replay.
+		g_Config.m_SvNoWeakHook = 1;
+	}
+	// The GTrain controller replaces /team with its own, this brings DDNet's
+	// back after it.
+	Console()->Register("team", "?i[id]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTeam, this, "Lets you join team i (shows your team if left blank)");
 
 	if(g_Config.m_SvSoloServer)
 	{
 		g_Config.m_SvTeam = SV_TEAM_FORCED_SOLO;
 		g_Config.m_SvShowOthersDefault = SHOW_OTHERS_ON;
 
-		GlobalTuning()->Set("player_collision", 0);
-		GlobalTuning()->Set("player_hooking", 0);
-
-		for(int i = 0; i < TuneZone::NUM; i++)
+		// GTrain keeps the map's player collision and hooking for its teams.
+		// Everyone else plays solo, which clients predict from the solo flag.
+		if(!IsGTrain)
 		{
-			TuningList()[i].Set("player_collision", 0);
-			TuningList()[i].Set("player_hooking", 0);
+			GlobalTuning()->Set("player_collision", 0);
+			GlobalTuning()->Set("player_hooking", 0);
+
+			for(int i = 0; i < TuneZone::NUM; i++)
+			{
+				TuningList()[i].Set("player_collision", 0);
+				TuningList()[i].Set("player_hooking", 0);
+			}
 		}
 	}
 
@@ -4367,6 +4420,8 @@ void CGameContext::OnInit(const void *pPersistentData)
 
 	// load map info from database
 	Score()->LoadMapInfo();
+	if(auto *pController = dynamic_cast<CGameControllerGTrain *>(m_pController))
+		pController->LoadMapDifficulty();
 
 	// create all entities from the game layer
 	CreateAllEntities(true);
@@ -4489,6 +4544,29 @@ void CGameContext::DeleteTempfile()
 }
 
 bool CGameContext::OnMapChange(char *pNewMapName, int MapNameSize)
+{
+	if(!ImportMapSettings(pNewMapName, MapNameSize))
+		return false;
+	if(str_comp(g_Config.m_SvGametype, "gtrain") != 0)
+		return true;
+	char aSwitchMap[IO_MAX_PATH_LENGTH];
+	if(!CGameControllerGTrain::AddSwitchLayer(Storage(), pNewMapName, aSwitchMap, sizeof(aSwitchMap)))
+	{
+		// Without door collision, GTrain hovers fall back to zero gravity.
+		log_error("mapchange", "Failed to add a switch layer to '%s'", pNewMapName);
+		return true;
+	}
+	if(aSwitchMap[0])
+	{
+		DeleteTempfile();
+		log_info("mapchange", "Added a switch layer for GTrain hover doors into '%s'", aSwitchMap);
+		str_copy(pNewMapName, aSwitchMap, MapNameSize);
+		str_copy(m_aDeleteTempfile, aSwitchMap);
+	}
+	return true;
+}
+
+bool CGameContext::ImportMapSettings(char *pNewMapName, int MapNameSize)
 {
 	char aConfig[IO_MAX_PATH_LENGTH];
 	str_format(aConfig, sizeof(aConfig), "maps/%s.cfg", g_Config.m_SvMap);
@@ -4757,6 +4835,11 @@ const char *CGameContext::GameType() const
 	dbg_assert(m_pController, "no controller");
 	dbg_assert(m_pController->m_pGameType, "no gametype");
 	return m_pController->m_pGameType;
+}
+bool CGameContext::HasTimeScore() const
+{
+	dbg_assert(m_pController, "no controller");
+	return m_pController->HasTimeScore();
 }
 const char *CGameContext::Version() const { return m_aVersionString; }
 const char *CGameContext::NetVersion() const { return GAME_NETVERSION; }

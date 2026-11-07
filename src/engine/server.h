@@ -452,6 +452,8 @@ public:
 
 	virtual CUuid GameUuid() const = 0;
 	virtual const char *GameType() const = 0;
+	// Whether client scores are race times, otherwise they are points.
+	virtual bool HasTimeScore() const = 0;
 	virtual const char *Version() const = 0;
 	virtual const char *NetVersion() const = 0;
 

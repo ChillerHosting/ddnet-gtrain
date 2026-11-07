@@ -13,6 +13,8 @@
 
 #include <game/server/teams.h>
 
+#include <optional>
+
 struct CScoreLoadBestTimeResult;
 
 /*
@@ -199,6 +201,15 @@ public:
 	 * @return The the map best time split into seconds and the milliseconds remainder, use CFinishTime::Unset if you want the server to prefer scores.
 	 */
 	virtual CFinishTime SnapMapBestTime(int SnappingClient) { return CFinishTime::Unset(); }
+
+	/**
+	 * Returns the tick at which the race timer shown to the character's player started.
+	 *
+	 * @param pChr Character whose timer is shown, to the player or to spectators.
+	 *
+	 * @return The start tick, or std::nullopt to show no race timer.
+	 */
+	virtual std::optional<int> RaceTimerStartTick(class CCharacter *pChr);
 
 	// spawn
 	virtual bool CanSpawn(int Team, vec2 *pOutPos, int ClientId);

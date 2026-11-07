@@ -1096,6 +1096,13 @@ void CConsole::DeregisterTemp(const char *pName)
 	}
 }
 
+void CConsole::RemoveCommandFlags(const char *pName, int Flags)
+{
+	for(CCommand *pCommand = m_pFirstCommand; pCommand; pCommand = pCommand->Next())
+		if(str_comp_nocase(pCommand->m_pName, pName) == 0)
+			pCommand->m_Flags &= ~Flags;
+}
+
 void CConsole::DeregisterTempAll()
 {
 	// set non temp as first one

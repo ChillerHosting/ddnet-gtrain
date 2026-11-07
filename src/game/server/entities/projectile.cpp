@@ -246,7 +246,7 @@ void CProjectile::Tick()
 		z = GameServer()->Collision()->IsTeleportWeapon(x);
 	if(z && !GameServer()->Collision()->TeleOuts(z - 1).empty())
 	{
-		int TeleOut = GameServer()->m_World.m_Core.RandomOr0(GameServer()->Collision()->TeleOuts(z - 1).size());
+		int TeleOut = GameServer()->m_World.m_Core.RandomOr0(GameServer()->Collision()->TeleOuts(z - 1).size(), m_Owner);
 		m_Pos = GameServer()->Collision()->TeleOuts(z - 1)[TeleOut];
 		m_StartTick = Server()->Tick();
 	}

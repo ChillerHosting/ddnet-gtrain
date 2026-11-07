@@ -63,6 +63,24 @@ public:
 	void ShowTopPoints(int ClientId, int Offset = 1);
 	void ShowPoints(int ClientId, const char *pName);
 
+	// GTrain stats and grind ELO, stored per player name
+	void LoadMapDifficulty(const std::shared_ptr<CScoreMapDifficultyResult> &pResult);
+	void LoadGTrainStats(const char *pName, const std::shared_ptr<CScoreGTrainStatsResult> &pResult);
+	void AddGTrainStats(const char *pName, const CGTrainStats &Stats);
+	// Distance is the path distance of the run's goal, Points, Elo and
+	// SpeedFactor what the capture earned.
+	void SaveGTrainRun(const char *pName, int Distance, int64_t Points, float Elo, float SpeedFactor, CGTrainRun &&Run);
+	// One member's capture of a team run, which every member's row stores
+	// whole. Ticks are the member's own until their flag.
+	void SaveGTrainTeamRun(const char *pName, int Distance, int64_t Points, float Elo, float SpeedFactor, int Ticks, const std::shared_ptr<const CGTrainTeamRun> &pRun);
+	// Shadow-bans the stored runs on a map, of a player or both (empty for
+	// all), or lifts the ban, and takes their points and captures off the
+	// stats or gives them back.
+	void BanGTrainRuns(const char *pMap, const char *pName, bool Ban);
+	void ShowGTrainTop(int ClientId, EGTrainStat Stat, int Offset = 1);
+	void ShowElo(int ClientId, const char *pName);
+	void ShowGTrainProfile(int ClientId, const char *pName);
+
 	void ShowTimes(int ClientId, const char *pName, int Offset = 1);
 	void ShowTimes(int ClientId, int Offset = 1);
 

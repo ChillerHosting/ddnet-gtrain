@@ -31,6 +31,7 @@ class CCharacter : public CEntity
 	// need to use core
 	friend class CSaveTee;
 	friend class CSaveHotReloadTee;
+	friend class CGTrainRunState;
 
 public:
 	CCharacter(CGameWorld *pWorld, CNetObj_PlayerInput LastInput);
@@ -77,7 +78,8 @@ public:
 	void ResetInput();
 	void FireWeapon();
 
-	void Die(int Killer, int Weapon, bool SendKillMsg = true);
+	// Without effects, there is no death sound or splash.
+	void Die(int Killer, int Weapon, bool SendKillMsg = true, bool Effects = true);
 	bool TakeDamage(vec2 Force, int Dmg, int From, int Weapon);
 	void SendDeathMessageIfNotInLockedTeam(int Killer, int Weapon, int ModeSpecial);
 	void CancelSwapRequests();
@@ -214,6 +216,7 @@ public:
 	void GiveAllWeapons();
 	void ResetPickups();
 	void ResetJumps();
+	void UseUpAirJumps();
 	ERaceState m_DDRaceState;
 	int Team();
 	bool CanCollide(int ClientId) override;
