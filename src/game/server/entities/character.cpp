@@ -1473,6 +1473,32 @@ void CCharacter::HandleBroadcast()
 	}
 }
 
+void CCharacter::HandleDeathSizedFreeze()
+{
+	if(m_Core.m_Super || m_Core.m_Invincible || !GameServer()->m_pController->DeathSizedFreeze(this))
+		return;
+	// the corners death tiles check
+	const float Offset = GetProximityRadius() / 3.f;
+	const vec2 aCorners[] = {
+		vec2(m_Pos.x + Offset, m_Pos.y - Offset),
+		vec2(m_Pos.x + Offset, m_Pos.y + Offset),
+		vec2(m_Pos.x - Offset, m_Pos.y - Offset),
+		vec2(m_Pos.x - Offset, m_Pos.y + Offset)};
+	for(const vec2 &Corner : aCorners)
+	{
+		const int Index = Collision()->GetPureMapIndex(Corner);
+		const int aTiles[] = {Collision()->GetTileIndex(Index), Collision()->GetFrontTileIndex(Index)};
+		for(const int Tile : aTiles)
+		{
+			// like HandleTiles
+			if(Tile == TILE_FREEZE && !m_Core.m_DeepFrozen)
+				Freeze();
+			else if(Tile == TILE_DFREEZE)
+				m_Core.m_DeepFrozen = true;
+		}
+	}
+}
+
 void CCharacter::HandleSkippableTiles(int Index)
 {
 	// handle death-tiles and leaving gamelayer
@@ -2361,6 +2387,7 @@ void CCharacter::DDRacePostCoreTick()
 		if(!m_Alive)
 			return;
 	}
+	HandleDeathSizedFreeze();
 
 	// teleport gun
 	if(m_TeleGunTeleport)

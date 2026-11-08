@@ -91,6 +91,8 @@ class CGameControllerGTrain : public CGameControllerDDNet
 		// Kept weapons were on since the release, so a capture earns no ELO,
 		// also once they are gone again.
 		bool m_WithWeapons = false;
+		// /death was on since the release, so a capture earns double.
+		bool m_Death = false;
 		std::vector<int> m_vRoute;
 		size_t m_RouteIndex = 0;
 		int m_RouteNode = -1;
@@ -122,6 +124,8 @@ class CGameControllerGTrain : public CGameControllerDDNet
 		bool m_NoDoubleJump = false;
 		// goals only on a shortest path towards the finish line
 		bool m_Forwards = false;
+		// freeze tiles freeze with the hitbox of death tiles, for double ELO
+		bool m_Death = false;
 		int m_GoalDistance = 0; // 0 uses sv_gtrain_goal_distance
 		int m_ScoreLimit = DEFAULT_SCORE_LIMIT; // 0 disables the limit
 		int m_Weapons = 0; // bit per weapon kept for good
@@ -309,6 +313,8 @@ public:
 	void Distance(int ClientId, std::optional<int> Tiles);
 	void NoDoubleJump(int ClientId);
 	void Forwards(int ClientId);
+	void Death(int ClientId);
+	bool DeathSizedFreeze(const class CCharacter *pChr) const override;
 	void Trail(int ClientId);
 	void ScoreLimit(int ClientId, std::optional<int> Limit);
 	void ToggleWeapon(int ClientId, int Weapon);

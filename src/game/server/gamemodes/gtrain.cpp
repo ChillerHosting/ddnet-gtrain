@@ -117,7 +117,7 @@ bool CGameControllerGTrain::AddSwitchLayer(IStorage *pStorage, const char *pPath
 // practice, and only clutter the chat's command completion.
 static const char *const s_apChatCommands[] = {
 	"help", "cmdlist", "info", "rules", "list",
-	"r", "retry", "fight", "lock", "invite", "team", "accept", "a", "distance", "nodj", "forwards", "trail", "scorelimit", "freeplay", "settings",
+	"r", "retry", "fight", "lock", "invite", "team", "accept", "a", "distance", "nodj", "forwards", "death", "trail", "scorelimit", "freeplay", "settings",
 	// practice binds, they retry
 	"invincible", "tc", "telecursor", "rescue", "back", "tp", "teleport", "lasttp",
 	"shotgun", "grenade", "laser", "rifle", "ninja",
@@ -141,6 +141,13 @@ static void ConLockFight(IConsole::IResult *pResult, void *pUserData)
 		pController->Lock(pResult->m_ClientId, pResult->NumArguments() ? std::optional<bool>(pResult->GetInteger(0) != 0) : std::nullopt);
 }
 
+static void ConDeath(IConsole::IResult *pResult, void *pUserData)
+{
+	auto *pController = dynamic_cast<CGameControllerGTrain *>(((CGameContext *)pUserData)->m_pController);
+	if(pController && pResult->m_ClientId >= 0 && pResult->m_ClientId < MAX_CLIENTS)
+		pController->Death(pResult->m_ClientId);
+}
+
 static void ConInviteToFight(IConsole::IResult *pResult, void *pUserData)
 {
 	auto *pController = dynamic_cast<CGameControllerGTrain *>(((CGameContext *)pUserData)->m_pController);
@@ -155,6 +162,7 @@ void CGameControllerGTrain::HideUnrelatedChatCommands()
 	// CGameContext::OnInit registers DDNet's commands again before every map.
 	GameServer()->Console()->Register("team", "?r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConTeamUp, GameServer(), "Ask a player to play together in a team (no name to leave)");
 	GameServer()->Console()->Register("lock", "?i['0'|'1']", CFGFLAG_CHAT | CFGFLAG_SERVER, ConLockFight, GameServer(), "Toggle locking your fight, so only players you /invite can join (fight leader only). /lock 0 to unlock, /lock 1 to lock");
+	GameServer()->Console()->Register("death", "", CFGFLAG_CHAT | CFGFLAG_SERVER, ConDeath, GameServer(), "Toggle freeze tiles freezing with the bigger hitbox of death tiles, for double ELO (fight leader only in a group)");
 	GameServer()->Console()->Register("invite", "r[player name]", CFGFLAG_CHAT | CFGFLAG_SERVER, ConInviteToFight, GameServer(), "Invite a player to your fight (fight leader only), also a locked one, or to your team, to join with /accept within a minute");
 
 	// Without the chat flag, they neither run from chat nor get sent to
@@ -530,6 +538,8 @@ std::optional<CGameControllerGTrain::CEloGain> CGameControllerGTrain::CaptureGai
 	const double Seconds = (Server()->Tick() - Attempt.m_StartTick) / (double)Server()->TickSpeed();
 	int64_t Points = ByTiles ? GTrainElo::CapturePointsOfTiles(TouchedTilePoints(Attempt), *Step, IsDeranged(), Distance, Seconds) :
 				   GTrainElo::CapturePoints(*Step, IsDeranged(), Distance, Seconds);
+	if(Attempt.m_Death)
+		Points *= 2;
 	// Teams earn what one player would, shared by everyone in them.
 	if(const std::vector<CTeamFlag> *pFlags = TeamFlags(ClientId))
 		Points = std::llround(Points / (double)pFlags->size());
@@ -653,6 +663,7 @@ void CGameControllerGTrain::PlaceForAttempt(CPlayer *pPlayer, const std::shared_
 	if(!SameSpot)
 		Attempt.m_SpotTried = false;
 	Attempt.m_WithWeapons = false;
+	Attempt.m_Death = false;
 	Attempt.m_CaptureTick = -1;
 	Attempt.m_TeamGain.reset();
 	Attempt.m_RunHookedPlayer = -1;
@@ -1665,6 +1676,21 @@ void CGameControllerGTrain::Forwards(int ClientId)
 	SendFightChat(ClientId, Forwards ? "New goals only lead towards the finish line." : "New goals lead in any direction again.");
 }
 
+void CGameControllerGTrain::Death(int ClientId)
+{
+	if(!GameServer()->m_apPlayers[ClientId] || !CheckFightLeader(ClientId, "toggle /death"))
+		return;
+	// Attempts already released keep earning normally.
+	bool &Death = m_aSettings[ClientId].m_Death;
+	Death = !Death;
+	SendFightChat(ClientId, Death ? "Freeze tiles now freeze with the hitbox of death tiles. Captures from the next release on earn double ELO." : "Freeze tiles freeze normally again.");
+}
+
+bool CGameControllerGTrain::DeathSizedFreeze(const CCharacter *pChr) const
+{
+	return m_aSettings[m_aFightGroup[pChr->GetPlayer()->GetCid()]].m_Death;
+}
+
 void CGameControllerGTrain::Trail(int ClientId)
 {
 	if(!GameServer()->m_apPlayers[ClientId])
@@ -1771,10 +1797,10 @@ void CGameControllerGTrain::ShowSettings(int ClientId, const char *pName)
 	char aScoreLimit[16] = "off";
 	if(Settings.m_ScoreLimit > 0)
 		str_format(aScoreLimit, sizeof(aScoreLimit), "%d", Settings.m_ScoreLimit);
-	char aMessage[256];
-	str_format(aMessage, sizeof(aMessage), "%s: /trail %s, %s/distance %d%s, /nodj %s, /forwards %s, /freeplay %s, /scorelimit %s, /lock %s, kept weapons: %s",
+	char aMessage[320];
+	str_format(aMessage, sizeof(aMessage), "%s: /trail %s, %s/distance %d%s, /nodj %s, /forwards %s, /death %s, /freeplay %s, /scorelimit %s, /lock %s, kept weapons: %s",
 		aWhose, m_aHideTrail[Target] ? "off" : "on", aFromLeader, GoalDistance(Group), Settings.m_GoalDistance ? "" : " (server default)", Settings.m_NoDoubleJump ? "on" : "off",
-		Settings.m_Forwards ? "on" : "off", Settings.m_Freeplay ? "on" : "off", aScoreLimit, m_aFightLocked[Group] ? "on" : "off", aWeapons[0] ? aWeapons : "none");
+		Settings.m_Forwards ? "on" : "off", Settings.m_Death ? "on" : "off", Settings.m_Freeplay ? "on" : "off", aScoreLimit, m_aFightLocked[Group] ? "on" : "off", aWeapons[0] ? aWeapons : "none");
 	GameServer()->SendChatTarget(ClientId, aMessage);
 }
 
@@ -1791,6 +1817,7 @@ void CGameControllerGTrain::Help()
 	log_info("chatresp", "/distance <%d-%d>: goal distance in tiles, 0 for the server default", MinGoalDistance(), (int)MAX_GOAL_DISTANCE);
 	log_info("chatresp", "/nodj: toggle starting attempts without double jump");
 	log_info("chatresp", "/forwards: toggle goals only leading towards the finish line");
+	log_info("chatresp", "/death: toggle freeze tiles freezing with the bigger hitbox of death tiles, for double ELO");
 	log_info("chatresp", "/scorelimit <0-%d>: points to win a fight, 0 for no limit", (int)MAX_SCORE_LIMIT);
 	log_info("chatresp", "/shotgun, /grenade, /laser or /rifle, /ninja: toggle keeping that weapon");
 	log_info("chatresp", "/freeplay: toggle training without flags and paths");
@@ -2357,6 +2384,7 @@ void CGameControllerGTrain::Tick()
 			Attempt.m_Running = !m_aSettings[m_aFightGroup[ClientId]].m_Freeplay && Attempt.m_pGoal && Attempt.m_pGoal->m_Ready;
 			Attempt.m_vTouchedTiles.clear();
 			Attempt.m_WithWeapons = m_aSettings[m_aFightGroup[ClientId]].m_Weapons != 0;
+			Attempt.m_Death = m_aSettings[m_aFightGroup[ClientId]].m_Death;
 			// Teammates release together, their runs start in the same tick.
 			if(Attempt.m_Running && g_Config.m_SvGtrainRecordRuns)
 			{
@@ -2366,6 +2394,9 @@ void CGameControllerGTrain::Tick()
 		}
 		else if(Attempt.m_StartTick >= 0 && m_aSettings[m_aFightGroup[ClientId]].m_Weapons)
 			Attempt.m_WithWeapons = true;
+		// Turning /death off during an attempt loses its double ELO.
+		if(!m_aSettings[m_aFightGroup[ClientId]].m_Death)
+			Attempt.m_Death = false;
 		if(m_aSettings[m_aFightGroup[ClientId]].m_Freeplay)
 			continue;
 		TrackTouchedTile(pChr);

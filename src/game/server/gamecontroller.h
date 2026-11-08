@@ -111,6 +111,9 @@ public:
 	virtual void OnCharacterSpawn(class CCharacter *pChr);
 
 	virtual void HandleCharacterTiles(class CCharacter *pChr, int MapIndex);
+	// Freeze tiles freeze the character as soon as the hitbox of death tiles
+	// touches them, instead of its center.
+	virtual bool DeathSizedFreeze(const class CCharacter *pChr) const { return false; }
 	virtual void SetArmorProgress(CCharacter *pCharacter, int Progress) {}
 
 	/*

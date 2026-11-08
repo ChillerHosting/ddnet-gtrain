@@ -181,6 +181,7 @@ private:
 	int m_LastBroadcast;
 	void DDRaceInit();
 	void HandleSkippableTiles(int Index);
+	void HandleDeathSizedFreeze();
 	void ForceSetRescue(int RescueMode);
 	void DDRaceTick();
 	void DDRacePostCoreTick();

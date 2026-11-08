@@ -3463,10 +3463,10 @@ TEST_F(GameWorld, GTrainSettingsShowsThoseOfPlayersAndFights)
 		return m_pServer->m_avChatMessages[ClientId].empty() ? std::string() : m_pServer->m_avChatMessages[ClientId].back();
 	};
 
-	EXPECT_EQ(Settings(Anna, "/settings"), "Your settings: /trail on, /distance 3 (server default), /nodj off, /forwards off, /freeplay off, /scorelimit 10, /lock off, kept weapons: none");
+	EXPECT_EQ(Settings(Anna, "/settings"), "Your settings: /trail on, /distance 3 (server default), /nodj off, /forwards off, /death off, /freeplay off, /scorelimit 10, /lock off, kept weapons: none");
 	for(const char *pCommand : {"/distance 120", "/nodj", "/forwards", "/ninja", "/shotgun", "/scorelimit 0", "/trail"})
 		Say(Anna, pCommand);
-	const std::string AnnaSettings = "/distance 120, /nodj on, /forwards on, /freeplay off, /scorelimit off, /lock off, kept weapons: shotgun, ninja";
+	const std::string AnnaSettings = "/distance 120, /nodj on, /forwards on, /death off, /freeplay off, /scorelimit off, /lock off, kept weapons: shotgun, ninja";
 	EXPECT_EQ(Settings(Anna, "/settings"), "Your settings: /trail off, " + AnnaSettings);
 	EXPECT_EQ(Settings(Runner, "/settings Anna"), "Settings of 'Anna': /trail off, " + AnnaSettings);
 	EXPECT_EQ(Settings(Runner, "/settings Nobody"), "Player not found. Use their full name.");
@@ -4064,6 +4064,43 @@ TEST_F(GameWorld, GTrainNoDoubleJumpStartsAttemptsWithoutAirJump)
 	EXPECT_EQ(GameServer()->GetPlayerChar(Bob)->Core()->m_Jumped, 0);
 }
 
+TEST_F(GameWorld, GTrainDeathFreezesWithTheHitboxOfDeathTiles)
+{
+	PrepareTrainingCorridor();
+	const auto vIds = SpawnTrainingPlayers({"Anna", "Bob"});
+	const int Anna = vIds[0], Bob = vIds[1];
+	auto *pController = static_cast<CGameControllerGTrain *>(GameServer()->m_pController);
+	const auto Command = [&](int ClientId, const char *pCommand) {
+		m_pServer->m_avChatMessages[ClientId].clear();
+		m_pServer->Console()->ExecuteLineFlag(pCommand, CFGFLAG_CHAT, ClientId);
+		return m_pServer->m_avChatMessages[ClientId].empty() ? std::string() : m_pServer->m_avChatMessages[ClientId].back();
+	};
+	// The tee's center stays out of the freeze tile to its right, the
+	// corners death tiles check reach into it.
+	CCharacter *pChr = GameServer()->GetPlayerChar(Anna);
+	const vec2 Pos = vec2(std::floor(pChr->m_Pos.x / 32) * 32 + 28, pChr->m_Pos.y);
+	GameServer()->Collision()->SetCollisionAt(Pos.x + 32, Pos.y, TILE_FREEZE);
+	const auto FrozenAt = [&]() {
+		pChr->Unfreeze();
+		pChr->ResetVelocity();
+		pChr->m_Pos = pChr->m_PrevPos = Pos;
+		pChr->SetPosition(Pos);
+		GameServer()->m_World.Tick();
+		return pChr->m_FreezeTime > 0;
+	};
+	EXPECT_FALSE(FrozenAt());
+	EXPECT_EQ(Command(Anna, "death"), "Freeze tiles now freeze with the hitbox of death tiles. Captures from the next release on earn double ELO.");
+	EXPECT_TRUE(FrozenAt());
+
+	// Fight members play with their leader's setting.
+	pController->Fight(Bob, "Anna");
+	EXPECT_TRUE(pController->DeathSizedFreeze(GameServer()->GetPlayerChar(Bob)));
+	EXPECT_EQ(Command(Bob, "death"), "Only the fight leader can toggle /death.");
+	EXPECT_EQ(Command(Anna, "death"), "Freeze tiles freeze normally again.");
+	EXPECT_EQ(m_pServer->m_avChatMessages[Bob].back(), "Freeze tiles freeze normally again.");
+	EXPECT_FALSE(FrozenAt());
+}
+
 TEST_F(GameWorld, GTrainForwardsGoalsLeadTowardsTheFinish)
 {
 	PrepareTrainingCorridor();
@@ -4211,7 +4248,7 @@ TEST_F(GameWorld, GTrainHelpListsOnlyGTrainCommands)
 	m_pServer->m_avChatMessages[Runner].clear();
 	Say(Runner, "/help");
 	const auto &vMessages = m_pServer->m_avChatMessages[Runner];
-	ASSERT_EQ(vMessages.size(), 21);
+	ASSERT_EQ(vMessages.size(), 22);
 	EXPECT_EQ(vMessages.front(), "GTrain commands:");
 	EXPECT_EQ(vMessages.back(), "Captures on this map earn no ELO.");
 	std::string Help;
